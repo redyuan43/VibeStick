@@ -7,6 +7,7 @@
 #include "vibe_board.h"
 #include "vibe_board_profile.h"
 #include "vibe_motion.h"
+#include "vibe_stick_pet_assets.h"
 #include "vibe_stick_config.h"
 #include "button_gpio.h"
 #include "cJSON.h"
@@ -29,7 +30,6 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "vibe_stick_ui_assets.h"
 #include "iot_button.h"
 #include "lvgl.h"
 #include "nvs_flash.h"
@@ -77,7 +77,6 @@ typedef struct {
     agent_provider_t id;
     const char *key;
     const char *display_name;
-    const lv_image_dsc_t *icon;
     lv_color_t accent_color;
     bool enabled;
     bool implemented;
@@ -137,6 +136,10 @@ static bool s_alert_sound_baseline_ready;
 static char s_recording_session_id[40];
 static TaskHandle_t s_recording_upload_task;
 static bool s_recording_upload_failed;
+static int64_t s_pet_next_idle_ms;
+static int s_pet_idle_step;
+static int s_pet_bob_step;
+static const lv_image_dsc_t *s_pet_current_image;
 
 static lv_display_t *s_display;
 static lv_obj_t *s_wifi_label;
@@ -145,18 +148,8 @@ static lv_obj_t *s_battery_icon;
 static lv_obj_t *s_battery_fill;
 static lv_obj_t *s_battery_cap;
 static lv_obj_t *s_battery_bolt;
-static lv_obj_t *s_provider_icon;
-static lv_obj_t *s_provider_label;
 static lv_obj_t *s_mode_label;
-static lv_obj_t *s_status_dot;
-static lv_obj_t *s_status_label;
-static lv_obj_t *s_quota_5h_title_label;
-static lv_obj_t *s_quota_7d_title_label;
-static lv_obj_t *s_quota_5h_bar;
-static lv_obj_t *s_quota_7d_bar;
-static lv_obj_t *s_quota_5h_label;
-static lv_obj_t *s_quota_7d_label;
-static lv_obj_t *s_quota_status_label;
+static lv_obj_t *s_pet_image;
 static lv_obj_t *s_recording_overlay;
 static lv_obj_t *s_recording_wave_group;
 static lv_obj_t *s_recording_wave_bars[5];
@@ -214,7 +207,6 @@ static const agent_provider_config_t s_provider_configs[] = {
         .id = PROVIDER_CODEX,
         .key = "codex",
         .display_name = "Codex",
-        .icon = &vibe_stick_provider_codex_icon_40,
         .accent_color = LV_COLOR_MAKE(0x4d, 0x82, 0xff),
         .enabled = true,
         .implemented = true,
@@ -223,7 +215,6 @@ static const agent_provider_config_t s_provider_configs[] = {
         .id = PROVIDER_CLAUDE,
         .key = "claude",
         .display_name = "Claude",
-        .icon = &vibe_stick_provider_claude_icon_40,
         .accent_color = LV_COLOR_MAKE(0xd9, 0x77, 0x57),
         .enabled = true,
         .implemented = true,
@@ -537,19 +528,6 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text, const lv_font_t 
     return label;
 }
 
-static lv_obj_t *make_bar(lv_obj_t *parent, int32_t width)
-{
-    lv_obj_t *bar = lv_bar_create(parent);
-    lv_obj_set_size(bar, width, 5);
-    lv_bar_set_range(bar, 0, 100);
-    lv_obj_set_style_radius(bar, 3, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0x2a2d33), 0);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0xf4f5f7), LV_PART_INDICATOR);
-    lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
-    return bar;
-}
-
 static lv_obj_t *make_plain_obj(lv_obj_t *parent, int32_t w, int32_t h,
                                 lv_color_t color, lv_opa_t opa, int32_t radius)
 {
@@ -560,36 +538,6 @@ static lv_obj_t *make_plain_obj(lv_obj_t *parent, int32_t w, int32_t h,
     lv_obj_set_style_bg_opa(obj, opa, 0);
     lv_obj_set_style_radius(obj, radius, 0);
     return obj;
-}
-
-static void create_provider_icon(lv_obj_t *parent)
-{
-    s_provider_icon = lv_image_create(parent);
-    lv_image_set_src(s_provider_icon, current_provider_config()->icon);
-    lv_obj_align(s_provider_icon, LV_ALIGN_TOP_LEFT, 18, 52);
-}
-
-static const char *status_text_for(const char *status)
-{
-    if (strcmp(status, "RUNNING") == 0) {
-        return "运行中";
-    }
-    if (strcmp(status, "DONE") == 0) {
-        return "已完成";
-    }
-    if (strcmp(status, "APPROVAL") == 0) {
-        return "待确认";
-    }
-    if (strcmp(status, "ERROR") == 0) {
-        return "出错";
-    }
-    if (strcmp(status, "OFFLINE") == 0) {
-        return "离线";
-    }
-    if (strcmp(status, "IDLE") == 0 || strcmp(status, "UNKNOWN") == 0) {
-        return "待命";
-    }
-    return "待命";
 }
 
 static void set_battery_ui(int battery_value, bool charging, bool usb_powered)
@@ -629,6 +577,98 @@ static void set_battery_ui(int battery_value, bool charging, bool usb_powered)
             lv_obj_add_flag(s_battery_bolt, LV_OBJ_FLAG_HIDDEN);
         }
     }
+}
+
+static void set_pet_image(const lv_image_dsc_t *image)
+{
+    if (!s_pet_image || !image || s_pet_current_image == image) {
+        return;
+    }
+    lv_image_set_src(s_pet_image, image);
+    s_pet_current_image = image;
+}
+
+static const lv_image_dsc_t *idle_pet_image(int64_t now_ms)
+{
+    static const int64_t intervals_ms[] = {10000, 1800, 14000, 2200};
+    if (s_pet_next_idle_ms == 0) {
+        s_pet_idle_step = 0;
+        s_pet_next_idle_ms = now_ms + intervals_ms[0];
+    } else if (now_ms >= s_pet_next_idle_ms) {
+        s_pet_idle_step = (s_pet_idle_step + 1) %
+                          (int)(sizeof(intervals_ms) / sizeof(intervals_ms[0]));
+        s_pet_next_idle_ms = now_ms + intervals_ms[s_pet_idle_step];
+    }
+
+    switch (s_pet_idle_step) {
+    case 1:
+        return &vibe_stick_pet_mini_happy;
+    case 3:
+        return &vibe_stick_pet_mini_alert;
+    default:
+        return &vibe_stick_pet_mini_idle;
+    }
+}
+
+static const lv_image_dsc_t *pet_image_for_state(const char *status, int64_t now_ms)
+{
+    if (strcmp(s_state.alert_type, "APPROVAL") == 0 ||
+        strcmp(s_state.alert_type, "WAITING_APPROVAL") == 0 ||
+        strcmp(s_state.alert_type, "PENDING_APPROVAL") == 0 ||
+        strcmp(s_state.alert_type, "NEEDS_APPROVAL") == 0) {
+        return &vibe_stick_pet_mini_alert;
+    }
+    if (strcmp(s_state.alert_type, "ERROR") == 0 ||
+        strcmp(s_state.alert_type, "FAILED") == 0 ||
+        strcmp(s_state.alert_type, "FAILURE") == 0) {
+        return &vibe_stick_pet_mini_alert;
+    }
+    if (strcmp(s_state.alert_type, "DONE") == 0 ||
+        strcmp(s_state.alert_type, "COMPLETED") == 0 ||
+        strcmp(s_state.alert_type, "SUCCESS") == 0) {
+        return &vibe_stick_pet_mini_happy;
+    }
+
+    if (strcmp(status, "RUNNING") == 0) {
+        return &vibe_stick_pet_mini_typing;
+    }
+    if (strcmp(status, "APPROVAL") == 0) {
+        return &vibe_stick_pet_mini_alert;
+    }
+    if (strcmp(status, "DONE") == 0) {
+        return &vibe_stick_pet_mini_happy;
+    }
+    if (strcmp(status, "ERROR") == 0) {
+        return &vibe_stick_pet_mini_alert;
+    }
+    if (strcmp(status, "OFFLINE") == 0 || strcmp(status, "UNIMPLEMENTED") == 0) {
+        return &vibe_stick_pet_mini_sleep;
+    }
+    return idle_pet_image(now_ms);
+}
+
+static void update_pet_visual(void)
+{
+    if (!s_pet_image) {
+        return;
+    }
+
+    const int bob_offsets[] = {0, -1, -2, -1, 0, 1, 2, 1};
+    const provider_display_state_t *display_state = current_provider_display_state();
+    const agent_provider_config_t *provider = current_provider_config();
+    const char *status = provider->implemented ? display_state->status : "UNIMPLEMENTED";
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+
+    set_pet_image(pet_image_for_state(status, now_ms));
+    lv_obj_align(s_pet_image, LV_ALIGN_CENTER, 0, 14 + bob_offsets[s_pet_bob_step]);
+    s_pet_bob_step = (s_pet_bob_step + 1) %
+                     (int)(sizeof(bob_offsets) / sizeof(bob_offsets[0]));
+}
+
+static void pet_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    update_pet_visual();
 }
 
 static void wave_bar_height_cb(void *obj, int32_t height)
@@ -697,52 +737,14 @@ static void create_ui(void)
     s_battery_cap = make_plain_obj(screen, 2, 7, lv_color_hex(0xf3f4f6), LV_OPA_COVER, 1);
     lv_obj_align_to(s_battery_cap, s_battery_icon, LV_ALIGN_OUT_RIGHT_MID, 1, 0);
 
-    create_provider_icon(screen);
-
-    s_status_dot = lv_obj_create(screen);
-    lv_obj_remove_style_all(s_status_dot);
-    lv_obj_set_size(s_status_dot, 7, 7);
-    lv_obj_set_style_radius(s_status_dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_status_dot, lv_color_hex(0xf3f4f6), 0);
-    lv_obj_set_style_bg_opa(s_status_dot, LV_OPA_COVER, 0);
-    lv_obj_align(s_status_dot, LV_ALIGN_TOP_LEFT, 72, 80);
-
-    s_provider_label = make_label(screen, "Codex", &lv_font_montserrat_16, lv_color_hex(0xf3f4f6), 60, LV_TEXT_ALIGN_LEFT);
-    lv_obj_align(s_provider_label, LV_ALIGN_TOP_LEFT, 72, 51);
-
     s_mode_label = make_label(screen, "PTT", &lv_font_montserrat_10, lv_color_hex(0x8a9099), 34, LV_TEXT_ALIGN_CENTER);
     lv_obj_align(s_mode_label, LV_ALIGN_TOP_MID, 0, 9);
 
-    s_status_label = make_label(screen, "待命", FONT_CN, lv_color_hex(0xf3f4f6), 52, LV_TEXT_ALIGN_LEFT);
-    lv_obj_align(s_status_label, LV_ALIGN_TOP_LEFT, 82, 73);
-
-    lv_obj_t *quota_wrap = make_plain_obj(screen, LCD_H_RES - 16, 104, lv_color_hex(0x0e1014), LV_OPA_COVER, 8);
-    lv_obj_set_style_border_width(quota_wrap, 1, 0);
-    lv_obj_set_style_border_color(quota_wrap, lv_color_hex(0x22252b), 0);
-    lv_obj_align(quota_wrap, LV_ALIGN_TOP_MID, 0, 118);
-
-    lv_obj_t *divider = make_plain_obj(quota_wrap, 1, 72, lv_color_hex(0x242832), LV_OPA_COVER, 1);
-    lv_obj_align(divider, LV_ALIGN_CENTER, 0, 10);
-
-    s_quota_5h_title_label = make_label(screen, "5H --%", &lv_font_montserrat_12,
-                                        lv_color_hex(0x8a9099), 44, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(s_quota_5h_title_label, LV_ALIGN_TOP_LEFT, 17, 133);
-    s_quota_5h_label = make_label(screen, "--%", &lv_font_montserrat_20, lv_color_hex(0xf3f4f6), 54, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(s_quota_5h_label, LV_ALIGN_TOP_LEFT, 10, 153);
-    s_quota_5h_bar = make_bar(screen, 46);
-    lv_obj_align(s_quota_5h_bar, LV_ALIGN_TOP_LEFT, 16, 190);
-
-    s_quota_7d_title_label = make_label(screen, "7D --%", &lv_font_montserrat_12,
-                                        lv_color_hex(0x8a9099), 44, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(s_quota_7d_title_label, LV_ALIGN_TOP_RIGHT, -17, 133);
-    s_quota_7d_label = make_label(screen, "--%", &lv_font_montserrat_20, lv_color_hex(0xf3f4f6), 54, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(s_quota_7d_label, LV_ALIGN_TOP_RIGHT, -10, 153);
-    s_quota_7d_bar = make_bar(screen, 46);
-    lv_obj_align(s_quota_7d_bar, LV_ALIGN_TOP_RIGHT, -16, 190);
-    s_quota_status_label = make_label(screen, "WAIT", &lv_font_montserrat_10,
-                                      lv_color_hex(0x686e78), 84, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(s_quota_status_label, LV_ALIGN_TOP_MID, 0, 207);
-    lv_obj_add_flag(s_quota_status_label, LV_OBJ_FLAG_HIDDEN);
+    s_pet_image = lv_image_create(screen);
+    lv_image_set_src(s_pet_image, &vibe_stick_pet_mini_idle);
+    s_pet_current_image = &vibe_stick_pet_mini_idle;
+    lv_obj_align(s_pet_image, LV_ALIGN_CENTER, 0, 14);
+    lv_timer_create(pet_timer_cb, 700, NULL);
 
     s_recording_overlay = lv_obj_create(screen);
     lv_obj_set_size(s_recording_overlay, LCD_H_RES, LCD_V_RES);
@@ -774,87 +776,22 @@ static void create_ui(void)
     lv_obj_align(s_recording_hint, LV_ALIGN_BOTTOM_MID, 0, -22);
 }
 
-static void set_quota_label(lv_obj_t *bar, lv_obj_t *label, int value, bool valid, lv_color_t accent_color)
-{
-    lv_obj_set_style_bg_color(bar, valid ? accent_color : lv_color_hex(0x4b4f57), LV_PART_INDICATOR);
-    if (!valid) {
-        lv_bar_set_value(bar, 0, LV_ANIM_OFF);
-        lv_label_set_text(label, "--%");
-        return;
-    }
-    lv_bar_set_value(bar, value, LV_ANIM_OFF);
-    char text[8];
-    snprintf(text, sizeof(text), "%d%%", value);
-    lv_label_set_text(label, text);
-}
-
-static void set_quota_title(lv_obj_t *label, const char *prefix, bool stale)
-{
-    if (stale) {
-        char text[8];
-        snprintf(text, sizeof(text), "%s*", prefix);
-        lv_label_set_text(label, text);
-    } else {
-        lv_label_set_text(label, prefix);
-    }
-}
-
-static void set_status_color(const agent_provider_config_t *provider, const char *status)
-{
-    lv_color_t color = lv_color_hex(0x9aa0aa);
-    if (!provider->implemented) {
-        color = lv_color_hex(0x9aa0aa);
-    } else if (strcmp(status, "RUNNING") == 0 || strcmp(status, "DONE") == 0) {
-        color = provider->accent_color;
-    } else if (strcmp(status, "APPROVAL") == 0) {
-        color = lv_color_hex(0xcfd3da);
-    } else if (strcmp(status, "IDLE") == 0 || strcmp(status, "UNKNOWN") == 0) {
-        color = lv_color_hex(0x9aa0aa);
-    } else if (strcmp(status, "ERROR") == 0 || strcmp(status, "OFFLINE") == 0) {
-        color = lv_color_hex(0x686e78);
-    }
-    lv_obj_set_style_bg_color(s_status_dot, color, 0);
-}
-
 static void render_state(void)
 {
     lvgl_lock();
     const agent_provider_config_t *provider = current_provider_config();
-    const provider_display_state_t *display_state = current_provider_display_state();
-    const bool implemented = provider->implemented;
-    const bool q5_valid = implemented && display_state->quota_5h_valid;
-    const bool q7_valid = implemented && display_state->quota_7d_valid;
-    const bool quota_stale = implemented && display_state->quota_stale;
-    const char *status_key = implemented ? display_state->status : "UNIMPLEMENTED";
 
     lv_label_set_text(s_wifi_label, s_wifi_connected ? "WiFi" : "OFF");
     lv_obj_set_style_text_color(s_wifi_label,
                                 s_wifi_connected ? lv_color_hex(0xf3f4f6) : lv_color_hex(0x686e78),
                                 0);
     set_battery_ui(s_state.battery, s_state.battery_charging, s_state.usb_powered);
-    if (provider->icon) {
-        lv_image_set_src(s_provider_icon, provider->icon);
-        lv_obj_clear_flag(s_provider_icon, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(s_provider_icon, LV_OBJ_FLAG_HIDDEN);
-    }
-    lv_label_set_text(s_provider_label, provider->display_name);
-    lv_obj_set_style_text_color(s_provider_label, provider->implemented ? lv_color_hex(0xf3f4f6) : lv_color_hex(0xd7d9de), 0);
     lv_label_set_text(s_mode_label, recording_mode_label());
     lv_obj_set_style_text_color(s_mode_label,
                                 s_recording_mode == RECORDING_MODE_LIFT_TO_TALK ?
                                     provider->accent_color : lv_color_hex(0x8a9099),
                                 0);
-    lv_label_set_text(s_status_label, implemented ? status_text_for(display_state->status) : "待命");
-    set_status_color(provider, status_key);
-    set_quota_title(s_quota_5h_title_label, "5H", quota_stale);
-    set_quota_title(s_quota_7d_title_label, "7D", quota_stale);
-    set_quota_label(s_quota_5h_bar, s_quota_5h_label, display_state->quota_5h,
-                    q5_valid, provider->accent_color);
-    set_quota_label(s_quota_7d_bar, s_quota_7d_label, display_state->quota_7d,
-                    q7_valid, provider->accent_color);
-    lv_label_set_text(s_quota_status_label, "");
-    lv_obj_add_flag(s_quota_status_label, LV_OBJ_FLAG_HIDDEN);
+    update_pet_visual();
     lvgl_unlock();
 }
 
@@ -1575,7 +1512,7 @@ static void side_button_single_click_cb(void *button_handle, void *usr_data)
 {
     (void)button_handle;
     (void)usr_data;
-    queue_event(VIBE_STICK_EVENT_PROVIDER_NEXT);
+    queue_event(VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE);
 }
 
 static void side_button_long_start_cb(void *button_handle, void *usr_data)
