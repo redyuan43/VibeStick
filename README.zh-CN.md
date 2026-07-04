@@ -105,6 +105,8 @@ ls /dev/cu.*
 
 11. 👤 打开任意文本框，长按正面蓝键说话，松开后 VibeStick 应自动转写并粘贴。
 
+M5StickC Plus 还支持拿起录音模式：默认是 `PTT` 按住说话；长按侧键可切到 `LIFT`，设备会用开机时的桌面平放状态做基线，拿起开始录音，放回桌面并稳定后发送识别。侧键短按仍用于切换 Codex / Claude。
+
 开发调试时可以用 `./scripts/dev.sh` 替代 `./scripts/install.sh`，它会在当前终端里运行 bridge。
 
 ## 常见问题排查

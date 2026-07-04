@@ -8,7 +8,8 @@ VibeStick targets M5Stack StickS3 and M5StickC Plus.
 
 - Screen: LVGL UI on the built-in 135x240 ST7789 display.
 - Front button: push-to-talk recording.
-- Side button: provider switching.
+- Side button: short-press provider switching; on M5StickC Plus, long-press toggles push-to-talk / lift-to-talk recording.
+- IMU: M5StickC Plus uses MPU6886 for lift-to-talk detection. The device calibrates its flat desktop baseline after boot.
 - Microphone: 16 kHz / 16-bit / mono PCM from StickS3 ES8311 or StickC Plus PDM microphone.
 - Speaker: StickS3 ES8311 / I2S playback, or StickC Plus GPIO2 tone output.
 - Wi-Fi: HTTP communication with the Mac bridge on a 2.4 GHz Wi-Fi network.
