@@ -30,6 +30,7 @@ KNOWN_ASR_HALLUCINATIONS = (
     "\u8bf7\u4e0d\u541d\u70b9\u8d5e\u8ba2\u9605\u8f6c\u53d1\u6253\u8d4f\u652f\u6301\u660e\u955c\u4e0e\u70b9\u70b9\u680f\u76ee",
     "\u8bf7\u4f7f\u7528\u7b80\u4f53\u4e2d\u6587\u8f93\u51fa\u3002",
 )
+DEVICE_PCM_SOURCE_MARKERS = ("sticks3", "stickc_plus")
 
 
 @dataclass
@@ -82,10 +83,10 @@ class RecordingController:
             status="recording",
             message="Recording session started",
         )
-        use_mac_mic = "sticks3" not in requested_source.lower()
+        use_mac_mic = not _is_device_pcm_source(requested_source)
         if not use_mac_mic:
-            self.session.audio_source = "sticks3_pcm"
-            self.session.message = "Waiting for StickS3 audio upload"
+            self.session.audio_source = _device_pcm_audio_source(requested_source)
+            self.session.message = "Waiting for device PCM audio upload"
             show_hud("listening")
 
         mic_result = self.audio_recorder.start(self.session.session_id) if use_mac_mic else None
@@ -122,6 +123,7 @@ class RecordingController:
         sample_rate: int = 16000,
         channels: int = 1,
         bits_per_sample: int = 16,
+        append: bool = False,
     ) -> RecordingSession:
         if not pcm:
             self.session.status = "audio_failed"
@@ -142,8 +144,8 @@ class RecordingController:
                 active=True,
                 started_at=datetime.now().isoformat(timespec="seconds"),
                 status="recording",
-                message="Recovered recording session from StickS3 audio upload",
-                audio_source="sticks3_pcm",
+                message="Recovered recording session from device PCM upload",
+                audio_source="device_pcm",
             )
         if bits_per_sample != 16:
             self.session.status = "audio_failed"
@@ -155,15 +157,23 @@ class RecordingController:
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
         sid = self.session.session_id or session_id or uuid.uuid4().hex
         audio_file = RECORDINGS_DIR / f"{sid}.wav"
-        with wave.open(str(audio_file), "wb") as wav:
-            wav.setnchannels(max(1, channels))
-            wav.setsampwidth(bits_per_sample // 8)
-            wav.setframerate(sample_rate)
-            wav.writeframes(pcm)
+        if append:
+            with _raw_pcm_path(sid).open("ab") as raw:
+                raw.write(pcm)
+            self.session.audio_file = str(audio_file)
+            if self.session.audio_source in {"none", ""}:
+                self.session.audio_source = "device_pcm"
+            self.session.message = "Device PCM audio uploaded"
+            show_hud("sending")
+            self._save()
+            return self.session
+
+        _write_wav(pcm, audio_file, sample_rate=sample_rate, channels=channels, bits_per_sample=bits_per_sample)
 
         self.session.audio_file = str(audio_file)
-        self.session.audio_source = "sticks3_pcm"
-        self.session.message = "StickS3 audio uploaded"
+        if self.session.audio_source in {"none", ""}:
+            self.session.audio_source = "device_pcm"
+        self.session.message = "Device PCM audio uploaded"
         show_hud("sending")
         self._save()
         return self.session
@@ -173,6 +183,7 @@ class RecordingController:
         self.session.active = False
         self.session.stopped_at = datetime.now().isoformat(timespec="seconds")
         explicit_text = str(request.get("text") or request.get("transcript") or "")
+        self._finalize_device_pcm_upload()
         mic_stop = self.audio_recorder.stop()
         if mic_stop is not None:
             ok, audio_file, message = mic_stop
@@ -294,6 +305,18 @@ class RecordingController:
         self._save_stop_result()
         return self.session
 
+    def _finalize_device_pcm_upload(self) -> None:
+        sid = _clean_session_id(self.session.session_id)
+        if not sid:
+            return
+        raw_path = _raw_pcm_path(sid)
+        if not raw_path.exists() or raw_path.stat().st_size == 0:
+            return
+        wav_path = RECORDINGS_DIR / f"{sid}.wav"
+        _write_wav(raw_path.read_bytes(), wav_path, sample_rate=16000, channels=1, bits_per_sample=16)
+        self.session.audio_file = str(wav_path)
+        raw_path.unlink(missing_ok=True)
+
     def _load(self) -> RecordingSession:
         try:
             data = json.loads(self.path.read_text())
@@ -413,6 +436,40 @@ def _clean_session_id(raw: str) -> str:
     if not all(ch.isalnum() or ch in {"-", "_"} for ch in value):
         return ""
     return value
+
+
+def _is_device_pcm_source(source: str) -> bool:
+    value = source.lower()
+    return any(marker in value for marker in DEVICE_PCM_SOURCE_MARKERS)
+
+
+def _device_pcm_audio_source(source: str) -> str:
+    value = source.lower()
+    if "stickc_plus" in value:
+        return "stickc_plus_pcm"
+    if "sticks3" in value:
+        return "sticks3_pcm"
+    return "device_pcm"
+
+
+def _raw_pcm_path(session_id: str) -> Path:
+    return RECORDINGS_DIR / f"{session_id}.pcm"
+
+
+def _write_wav(
+    pcm: bytes,
+    path: Path,
+    *,
+    sample_rate: int,
+    channels: int,
+    bits_per_sample: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(max(1, channels))
+        wav.setsampwidth(bits_per_sample // 8)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
 
 
 def _run_command_hook(

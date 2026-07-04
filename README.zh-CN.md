@@ -6,13 +6,13 @@
 
 ![VibeStick 语音输入流程，显示 StickS3 录音状态和 Mac HUD](assets/brand/voice-input-preview.png)
 
-VibeStick 把 M5Stack StickS3 变成一个桌面 AI agent 小终端：显示状态、5H/7D 用量、提醒音，并支持长按说话后自动转写粘贴到 Mac。
+VibeStick 把 M5Stack StickS3 / M5StickC Plus 变成一个桌面 AI agent 小终端：显示状态、5H/7D 用量、提醒音，并支持长按说话后自动转写粘贴到 Mac。
 
-VibeStick 面向 M5Stack StickS3，不是 M5Stack 官方项目。Codex、Claude 等第三方 agent 名称只用于说明本地兼容工具和集成。
+VibeStick 面向 M5Stack StickS3 和 M5StickC Plus，不是 M5Stack 官方项目。Codex、Claude 等第三方 agent 名称只用于说明本地兼容工具和集成。
 
 ## 开始前的准备
 
-- [ ] M5 StickS3｜一根 USB-C 数据线｜一台电脑（最好是Mac）
+- [ ] M5 StickS3 或 M5StickC Plus｜一根数据线｜一台电脑（最好是Mac）
 - [ ] Wi-Fi（必须是 2.4GHz） 名称｜Wi-Fi密码｜语音识别模型 API Key
 -  语音转写API key 推荐 SiliconFlow：<https://cloud.siliconflow.cn/i/7ZCoy9fU>。国内直连、有免费额度、OpenAI 兼容；演示视频用的就是 SiliconFlow。可改用其他 OpenAI 兼容服务的 `base_url` 和模型名称。
 -  如要显示 Claude 5H/7D 用量（该功能默认关闭）。需要 Claude Code CLI（在终端运行 `claude` 后执行 `/login`），并在 `.env` 中设置 `VIBE_STICK_CLAUDE_USAGE=on`。
@@ -60,7 +60,7 @@ VIBE_STICK_ASR_MODEL=FunAudioLLM/SenseVoiceSmall
 if [ ! -d "$HOME/esp/esp-idf" ]; then
   mkdir -p ~/esp && cd ~/esp
   git clone -b v5.5.1 --recursive https://github.com/espressif/esp-idf.git
-  cd esp-idf && ./install.sh esp32s3
+  cd esp-idf && ./install.sh esp32,esp32s3
 fi
 . "$HOME/esp/esp-idf/export.sh"
 ```
@@ -70,10 +70,10 @@ fi
 6. 构建并烧录固件：
 
 ```sh
-cd firmware/sticks3
-idf.py -p <port> build flash
-cd ../..
+./scripts/firmware.sh stickc_plus -p <port> build flash
 ```
+
+如果是 StickS3，把 `stickc_plus` 换成 `sticks3`。
 
 如果不知道端口，运行：
 
@@ -246,15 +246,15 @@ bash -n scripts/setup.sh scripts/doctor.sh scripts/install.sh
 固件构建仍需要 ESP-IDF：
 
 ```sh
-cd firmware/sticks3
 . $HOME/esp/esp-idf/export.sh
-idf.py build
+./scripts/firmware.sh stickc_plus build
+./scripts/firmware.sh sticks3 build
 ```
 
 ## 当前限制
 
 - 这是整理后的原型，不是打包好的 Mac app 或 DMG。
-- 固件只面向 M5Stack StickS3。
+- 固件面向 M5Stack StickS3 和 M5StickC Plus；其他设备未声明支持。
 - Codex quota 来自本地 Codex session JSONL 里的 `rate_limits`，不是官方 quota API。
 - Claude usage 来自未公开的 Claude Code OAuth endpoint，默认关闭。
 - ASR 可靠性取决于麦克风采集、上传 PCM 质量、provider 可达性和模型配置。

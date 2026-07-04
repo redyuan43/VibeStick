@@ -1,6 +1,6 @@
 # Protocol
 
-VibeStick v0.1.2 uses HTTP over Wi-Fi between the StickS3 firmware and the local Mac bridge.
+VibeStick v0.1.2 uses HTTP over Wi-Fi between the device firmware and the local Mac bridge.
 
 Default bridge URL:
 
@@ -26,6 +26,15 @@ X-Vibe-Stick-Sample-Rate: 16000
 X-Vibe-Stick-Channels: 1
 X-Vibe-Stick-Bits-Per-Sample: 16
 ```
+
+Low-memory firmware targets may upload audio in append chunks:
+
+```text
+POST /recording/audio?session_id=<id>&append=1
+Content-Type: application/octet-stream
+```
+
+The bridge appends those chunks to a temporary PCM file and finalizes it as WAV when `/recording/stop` arrives. A single full-body upload without `append=1` remains supported.
 
 When `VIBE_STICK_BRIDGE_TOKEN` is configured on the bridge and firmware, protected POST requests also include:
 

@@ -1,12 +1,20 @@
 #include "vibe_board.h"
 
+#include "vibe_board_profile.h"
+
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 
-#define PIN_I2C_SCL 48
-#define PIN_I2C_SDA 47
+#define I2C_FREQ_HZ 100000
+
+static const char *TAG = "vibe_board";
+static i2c_master_bus_handle_t s_i2c_bus;
+static i2c_master_dev_handle_t s_pmic_dev;
+
+#if VIBE_BOARD_HAS_ES8311
 
 #define M5PM1_ADDR 0x6e
 #define M5PM1_REG_DEVICE_ID 0x00
@@ -36,11 +44,28 @@
 #define M5PM1_GPIO_FUNC_MASK(pin) (0x03 << ((pin) * 2))
 #define M5PM1_GPIO_FUNC_GPIO(pin) (0x00 << ((pin) * 2))
 #define M5PM1_GPIO_FUNC_IRQ(pin)  (0x01 << ((pin) * 2))
-#define I2C_FREQ_HZ 100000
 
-static const char *TAG = "vibe_board";
-static i2c_master_bus_handle_t s_i2c_bus;
-static i2c_master_dev_handle_t s_pmic_dev;
+#else
+
+#define AXP192_ADDR 0x34
+#define AXP192_REG_INPUT_STATUS 0x00
+#define AXP192_REG_POWER_STATUS 0x01
+#define AXP192_REG_EXTEN_DCDC2_CTRL 0x10
+#define AXP192_REG_OUTPUT_CTRL 0x12
+#define AXP192_REG_VOFF_SET 0x31
+#define AXP192_REG_CHARGE_CTRL1 0x33
+#define AXP192_REG_BACKUP_CHARGE_CTRL 0x35
+#define AXP192_REG_PEK 0x36
+#define AXP192_REG_TEMP_PROTECT 0x39
+#define AXP192_REG_ADC_ENABLE1 0x82
+#define AXP192_REG_ADC_SPEED 0x84
+#define AXP192_REG_GPIO0_CTRL 0x90
+#define AXP192_REG_GPIO0_LDO_VOLT 0x91
+#define AXP192_REG_LDO23_VOLT 0x28
+#define AXP192_REG_VBUS_VOLTAGE 0x5a
+#define AXP192_REG_BAT_VOLTAGE 0x78
+
+#endif
 
 static esp_err_t read_reg(uint8_t reg, uint8_t *value)
 {
@@ -67,7 +92,7 @@ static esp_err_t update_reg(uint8_t reg, uint8_t clear_mask, uint8_t set_mask)
     return write_reg(reg, value);
 }
 
-static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl)
+static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, uint8_t address)
 {
     if (s_i2c_bus) {
         i2c_del_master_bus(s_i2c_bus);
@@ -87,11 +112,25 @@ static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl)
 
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = M5PM1_ADDR,
+        .device_address = address,
         .scl_speed_hz = I2C_FREQ_HZ,
     };
     return i2c_master_bus_add_device(s_i2c_bus, &dev_config, &s_pmic_dev);
 }
+
+static int voltage_to_percent(int voltage_mv)
+{
+    int level = (voltage_mv - 3300) * 100 / (4150 - 3350);
+    if (level < 0) {
+        return 0;
+    }
+    if (level > 100) {
+        return 100;
+    }
+    return level;
+}
+
+#if VIBE_BOARD_HAS_ES8311
 
 static esp_err_t init_i2c(void)
 {
@@ -100,14 +139,14 @@ static esp_err_t init_i2c(void)
         gpio_num_t sda;
         gpio_num_t scl;
     } candidates[] = {
-        {I2C_NUM_1, PIN_I2C_SDA, PIN_I2C_SCL},
-        {I2C_NUM_1, PIN_I2C_SCL, PIN_I2C_SDA},
-        {I2C_NUM_0, PIN_I2C_SDA, PIN_I2C_SCL},
-        {I2C_NUM_0, PIN_I2C_SCL, PIN_I2C_SDA},
+        {VIBE_BOARD_I2C_PORT, VIBE_BOARD_PIN_I2C_SDA, VIBE_BOARD_PIN_I2C_SCL},
+        {VIBE_BOARD_I2C_PORT, VIBE_BOARD_PIN_I2C_SCL, VIBE_BOARD_PIN_I2C_SDA},
+        {I2C_NUM_0, VIBE_BOARD_PIN_I2C_SDA, VIBE_BOARD_PIN_I2C_SCL},
+        {I2C_NUM_0, VIBE_BOARD_PIN_I2C_SCL, VIBE_BOARD_PIN_I2C_SDA},
     };
     esp_err_t last_err = ESP_FAIL;
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
-        last_err = init_i2c_on(candidates[i].port, candidates[i].sda, candidates[i].scl);
+        last_err = init_i2c_on(candidates[i].port, candidates[i].sda, candidates[i].scl, M5PM1_ADDR);
         if (last_err != ESP_OK) {
             continue;
         }
@@ -165,11 +204,6 @@ esp_err_t vibe_board_init_power(void)
     return ESP_OK;
 }
 
-i2c_master_bus_handle_t vibe_board_i2c_bus(void)
-{
-    return s_i2c_bus;
-}
-
 esp_err_t vibe_board_battery_level(int *level_percent)
 {
     ESP_RETURN_ON_FALSE(level_percent != NULL, ESP_ERR_INVALID_ARG, TAG, "null level");
@@ -177,14 +211,7 @@ esp_err_t vibe_board_battery_level(int *level_percent)
 
     uint8_t data[2] = {0};
     ESP_RETURN_ON_ERROR(read_regs(M5PM1_REG_BAT_L, data, sizeof(data)), TAG, "read bat");
-    int voltage_mv = (data[1] << 8) | data[0];
-    int level = (voltage_mv - 3300) * 100 / (4150 - 3350);
-    if (level < 0) {
-        level = 0;
-    } else if (level > 100) {
-        level = 100;
-    }
-    *level_percent = level;
+    *level_percent = voltage_to_percent((data[1] << 8) | data[0]);
     return ESP_OK;
 }
 
@@ -206,8 +233,7 @@ esp_err_t vibe_board_usb_powered(bool *usb_powered)
 
     uint8_t data[2] = {0};
     ESP_RETURN_ON_ERROR(read_regs(M5PM1_REG_VIN_L, data, sizeof(data)), TAG, "read vin");
-    int voltage_mv = (data[1] << 8) | data[0];
-    *usb_powered = voltage_mv > 4500;
+    *usb_powered = (((int)data[1] << 8) | data[0]) > 4500;
     return ESP_OK;
 }
 
@@ -234,6 +260,132 @@ esp_err_t vibe_board_speaker_set_enabled(bool enabled)
                                    enabled ? 0 : M5PM1_GPIO3_SPK_PULSE,
                                    enabled ? M5PM1_GPIO3_SPK_PULSE : 0),
                         TAG, "speaker gpio out");
-    ESP_LOGI(TAG, "speaker amp %s", enabled ? "enabled" : "disabled");
     return ESP_OK;
 }
+
+esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
+{
+    (void)brightness;
+    return ESP_OK;
+}
+
+#else
+
+static uint16_t read_12bit_adc(uint8_t reg)
+{
+    uint8_t data[2] = {0};
+    if (read_regs(reg, data, sizeof(data)) != ESP_OK) {
+        return 0;
+    }
+    return ((uint16_t)data[0] << 4) | (data[1] & 0x0f);
+}
+
+static esp_err_t init_i2c(void)
+{
+    ESP_RETURN_ON_ERROR(init_i2c_on(VIBE_BOARD_I2C_PORT,
+                                    VIBE_BOARD_PIN_I2C_SDA,
+                                    VIBE_BOARD_PIN_I2C_SCL,
+                                    AXP192_ADDR),
+                        TAG, "i2c axp192");
+    uint8_t status = 0;
+    ESP_RETURN_ON_ERROR(read_reg(AXP192_REG_INPUT_STATUS, &status), TAG, "read axp192");
+    ESP_LOGI(TAG, "AXP192 found input_status=0x%02x", status);
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_init_power(void)
+{
+    if (s_pmic_dev) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(init_i2c(), TAG, "init i2c");
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_LDO23_VOLT, 0xcc));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_ADC_SPEED, 0xf2));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_ADC_ENABLE1, 0xff));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_CHARGE_CTRL1, 0xc0));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(AXP192_REG_OUTPUT_CTRL, BIT(4), 0x4d));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_PEK, 0x0c));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_GPIO0_LDO_VOLT, 0xa0));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_GPIO0_CTRL, 0x02));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_EXTEN_DCDC2_CTRL, 0x80));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_TEMP_PROTECT, 0xfc));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_BACKUP_CHARGE_CTRL, 0xa2));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(0x32, 0x46));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(AXP192_REG_VOFF_SET, 0x07, BIT(2)));
+    ESP_LOGI(TAG, "AXP192 power initialized");
+    return ESP_OK;
+}
+
+i2c_master_bus_handle_t vibe_board_i2c_bus(void)
+{
+    return s_i2c_bus;
+}
+
+esp_err_t vibe_board_battery_level(int *level_percent)
+{
+    ESP_RETURN_ON_FALSE(level_percent != NULL, ESP_ERR_INVALID_ARG, TAG, "null level");
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+
+    int voltage_mv = (int)((read_12bit_adc(AXP192_REG_BAT_VOLTAGE) * 11 + 5) / 10);
+    *level_percent = voltage_to_percent(voltage_mv);
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_battery_charging(bool *charging)
+{
+    ESP_RETURN_ON_FALSE(charging != NULL, ESP_ERR_INVALID_ARG, TAG, "null charging");
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+
+    uint8_t status = 0;
+    ESP_RETURN_ON_ERROR(read_reg(AXP192_REG_POWER_STATUS, &status), TAG, "read power status");
+    *charging = (status & BIT(6)) != 0;
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_usb_powered(bool *usb_powered)
+{
+    ESP_RETURN_ON_FALSE(usb_powered != NULL, ESP_ERR_INVALID_ARG, TAG, "null usb powered");
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+
+    int voltage_mv = (int)((read_12bit_adc(AXP192_REG_VBUS_VOLTAGE) * 17 + 5) / 10);
+    *usb_powered = voltage_mv > 4500;
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_speaker_set_enabled(bool enabled)
+{
+    if (!enabled) {
+        gpio_set_direction(VIBE_BOARD_PIN_SPEAKER, GPIO_MODE_OUTPUT);
+        gpio_set_level(VIBE_BOARD_PIN_SPEAKER, 0);
+    }
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
+{
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    uint8_t reg = 0;
+    ESP_RETURN_ON_ERROR(read_reg(AXP192_REG_LDO23_VOLT, &reg), TAG, "read ldo23");
+    if (brightness == 0) {
+        return write_reg(AXP192_REG_LDO23_VOLT, reg & 0x0f);
+    }
+    int percent = (brightness * 100) / 255;
+    int voltage_mv = 2500 + ((3200 - 2500) * percent) / 100;
+    int encoded = (voltage_mv - 1800) / 100;
+    if (encoded < 0) {
+        encoded = 0;
+    } else if (encoded > 0x0f) {
+        encoded = 0x0f;
+    }
+    return write_reg(AXP192_REG_LDO23_VOLT, (reg & 0x0f) | ((uint8_t)encoded << 4));
+}
+
+#endif
+
+#if VIBE_BOARD_HAS_ES8311
+i2c_master_bus_handle_t vibe_board_i2c_bus(void)
+{
+    return s_i2c_bus;
+}
+#endif

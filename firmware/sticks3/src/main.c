@@ -5,6 +5,7 @@
 
 #include "vibe_audio.h"
 #include "vibe_board.h"
+#include "vibe_board_profile.h"
 #include "vibe_stick_config.h"
 #include "button_gpio.h"
 #include "cJSON.h"
@@ -32,27 +33,20 @@
 #include "lvgl.h"
 #include "nvs_flash.h"
 
-#define LCD_HOST SPI2_HOST
-#define LCD_H_RES 135
-#define LCD_V_RES 240
-#define LCD_X_GAP 52
-#define LCD_Y_GAP 40
-#define LCD_PIXEL_CLOCK_HZ (20 * 1000 * 1000)
+#define LCD_HOST VIBE_BOARD_LCD_HOST
+#define LCD_H_RES VIBE_BOARD_LCD_H_RES
+#define LCD_V_RES VIBE_BOARD_LCD_V_RES
+#define LCD_X_GAP VIBE_BOARD_LCD_X_GAP
+#define LCD_Y_GAP VIBE_BOARD_LCD_Y_GAP
+#define LCD_PIXEL_CLOCK_HZ VIBE_BOARD_LCD_PIXEL_CLOCK_HZ
 #define LCD_BACKLIGHT_PWM_HZ 5000
 #define LCD_BACKLIGHT_PWM_MAX 255
 #define LCD_BACKLIGHT_DEFAULT 150
 #define LVGL_DRAW_BUF_LINES 24
 #define LVGL_TICK_PERIOD_MS 10
 #define BATTERY_FILL_MAX_WIDTH 20
-
-#define PIN_BUTTON_FRONT 11
-#define PIN_BUTTON_SIDE 12
-#define PIN_LCD_MOSI 39
-#define PIN_LCD_SCK 40
-#define PIN_LCD_DC 45
-#define PIN_LCD_CS 41
-#define PIN_LCD_RST 21
-#define PIN_LCD_BL 38
+#define RECORDING_UPLOAD_BUFFER_BYTES 4096
+#define RECORDING_UPLOAD_WAIT_MS 10000
 
 static const char *TAG = "vibe_stick";
 
@@ -131,6 +125,8 @@ static char s_last_alert_event_id[56];
 static char s_last_alert_type[24];
 static bool s_alert_sound_baseline_ready;
 static char s_recording_session_id[40];
+static TaskHandle_t s_recording_upload_task;
+static bool s_recording_upload_failed;
 
 static lv_display_t *s_display;
 static lv_obj_t *s_wifi_label;
@@ -390,12 +386,17 @@ static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t 
 
 static void set_backlight(uint8_t brightness)
 {
+#if VIBE_BOARD_HAS_GPIO_BACKLIGHT
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, brightness);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+#else
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_set_lcd_brightness(brightness));
+#endif
 }
 
 static void init_backlight(void)
 {
+#if VIBE_BOARD_HAS_GPIO_BACKLIGHT
     ledc_timer_config_t timer = {
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .timer_num = LEDC_TIMER_0,
@@ -405,7 +406,7 @@ static void init_backlight(void)
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer));
     ledc_channel_config_t channel = {
-        .gpio_num = PIN_LCD_BL,
+        .gpio_num = VIBE_BOARD_LCD_BACKLIGHT_GPIO,
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel = LEDC_CHANNEL_0,
         .timer_sel = LEDC_TIMER_0,
@@ -413,6 +414,7 @@ static void init_backlight(void)
         .hpoint = 0,
     };
     ESP_ERROR_CHECK(ledc_channel_config(&channel));
+#endif
     set_backlight(LCD_BACKLIGHT_DEFAULT);
 }
 
@@ -421,8 +423,8 @@ static esp_err_t init_display(void)
     init_backlight();
 
     spi_bus_config_t buscfg = {
-        .sclk_io_num = PIN_LCD_SCK,
-        .mosi_io_num = PIN_LCD_MOSI,
+        .sclk_io_num = VIBE_BOARD_PIN_LCD_SCK,
+        .mosi_io_num = VIBE_BOARD_PIN_LCD_MOSI,
         .miso_io_num = -1,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
@@ -432,8 +434,8 @@ static esp_err_t init_display(void)
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num = PIN_LCD_DC,
-        .cs_gpio_num = PIN_LCD_CS,
+        .dc_gpio_num = VIBE_BOARD_PIN_LCD_DC,
+        .cs_gpio_num = VIBE_BOARD_PIN_LCD_CS,
         .pclk_hz = LCD_PIXEL_CLOCK_HZ,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
@@ -447,7 +449,7 @@ static esp_err_t init_display(void)
 
     esp_lcd_panel_handle_t panel = NULL;
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = PIN_LCD_RST,
+        .reset_gpio_num = VIBE_BOARD_PIN_LCD_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
@@ -1286,25 +1288,86 @@ static void generate_recording_session_id(char *session_id, size_t session_id_le
     session_id[32] = '\0';
 }
 
-static void upload_recording_audio(void)
+static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len)
 {
-    size_t audio_len = 0;
-    const uint8_t *audio = vibe_audio_data(&audio_len);
     if (!audio || audio_len == 0 || s_recording_session_id[0] == '\0') {
-        ESP_LOGW(TAG, "skip audio upload audio=%p len=%u session=%s",
-                 audio, (unsigned)audio_len, s_recording_session_id);
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
-    char path[96];
-    snprintf(path, sizeof(path), "%s?session_id=%s", VIBE_STICK_RECORDING_AUDIO_PATH, s_recording_session_id);
-    char response[768] = {0};
+    char path[128];
+    snprintf(path, sizeof(path), "%s?session_id=%s&append=1",
+             VIBE_STICK_RECORDING_AUDIO_PATH, s_recording_session_id);
+    char response[512] = {0};
     esp_err_t err = http_post_binary(path, audio, audio_len, response, sizeof(response));
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "audio upload failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "audio chunk upload failed len=%u: %s",
+                 (unsigned)audio_len, esp_err_to_name(err));
+        return err;
+    }
+    (void)response;
+    return ESP_OK;
+}
+
+static void recording_upload_task(void *arg)
+{
+    (void)arg;
+    uint8_t *buffer = heap_caps_malloc(RECORDING_UPLOAD_BUFFER_BYTES, MALLOC_CAP_8BIT);
+    if (!buffer) {
+        ESP_LOGW(TAG, "recording upload buffer allocation failed");
+        s_recording_upload_failed = true;
+        s_recording_upload_task = NULL;
+        vTaskDelete(NULL);
         return;
     }
-    if (response[0] != '\0' && parse_state_json(response)) {
-        render_state();
+
+    size_t uploaded = 0;
+    while (vibe_audio_is_recording() || vibe_audio_pending_chunks() > 0) {
+        size_t audio_len = 0;
+        esp_err_t err = vibe_audio_read(buffer, RECORDING_UPLOAD_BUFFER_BYTES, &audio_len, 250);
+        if (err == ESP_ERR_TIMEOUT) {
+            continue;
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "audio read for upload failed: %s", esp_err_to_name(err));
+            s_recording_upload_failed = true;
+            continue;
+        }
+        err = upload_recording_chunk(buffer, audio_len);
+        if (err != ESP_OK) {
+            s_recording_upload_failed = true;
+        } else {
+            uploaded += audio_len;
+        }
+    }
+
+    heap_caps_free(buffer);
+    ESP_LOGI(TAG, "recording upload task done bytes=%u failed=%d",
+             (unsigned)uploaded, s_recording_upload_failed);
+    s_recording_upload_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void start_recording_upload_task(void)
+{
+    s_recording_upload_failed = false;
+    s_recording_upload_task = NULL;
+    BaseType_t ok = xTaskCreate(recording_upload_task, "recording_upload", 6144, NULL, 4,
+                                &s_recording_upload_task);
+    if (ok != pdPASS) {
+        s_recording_upload_failed = true;
+        s_recording_upload_task = NULL;
+        ESP_LOGW(TAG, "recording upload task create failed");
+    }
+}
+
+static void wait_recording_upload_task(void)
+{
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(RECORDING_UPLOAD_WAIT_MS);
+    while (s_recording_upload_task != NULL && xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    if (s_recording_upload_task != NULL) {
+        ESP_LOGW(TAG, "recording upload task wait timeout");
+        s_recording_upload_failed = true;
     }
 }
 
@@ -1326,8 +1389,10 @@ static void handle_recording_start(void)
 
     char body[192];
     snprintf(body, sizeof(body),
-             "{\"event\":\"button_long_start\",\"source\":\"sticks3\","
-             "\"audio_source\":\"sticks3_pcm\",\"session_id\":\"%s\"}",
+             "{\"event\":\"button_long_start\",\"source\":\"%s\","
+             "\"audio_source\":\"%s\",\"session_id\":\"%s\"}",
+             VIBE_BOARD_EVENT_SOURCE,
+             VIBE_BOARD_AUDIO_SOURCE,
              s_recording_session_id);
     char response[1024] = {0};
     esp_err_t err = http_request("POST", VIBE_STICK_RECORDING_START_PATH, body, response, sizeof(response));
@@ -1345,6 +1410,7 @@ static void handle_recording_start(void)
         ESP_LOGW(TAG, "recording start bridge request failed: %s", esp_err_to_name(err));
     }
 
+    start_recording_upload_task();
 }
 
 static void handle_recording_stop(void)
@@ -1362,12 +1428,14 @@ static void handle_recording_stop(void)
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "hardware recording stop failed: %s", esp_err_to_name(audio_err));
     }
-
-    upload_recording_audio();
+    wait_recording_upload_task();
     vibe_audio_clear();
 
     show_recording_overlay("正在识别", "", true);
-    const char *body = "{\"event\":\"button_long_stop\",\"source\":\"sticks3\",\"paste\":true}";
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"event\":\"button_long_stop\",\"source\":\"%s\",\"paste\":true}",
+             VIBE_BOARD_EVENT_SOURCE);
     char response[1024] = {0};
     esp_err_t err = http_request_timeout("POST", VIBE_STICK_RECORDING_STOP_PATH, body, response, sizeof(response), 30000);
     bool recording_failed = false;
@@ -1383,7 +1451,7 @@ static void handle_recording_stop(void)
             render_state();
         }
     }
-    if (err != ESP_OK || recording_failed) {
+    if (err != ESP_OK || recording_failed || s_recording_upload_failed) {
         ESP_LOGW(TAG, "recording stop bridge request failed: %s", esp_err_to_name(err));
         const char *title = (strcmp(recording_status, "audio_skipped") == 0 ||
                              strcmp(recording_status, "transcript_rejected") == 0)
@@ -1482,7 +1550,7 @@ static esp_err_t init_button(void)
     button_handle_t side_button = NULL;
     const button_config_t button_config = {0};
     const button_gpio_config_t gpio_config = {
-        .gpio_num = PIN_BUTTON_FRONT,
+        .gpio_num = VIBE_BOARD_PIN_BUTTON_FRONT,
         .active_level = 0,
         .enable_power_save = true,
     };
@@ -1502,7 +1570,7 @@ static esp_err_t init_button(void)
                         TAG, "button up");
 
     const button_gpio_config_t side_gpio_config = {
-        .gpio_num = PIN_BUTTON_SIDE,
+        .gpio_num = VIBE_BOARD_PIN_BUTTON_SIDE,
         .active_level = 0,
         .enable_power_save = false,
     };

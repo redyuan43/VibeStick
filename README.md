@@ -6,13 +6,13 @@
 
 ![VibeStick voice input flow showing StickS3 recording states and Mac HUD](assets/brand/voice-input-preview.png)
 
-VibeStick turns an M5Stack StickS3 into a tiny desktop companion for coding agents: status, 5H/7D usage, alerts, and push-to-talk transcription into your Mac.
+VibeStick turns an M5Stack StickS3 or M5StickC Plus into a tiny desktop companion for coding agents: status, 5H/7D usage, alerts, and push-to-talk transcription into your Mac.
 
-VibeStick targets M5Stack StickS3 hardware and is not an official M5Stack project. Third-party agent names such as Codex and Claude describe compatible local tools and integrations only.
+VibeStick targets M5Stack StickS3 and M5StickC Plus hardware and is not an official M5Stack project. Third-party agent names such as Codex and Claude describe compatible local tools and integrations only.
 
 ## What you'll need (prepare first)
 
-- [ ] M5Stack StickS3 and a USB-C data cable.
+- [ ] M5Stack StickS3 or M5StickC Plus and a data cable.
 - [ ] A Mac on the same network as the StickS3.
 - [ ] Wi-Fi name and password. The Wi-Fi must be 2.4 GHz; StickS3 / ESP32-S3 does not support 5 GHz Wi-Fi.
 - [ ] To show Claude 5H/7D usage: this feature is off by default (safer). It needs the Claude Code CLI (run `claude` then `/login` in Terminal) and `VIBE_STICK_CLAUDE_USAGE=on` in `.env`.
@@ -62,7 +62,7 @@ VIBE_STICK_ASR_MODEL=FunAudioLLM/SenseVoiceSmall
 if [ ! -d "$HOME/esp/esp-idf" ]; then
   mkdir -p ~/esp && cd ~/esp
   git clone -b v5.5.1 --recursive https://github.com/espressif/esp-idf.git
-  cd esp-idf && ./install.sh esp32s3
+  cd esp-idf && ./install.sh esp32,esp32s3
 fi
 . "$HOME/esp/esp-idf/export.sh"
 ```
@@ -72,10 +72,10 @@ Or install via Espressif's [official guide](https://docs.espressif.com/projects/
 6. Build and flash the firmware:
 
 ```sh
-cd firmware/sticks3
-idf.py -p <port> build flash
-cd ../..
+./scripts/firmware.sh stickc_plus -p <port> build flash
 ```
+
+For StickS3, replace `stickc_plus` with `sticks3`.
 
 If you do not know the port, run:
 
@@ -248,15 +248,15 @@ bash -n scripts/setup.sh scripts/doctor.sh scripts/install.sh
 Firmware builds still require ESP-IDF:
 
 ```sh
-cd firmware/sticks3
 . $HOME/esp/esp-idf/export.sh
-idf.py build
+./scripts/firmware.sh stickc_plus build
+./scripts/firmware.sh sticks3 build
 ```
 
 ## Current limits
 
 - This is a cleaned prototype, not a packaged Mac app or DMG.
-- The firmware targets M5Stack StickS3 only.
+- The firmware targets M5Stack StickS3 and M5StickC Plus; other devices are not declared supported.
 - Codex quota is inferred from local Codex session JSONL events with `rate_limits`; it is not an official quota API.
 - Claude usage comes from an undocumented Claude Code OAuth endpoint and is disabled by default.
 - ASR reliability depends on microphone capture, uploaded PCM quality, provider availability, and configured model.

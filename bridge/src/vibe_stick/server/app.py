@@ -134,6 +134,7 @@ class BridgeStateStore:
         sample_rate: int = 16000,
         channels: int = 1,
         bits_per_sample: int = 16,
+        append: bool = False,
     ) -> dict[str, Any]:
         session = self.recording.attach_pcm(
             pcm,
@@ -141,6 +142,7 @@ class BridgeStateStore:
             sample_rate=sample_rate,
             channels=channels,
             bits_per_sample=bits_per_sample,
+            append=append,
         )
         return {"recording": session.to_jsonable(), "state": self.get_state().to_jsonable()}
 
@@ -336,6 +338,7 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                         sample_rate=_int_header(self.headers.get("X-Vibe-Stick-Sample-Rate"), 16000),
                         channels=_int_header(self.headers.get("X-Vibe-Stick-Channels"), 1),
                         bits_per_sample=_int_header(self.headers.get("X-Vibe-Stick-Bits-Per-Sample"), 16),
+                        append=_query_bool(query, "append"),
                     )
                 )
             elif parsed.path == "/recording/stop":
@@ -498,6 +501,10 @@ def _claude_quota_from_state(state: VibeStickState) -> QuotaSnapshot:
 def _first(query: dict[str, list[str]], key: str) -> str:
     values = query.get(key) or []
     return values[0] if values else ""
+
+
+def _query_bool(query: dict[str, list[str]], key: str) -> bool:
+    return _first(query, key).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _with_bridge_metadata(payload: dict[str, Any]) -> dict[str, Any]:

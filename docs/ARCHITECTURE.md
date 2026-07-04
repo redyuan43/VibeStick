@@ -2,24 +2,24 @@
 
 VibeStick has two active runtime parts:
 
-1. StickS3 firmware.
+1. Device firmware.
 2. Local Mac bridge service.
 
-The StickS3 does not call cloud AI services directly. It polls and posts to the Mac bridge over HTTP on the local network.
+The device does not call cloud AI services directly. It polls and posts to the Mac bridge over HTTP on the local network.
 
 ```mermaid
 flowchart LR
   Codex["Local Codex sessions"] --> Bridge["VibeStick Bridge"]
   Bridge --> HUD["macOS HUD"]
-  Stick["StickS3 firmware"] <--> Bridge
-  Stick --> Screen["StickS3 screen"]
-  Stick --> Speaker["StickS3 speaker"]
-  Stick --> Mic["StickS3 microphone"]
+  Stick["Device firmware"] <--> Bridge
+  Stick --> Screen["Device screen"]
+  Stick --> Speaker["Device speaker"]
+  Stick --> Mic["Device microphone"]
   Bridge --> Paste["macOS paste injection"]
   Bridge --> ASR["Optional ASR provider or local command"]
 ```
 
-## StickS3 Firmware
+## Device Firmware
 
 Firmware lives in `firmware/sticks3/`.
 
@@ -29,11 +29,11 @@ It owns:
 - Wi-Fi connection.
 - Polling `GET /state`.
 - Posting button events to `/event` and `/quota/refresh`.
-- Blue front-button push-to-talk recording.
-- 16 kHz / 16-bit / mono PCM recording from the StickS3 microphone.
-- Uploading PCM to `/recording/audio`.
-- Agent status sounds generated as PCM and played through ES8311/I2S speaker output.
-- Local battery and USB power display from the StickS3 PMIC.
+- Front-button push-to-talk recording.
+- 16 kHz / 16-bit / mono PCM recording from the device microphone.
+- Uploading PCM to `/recording/audio`; low-memory targets use append-style chunk uploads.
+- Agent status sounds through the board speaker path.
+- Local battery and USB power display from the board PMIC.
 
 It does not read account cookies, browser state, API keys, or quota dashboards.
 

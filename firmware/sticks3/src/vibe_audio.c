@@ -5,56 +5,68 @@
 #include <string.h>
 
 #include "vibe_board.h"
+#include "vibe_board_profile.h"
 #include "driver/i2s_std.h"
+#include "driver/ledc.h"
 #include "esp_check.h"
-#include "esp_codec_dev.h"
-#include "esp_codec_dev_defaults.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#define PIN_ES8311_MCLK 18
-#define PIN_ES8311_BCLK 17
-#define PIN_ES8311_LRCK 15
-#define PIN_ES8311_DIN 14
-#define PIN_ES8311_DOUT 16
+#if VIBE_BOARD_HAS_PDM_MIC
+#include "driver/i2s_pdm.h"
+#endif
+
+#if VIBE_BOARD_HAS_ES8311
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
+#endif
 
 #define AUDIO_FRAME_MS 60
 #define AUDIO_FRAME_SAMPLES ((VIBE_STICK_AUDIO_SAMPLE_RATE * AUDIO_FRAME_MS) / 1000)
-#define AUDIO_MAX_SECONDS 45
-#define AUDIO_MAX_BYTES (VIBE_STICK_AUDIO_SAMPLE_RATE * VIBE_STICK_AUDIO_CHANNELS * \
-                         (VIBE_STICK_AUDIO_BITS_PER_SAMPLE / 8) * AUDIO_MAX_SECONDS)
+#define AUDIO_CHUNK_BYTES (AUDIO_FRAME_SAMPLES * VIBE_STICK_AUDIO_CHANNELS * \
+                           (VIBE_STICK_AUDIO_BITS_PER_SAMPLE / 8))
+#define AUDIO_QUEUE_DEPTH 12
 #define TASK_EXIT_WAIT_MS 800
 #define VIBE_STICK_SOUND_VOLUME 0.40f
 #define VIBE_STICK_SOUND_FRAME_SAMPLES 160
 #define VIBE_STICK_SOUND_FADE_MS 8
 #define VIBE_STICK_SOUND_OUTPUT_VOLUME 85
 #define VIBE_STICK_TWO_PI 6.28318530717958647692f
+#define TONE_DUTY_RES LEDC_TIMER_10_BIT
+#define TONE_DUTY_ON 512
+
+typedef struct {
+    size_t len;
+    uint8_t data[AUDIO_CHUNK_BYTES];
+} audio_chunk_t;
 
 static const char *TAG = "vibe_audio";
 
 static atomic_bool s_running;
 static bool s_initialized;
 static SemaphoreHandle_t s_audio_mutex;
+static QueueHandle_t s_audio_queue;
 static TaskHandle_t s_audio_task;
 static i2s_chan_handle_t s_tx_handle;
 static i2s_chan_handle_t s_rx_handle;
 static bool s_tx_enabled;
 static bool s_rx_enabled;
+
+#if VIBE_BOARD_HAS_ES8311
 static esp_codec_dev_handle_t s_codec;
 static const audio_codec_ctrl_if_t *s_ctrl_if;
 static const audio_codec_data_if_t *s_data_if;
 static const audio_codec_gpio_if_t *s_gpio_if;
 static const audio_codec_if_t *s_codec_if;
-static uint8_t *s_audio_buffer;
-static size_t s_audio_len;
-static size_t s_audio_capacity;
+#endif
 
-static esp_err_t init_i2s(bool enable_tx, bool enable_rx)
+#if VIBE_BOARD_HAS_ES8311
+static esp_err_t init_i2s_std(bool enable_tx, bool enable_rx)
 {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(VIBE_BOARD_I2S_PORT, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg,
                                         enable_tx ? &s_tx_handle : NULL,
@@ -66,11 +78,11 @@ static esp_err_t init_i2s(bool enable_tx, bool enable_rx)
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
                                                         I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .mclk = PIN_ES8311_MCLK,
-            .bclk = PIN_ES8311_BCLK,
-            .ws = PIN_ES8311_LRCK,
-            .dout = PIN_ES8311_DIN,
-            .din = PIN_ES8311_DOUT,
+            .mclk = VIBE_BOARD_PIN_ES8311_MCLK,
+            .bclk = VIBE_BOARD_PIN_ES8311_BCLK,
+            .ws = VIBE_BOARD_PIN_ES8311_LRCK,
+            .dout = VIBE_BOARD_PIN_ES8311_DIN,
+            .din = VIBE_BOARD_PIN_ES8311_DOUT,
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
@@ -99,7 +111,7 @@ static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mo
     ESP_RETURN_ON_FALSE(i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG, "i2c unavailable");
 
     audio_codec_i2c_cfg_t i2c_cfg = {
-        .port = I2C_NUM_1,
+        .port = VIBE_BOARD_I2C_PORT,
         .addr = ES8311_CODEC_DEFAULT_ADDR,
         .bus_handle = i2c_bus,
     };
@@ -107,7 +119,7 @@ static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mo
     ESP_RETURN_ON_FALSE(s_ctrl_if != NULL, ESP_ERR_NO_MEM, TAG, "codec i2c");
 
     audio_codec_i2s_cfg_t i2s_cfg = {
-        .port = I2S_NUM_1,
+        .port = VIBE_BOARD_I2S_PORT,
         .rx_handle = s_rx_handle,
         .tx_handle = s_tx_handle,
     };
@@ -165,7 +177,34 @@ static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mo
     }
     return ESP_OK;
 }
+#endif
 
+#if VIBE_BOARD_HAS_PDM_MIC
+static esp_err_t init_i2s_pdm_rx(void)
+{
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(VIBE_BOARD_I2S_PORT, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &s_rx_handle), TAG, "create pdm rx");
+
+    i2s_pdm_rx_config_t pdm_cfg = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(VIBE_STICK_AUDIO_SAMPLE_RATE),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .clk = VIBE_BOARD_PIN_PDM_CLK,
+            .din = VIBE_BOARD_PIN_PDM_DATA,
+            .invert_flags = {
+                .clk_inv = false,
+            },
+        },
+    };
+    ESP_RETURN_ON_ERROR(i2s_channel_init_pdm_rx_mode(s_rx_handle, &pdm_cfg), TAG, "init pdm rx");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx_handle), TAG, "enable pdm rx");
+    s_rx_enabled = true;
+    return ESP_OK;
+}
+#endif
+
+#if VIBE_BOARD_HAS_ES8311
 static void deinit_codec(void)
 {
     if (s_codec) {
@@ -192,6 +231,7 @@ static void deinit_codec(void)
         s_ctrl_if = NULL;
     }
 }
+#endif
 
 static void deinit_i2s(void)
 {
@@ -221,7 +261,9 @@ static void deinit_i2s(void)
 
 static void release_session_resources(void)
 {
+#if VIBE_BOARD_HAS_ES8311
     deinit_codec();
+#endif
     deinit_i2s();
 }
 
@@ -230,6 +272,7 @@ typedef struct {
     int duration_ms;
 } sound_segment_t;
 
+#if VIBE_BOARD_HAS_ES8311
 static float sound_envelope(int sample_index, int total_samples)
 {
     const int fade_samples = (VIBE_STICK_AUDIO_SAMPLE_RATE * VIBE_STICK_SOUND_FADE_MS) / 1000;
@@ -287,6 +330,51 @@ static esp_err_t play_sound_segments(const sound_segment_t *segments, size_t cou
     sound_segment_t tail = {.freq_hz = 0, .duration_ms = 20};
     return write_sound_segment(&tail);
 }
+#endif
+
+#if VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+static esp_err_t init_tone_output(void)
+{
+    ledc_timer_config_t timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_1,
+        .duty_resolution = TONE_DUTY_RES,
+        .freq_hz = 1000,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "tone timer");
+    ledc_channel_config_t channel = {
+        .gpio_num = VIBE_BOARD_PIN_SPEAKER,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1,
+        .timer_sel = LEDC_TIMER_1,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    return ledc_channel_config(&channel);
+}
+
+static esp_err_t play_tone_segments(const sound_segment_t *segments, size_t count)
+{
+    ESP_RETURN_ON_ERROR(init_tone_output(), TAG, "tone output");
+    for (size_t i = 0; i < count; ++i) {
+        if (segments[i].freq_hz > 0) {
+            ESP_RETURN_ON_ERROR(ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1, segments[i].freq_hz),
+                                TAG, "tone freq");
+            ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, TONE_DUTY_ON),
+                                TAG, "tone duty");
+        } else {
+            ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0),
+                                TAG, "tone silence");
+        }
+        ESP_RETURN_ON_ERROR(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1), TAG, "tone update");
+        vTaskDelay(pdMS_TO_TICKS(segments[i].duration_ms));
+    }
+    ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0), TAG, "tone off");
+    ESP_RETURN_ON_ERROR(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1), TAG, "tone off update");
+    return vibe_board_speaker_set_enabled(false);
+}
+#endif
 
 static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *count)
 {
@@ -324,27 +412,45 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
     }
 }
 
+static esp_err_t read_audio_chunk(audio_chunk_t *chunk)
+{
+#if VIBE_BOARD_HAS_ES8311
+    chunk->len = AUDIO_CHUNK_BYTES;
+    ESP_RETURN_ON_FALSE(esp_codec_dev_read(s_codec, chunk->data, (int)chunk->len) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "codec read");
+    return ESP_OK;
+#else
+    size_t bytes_read = 0;
+    ESP_RETURN_ON_ERROR(i2s_channel_read(s_rx_handle, chunk->data, sizeof(chunk->data),
+                                         &bytes_read, portMAX_DELAY),
+                        TAG, "pdm read");
+    chunk->len = bytes_read;
+    return ESP_OK;
+#endif
+}
+
 static void audio_task(void *arg)
 {
     (void)arg;
-    int16_t frame[AUDIO_FRAME_SAMPLES];
+    audio_chunk_t chunk = {0};
     size_t dropped = 0;
 
     while (atomic_load(&s_running)) {
-        esp_err_t err = esp_codec_dev_read(s_codec, frame, sizeof(frame));
+        esp_err_t err = read_audio_chunk(&chunk);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "codec read failed: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "audio read failed: %s", esp_err_to_name(err));
             continue;
         }
-        if (s_audio_len + sizeof(frame) <= s_audio_capacity) {
-            memcpy(s_audio_buffer + s_audio_len, frame, sizeof(frame));
-            s_audio_len += sizeof(frame);
-        } else {
-            dropped += sizeof(frame);
+        if (chunk.len == 0) {
+            continue;
+        }
+        if (xQueueSend(s_audio_queue, &chunk, 0) != pdTRUE) {
+            dropped += chunk.len;
         }
     }
 
-    ESP_LOGI(TAG, "recorded %u bytes dropped=%u", (unsigned)s_audio_len, (unsigned)dropped);
+    ESP_LOGI(TAG, "recording stopped dropped=%u pending=%u",
+             (unsigned)dropped, (unsigned)uxQueueMessagesWaiting(s_audio_queue));
     release_session_resources();
     s_audio_task = NULL;
     vTaskDelete(NULL);
@@ -355,6 +461,10 @@ esp_err_t vibe_audio_init(void)
     if (!s_audio_mutex) {
         s_audio_mutex = xSemaphoreCreateMutex();
         ESP_RETURN_ON_FALSE(s_audio_mutex != NULL, ESP_ERR_NO_MEM, TAG, "audio mutex");
+    }
+    if (!s_audio_queue) {
+        s_audio_queue = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(audio_chunk_t));
+        ESP_RETURN_ON_FALSE(s_audio_queue != NULL, ESP_ERR_NO_MEM, TAG, "audio queue");
     }
     s_initialized = true;
     return ESP_OK;
@@ -369,43 +479,33 @@ esp_err_t vibe_audio_start(void)
     ESP_RETURN_ON_FALSE(s_audio_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "audio mutex missing");
     ESP_RETURN_ON_FALSE(xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(250)) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "audio busy");
-    if (atomic_load(&s_running) || s_audio_task != NULL || s_codec != NULL || s_tx_handle != NULL || s_rx_handle != NULL) {
+    if (atomic_load(&s_running) || s_audio_task != NULL || s_tx_handle != NULL || s_rx_handle != NULL) {
         xSemaphoreGive(s_audio_mutex);
         return ESP_ERR_INVALID_STATE;
     }
 
     vibe_audio_clear();
-    s_audio_capacity = AUDIO_MAX_BYTES;
-    s_audio_buffer = heap_caps_malloc(s_audio_capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_audio_buffer) {
-        s_audio_buffer = heap_caps_malloc(s_audio_capacity, MALLOC_CAP_8BIT);
-    }
-    if (!s_audio_buffer) {
-        xSemaphoreGive(s_audio_mutex);
-        ESP_RETURN_ON_FALSE(false, ESP_ERR_NO_MEM, TAG, "audio buffer");
-    }
-    s_audio_len = 0;
 
-    esp_err_t err = init_i2s(false, true);
-    if (err != ESP_OK) {
-        release_session_resources();
-        xSemaphoreGive(s_audio_mutex);
-        return err;
+    esp_err_t err = ESP_OK;
+#if VIBE_BOARD_HAS_ES8311
+    err = init_i2s_std(false, true);
+    if (err == ESP_OK) {
+        err = init_codec(ESP_CODEC_DEV_TYPE_IN, ESP_CODEC_DEV_WORK_MODE_ADC);
     }
-    err = init_codec(ESP_CODEC_DEV_TYPE_IN, ESP_CODEC_DEV_WORK_MODE_ADC);
+#else
+    err = init_i2s_pdm_rx();
+#endif
     if (err != ESP_OK) {
         release_session_resources();
-        vibe_audio_clear();
         xSemaphoreGive(s_audio_mutex);
         return err;
     }
 
     atomic_store(&s_running, true);
-    BaseType_t ok = xTaskCreatePinnedToCore(audio_task, "vibe_audio", 32768, NULL, 5, &s_audio_task, 1);
+    BaseType_t ok = xTaskCreatePinnedToCore(audio_task, "vibe_audio", 8192, NULL, 5, &s_audio_task, 1);
     if (ok != pdPASS) {
         atomic_store(&s_running, false);
         release_session_resources();
-        vibe_audio_clear();
         xSemaphoreGive(s_audio_mutex);
         return ESP_ERR_NO_MEM;
     }
@@ -447,7 +547,7 @@ esp_err_t vibe_audio_play_sound(agent_sound_t sound)
     if (xSemaphoreTake(s_audio_mutex, 0) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    if (vibe_audio_is_recording() || s_codec != NULL || s_tx_handle != NULL || s_rx_handle != NULL) {
+    if (vibe_audio_is_recording() || s_tx_handle != NULL || s_rx_handle != NULL) {
         xSemaphoreGive(s_audio_mutex);
         return ESP_ERR_INVALID_STATE;
     }
@@ -460,8 +560,9 @@ esp_err_t vibe_audio_play_sound(agent_sound_t sound)
     }
 
     esp_err_t err = vibe_board_speaker_set_enabled(true);
+#if VIBE_BOARD_HAS_ES8311
     if (err == ESP_OK) {
-        err = init_i2s(true, false);
+        err = init_i2s_std(true, false);
     }
     if (err == ESP_OK) {
         err = init_codec(ESP_CODEC_DEV_TYPE_OUT, ESP_CODEC_DEV_WORK_MODE_DAC);
@@ -469,9 +570,13 @@ esp_err_t vibe_audio_play_sound(agent_sound_t sound)
     if (err == ESP_OK) {
         err = play_sound_segments(segments, segment_count);
     }
-
     release_session_resources();
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_speaker_set_enabled(false));
+#else
+    if (err == ESP_OK) {
+        err = play_tone_segments(segments, segment_count);
+    }
+#endif
     xSemaphoreGive(s_audio_mutex);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "sound playback failed: %s", esp_err_to_name(err));
@@ -481,20 +586,39 @@ esp_err_t vibe_audio_play_sound(agent_sound_t sound)
     return err;
 }
 
+esp_err_t vibe_audio_read(uint8_t *buffer, size_t capacity, size_t *len, uint32_t timeout_ms)
+{
+    ESP_RETURN_ON_FALSE(buffer != NULL && len != NULL, ESP_ERR_INVALID_ARG, TAG, "null read args");
+    ESP_RETURN_ON_FALSE(capacity >= AUDIO_CHUNK_BYTES, ESP_ERR_INVALID_ARG, TAG, "buffer too small");
+    audio_chunk_t chunk = {0};
+    if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        *len = 0;
+        return ESP_ERR_TIMEOUT;
+    }
+    memcpy(buffer, chunk.data, chunk.len);
+    *len = chunk.len;
+    return ESP_OK;
+}
+
+size_t vibe_audio_pending_chunks(void)
+{
+    return s_audio_queue ? uxQueueMessagesWaiting(s_audio_queue) : 0;
+}
+
 const uint8_t *vibe_audio_data(size_t *len)
 {
     if (len) {
-        *len = s_audio_len;
+        *len = 0;
     }
-    return s_audio_buffer;
+    return NULL;
 }
 
 void vibe_audio_clear(void)
 {
-    if (s_audio_buffer) {
-        heap_caps_free(s_audio_buffer);
-        s_audio_buffer = NULL;
+    if (!s_audio_queue) {
+        return;
     }
-    s_audio_len = 0;
-    s_audio_capacity = 0;
+    audio_chunk_t chunk = {0};
+    while (xQueueReceive(s_audio_queue, &chunk, 0) == pdTRUE) {
+    }
 }
