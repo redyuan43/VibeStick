@@ -105,9 +105,23 @@ ls /dev/cu.*
 
 11. 👤 打开任意文本框，长按正面蓝键说话，松开后 VibeStick 应自动转写并粘贴。
 
-M5StickC Plus 还支持拿起录音模式：默认是 `PTT` 按住说话；长按侧键可切到 `LIFT`，设备会用开机时的桌面平放状态做基线，拿起开始录音，放回桌面并稳定后发送识别。侧键短按仍用于切换 Codex / Claude。
+StickS3 和 M5StickC Plus 都支持拿起录音模式：默认是 `PTT` 按住说话；长按侧键可切到 `LIFT`，设备会用开机时的桌面平放状态做基线，拿起开始录音，放回桌面并稳定后发送识别。侧键短按仍用于切换 Codex / Claude。
 
 开发调试时可以用 `./scripts/dev.sh` 替代 `./scripts/install.sh`，它会在当前终端里运行 bridge。
+
+## Wi-Fi OTA 固件更新
+
+当前固件使用双 OTA app 分区。第一次从旧 single-app 分区升级到双 OTA 分区时，仍然需要通过 USB 烧录一次完整固件；完成这一次后，后续固件可以通过同一 Wi-Fi 下的 bridge 发布。
+
+构建并发布某块板的 OTA 包：
+
+```sh
+. "$HOME/esp/esp-idf/export.sh"
+./scripts/firmware.sh sticks3 build
+./scripts/ota_publish.sh sticks3
+```
+
+如果是 M5StickC Plus，把 `sticks3` 换成 `stickc_plus`。发布后的文件会写入 `firmware/sticks3/ota/`，bridge 会通过 `/ota/manifest?board=...` 和 `/ota/bin?board=...` 提供给设备。设备连上 Wi-Fi 后会自动检查；发现 build id 不同的新固件时，会下载到备用 OTA 分区、切换启动分区并重启。
 
 ## 常见问题排查
 

@@ -107,9 +107,23 @@ If Codex works but the Claude column shows `--%`, that is expected: Claude usage
 
 11. 👤 Open any text box, long-press the front blue button, speak, and release. VibeStick should transcribe and paste the text automatically.
 
-M5StickC Plus also supports lift-to-talk mode. The default `PTT` mode keeps push-to-talk behavior. Long-press the side button to switch to `LIFT`; the device uses its boot-time flat desktop pose as the baseline, starts recording when lifted, and sends recognition after it is placed back flat and stable. Short-pressing the side button still switches Codex / Claude.
+StickS3 and M5StickC Plus also support lift-to-talk mode. The default `PTT` mode keeps push-to-talk behavior. Long-press the side button to switch to `LIFT`; the device uses its boot-time flat desktop pose as the baseline, starts recording when lifted, and sends recognition after it is placed back flat and stable. Short-pressing the side button still switches Codex / Claude.
 
 For development without installing LaunchAgents, run `./scripts/dev.sh` from the repository root instead of `./scripts/install.sh`.
+
+## Wi-Fi OTA Firmware Updates
+
+The firmware now uses dual OTA app partitions. The first upgrade from the old single-app partition layout still needs one full USB flash. After that one-time flash, future firmware builds can be published through the bridge on the same Wi-Fi network.
+
+Build and publish an OTA image for a board:
+
+```sh
+. "$HOME/esp/esp-idf/export.sh"
+./scripts/firmware.sh sticks3 build
+./scripts/ota_publish.sh sticks3
+```
+
+For M5StickC Plus, replace `sticks3` with `stickc_plus`. Published files are written to `firmware/sticks3/ota/`; the bridge serves them through `/ota/manifest?board=...` and `/ota/bin?board=...`. Once the device is on Wi-Fi, it checks for a different build id, downloads the image to the inactive OTA slot, switches boot partitions, and restarts.
 
 ## Troubleshooting
 

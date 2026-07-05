@@ -11,4 +11,18 @@ The generated glyph subset is used only for the StickS3 Chinese UI font in:
 
   firmware/sticks3/generated/vibe_stick_cn_16.c
 
+Wowotou character artwork
+
+This repository includes selected Wowotou theme SVG source frames and generated
+LVGL RGB565 firmware bitmaps for the M5Stack home-screen pet:
+
+  firmware/sticks3/assets/wowotou/
+  firmware/sticks3/generated/vibe_stick_pet_assets.c
+  firmware/sticks3/generated/vibe_stick_pet_assets.h
+
+The artwork originates from the user's MiniCPM-Desk-Pet-client / clawd-on-desk
+Wowotou theme. The user confirmed they have the right to use these assets in
+this VibeStick repository. These artwork files are not general-purpose
+project-owned MIT assets.
+
 VibeStick does not intentionally vendor third-party brand assets or historical prototype application shells in v0.1.1.
