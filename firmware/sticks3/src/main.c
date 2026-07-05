@@ -45,8 +45,9 @@
 #define LCD_PIXEL_CLOCK_HZ VIBE_BOARD_LCD_PIXEL_CLOCK_HZ
 #define LCD_BACKLIGHT_PWM_HZ 5000
 #define LCD_BACKLIGHT_PWM_MAX 255
-#define LCD_BACKLIGHT_DEFAULT 150
-#define LCD_BACKLIGHT_IDLE 45
+#define LCD_BACKLIGHT_DEFAULT VIBE_BOARD_LCD_BACKLIGHT_DEFAULT
+#define LCD_BACKLIGHT_IDLE VIBE_BOARD_LCD_BACKLIGHT_IDLE
+#define LCD_BACKLIGHT_OFF VIBE_BOARD_LCD_BACKLIGHT_OFF
 #define LVGL_DRAW_BUF_LINES 24
 #define LVGL_TICK_PERIOD_MS 10
 #define BATTERY_FILL_MAX_WIDTH 20
@@ -56,6 +57,7 @@
 #define FIRMWARE_BUILD_ID __DATE__ " " __TIME__
 #define VIBE_STICK_CONTROL_CORE 0
 #define VIBE_STICK_IDLE_DIM_MS 30000
+#define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_IDLE_STATE_POLL_MS 10000
 
 static const char *TAG = "vibe_stick";
@@ -144,6 +146,12 @@ typedef enum {
     RECORDING_MODE_LIFT_TO_TALK,
 } recording_mode_t;
 
+typedef enum {
+    DISPLAY_POWER_ACTIVE,
+    DISPLAY_POWER_DIMMED,
+    DISPLAY_POWER_OFF,
+} display_power_state_t;
+
 static QueueHandle_t s_event_queue;
 static SemaphoreHandle_t s_lvgl_lock;
 static bool s_wifi_connected;
@@ -164,7 +172,7 @@ static bool s_ota_in_progress;
 static int64_t s_last_ota_check_ms;
 static int64_t s_last_activity_ms;
 static uint8_t s_current_backlight = LCD_BACKLIGHT_DEFAULT;
-static bool s_power_save_dimmed;
+static display_power_state_t s_display_power_state = DISPLAY_POWER_ACTIVE;
 static uint8_t *s_pet_pixels;
 static vibe_stick_pet_frame_id_t s_pet_current_frame = VIBE_STICK_PET_FRAME_COUNT;
 static int64_t s_pet_next_frame_ms;
@@ -495,8 +503,9 @@ static bool display_should_stay_active(void)
 static void register_activity(void)
 {
     s_last_activity_ms = esp_timer_get_time() / 1000;
-    if (s_power_save_dimmed || s_current_backlight != LCD_BACKLIGHT_DEFAULT) {
-        s_power_save_dimmed = false;
+    if (s_display_power_state != DISPLAY_POWER_ACTIVE ||
+        s_current_backlight != LCD_BACKLIGHT_DEFAULT) {
+        s_display_power_state = DISPLAY_POWER_ACTIVE;
         set_backlight(LCD_BACKLIGHT_DEFAULT);
     }
 }
@@ -506,13 +515,22 @@ static void update_power_saving(int64_t now_ms)
     if (s_last_activity_ms == 0) {
         s_last_activity_ms = now_ms;
     }
-    const bool dim = !display_should_stay_active() &&
-                     now_ms - s_last_activity_ms >= VIBE_STICK_IDLE_DIM_MS;
-    const uint8_t target = dim ? LCD_BACKLIGHT_IDLE : LCD_BACKLIGHT_DEFAULT;
+    display_power_state_t next_state = DISPLAY_POWER_ACTIVE;
+    uint8_t target = LCD_BACKLIGHT_DEFAULT;
+    if (!display_should_stay_active()) {
+        const int64_t idle_ms = now_ms - s_last_activity_ms;
+        if (idle_ms >= VIBE_STICK_IDLE_OFF_MS) {
+            next_state = DISPLAY_POWER_OFF;
+            target = LCD_BACKLIGHT_OFF;
+        } else if (idle_ms >= VIBE_STICK_IDLE_DIM_MS) {
+            next_state = DISPLAY_POWER_DIMMED;
+            target = LCD_BACKLIGHT_IDLE;
+        }
+    }
     if (target != s_current_backlight) {
         set_backlight(target);
     }
-    s_power_save_dimmed = dim;
+    s_display_power_state = next_state;
 }
 
 static void init_backlight(void)
@@ -808,7 +826,7 @@ static pet_sequence_t pet_sequence_for_state(const char *status)
 
 static void update_pet_visual(void)
 {
-    if (s_power_save_dimmed && !s_recording_overlay_visible) {
+    if (s_display_power_state != DISPLAY_POWER_ACTIVE && !s_recording_overlay_visible) {
         return;
     }
     if (!s_pet_image) {
@@ -2085,7 +2103,7 @@ static void app_task(void *arg)
     while (true) {
         int64_t now_ms = esp_timer_get_time() / 1000;
         update_power_saving(now_ms);
-        const int state_poll_ms = s_power_save_dimmed ?
+        const int state_poll_ms = s_display_power_state != DISPLAY_POWER_ACTIVE ?
             VIBE_STICK_IDLE_STATE_POLL_MS : VIBE_STICK_STATE_POLL_MS;
         if (s_wifi_connected && now_ms - last_poll >= state_poll_ms) {
             last_poll = now_ms;
