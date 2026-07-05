@@ -59,6 +59,7 @@
 #define VIBE_STICK_IDLE_DIM_MS 30000
 #define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_IDLE_STATE_POLL_MS 10000
+#define RECORDING_RSSI_UNKNOWN -127
 
 static const char *TAG = "vibe_stick";
 
@@ -152,6 +153,20 @@ typedef enum {
     DISPLAY_POWER_OFF,
 } display_power_state_t;
 
+typedef struct {
+    size_t uploaded_chunks;
+    size_t uploaded_bytes;
+    size_t upload_failures;
+    size_t read_failures;
+    size_t read_timeouts;
+    size_t max_pending_chunks;
+    int64_t post_duration_total_ms;
+    int64_t post_duration_min_ms;
+    int64_t post_duration_max_ms;
+    int start_rssi;
+    int stop_rssi;
+} recording_upload_stats_t;
+
 static QueueHandle_t s_event_queue;
 static SemaphoreHandle_t s_lvgl_lock;
 static bool s_wifi_connected;
@@ -173,6 +188,7 @@ static int64_t s_last_ota_check_ms;
 static int64_t s_last_activity_ms;
 static uint8_t s_current_backlight = LCD_BACKLIGHT_DEFAULT;
 static display_power_state_t s_display_power_state = DISPLAY_POWER_ACTIVE;
+static recording_upload_stats_t s_recording_upload_stats;
 static uint8_t *s_pet_pixels;
 static vibe_stick_pet_frame_id_t s_pet_current_frame = VIBE_STICK_PET_FRAME_COUNT;
 static int64_t s_pet_next_frame_ms;
@@ -1742,6 +1758,76 @@ static void generate_recording_session_id(char *session_id, size_t session_id_le
     session_id[32] = '\0';
 }
 
+static int current_wifi_rssi(void)
+{
+    if (!s_wifi_connected) {
+        return RECORDING_RSSI_UNKNOWN;
+    }
+    wifi_ap_record_t ap = {0};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return RECORDING_RSSI_UNKNOWN;
+    }
+    return ap.rssi;
+}
+
+static void reset_recording_upload_stats(void)
+{
+    memset(&s_recording_upload_stats, 0, sizeof(s_recording_upload_stats));
+    s_recording_upload_stats.post_duration_min_ms = -1;
+    s_recording_upload_stats.start_rssi = current_wifi_rssi();
+    s_recording_upload_stats.stop_rssi = RECORDING_RSSI_UNKNOWN;
+}
+
+static void record_upload_duration(int64_t duration_ms)
+{
+    if (duration_ms < 0) {
+        duration_ms = 0;
+    }
+    if (s_recording_upload_stats.post_duration_min_ms < 0 ||
+        duration_ms < s_recording_upload_stats.post_duration_min_ms) {
+        s_recording_upload_stats.post_duration_min_ms = duration_ms;
+    }
+    if (duration_ms > s_recording_upload_stats.post_duration_max_ms) {
+        s_recording_upload_stats.post_duration_max_ms = duration_ms;
+    }
+    s_recording_upload_stats.post_duration_total_ms += duration_ms;
+}
+
+static void log_recording_diagnostics(void)
+{
+    vibe_audio_stats_t audio_stats = {0};
+    vibe_audio_stats(&audio_stats);
+    s_recording_upload_stats.stop_rssi = current_wifi_rssi();
+    const int64_t avg_post_ms = s_recording_upload_stats.uploaded_chunks > 0
+                                    ? s_recording_upload_stats.post_duration_total_ms /
+                                          (int64_t)s_recording_upload_stats.uploaded_chunks
+                                    : 0;
+    const int64_t min_post_ms = s_recording_upload_stats.post_duration_min_ms >= 0
+                                    ? s_recording_upload_stats.post_duration_min_ms
+                                    : 0;
+    ESP_LOGI(TAG,
+             "recording diagnostics board=%s audio_read_chunks=%u audio_queued_chunks=%u "
+             "audio_dropped_chunks=%u audio_dropped_bytes=%u uploaded_chunks=%u uploaded_bytes=%u "
+             "upload_failures=%u read_failures=%u read_timeouts=%u max_pending=%u "
+             "post_ms_min=%lld post_ms_avg=%lld post_ms_max=%lld rssi_start=%d rssi_stop=%d",
+             VIBE_BOARD_NAME,
+             (unsigned)audio_stats.chunks_read,
+             (unsigned)audio_stats.chunks_queued,
+             (unsigned)audio_stats.chunks_dropped,
+             (unsigned)audio_stats.bytes_dropped,
+             (unsigned)s_recording_upload_stats.uploaded_chunks,
+             (unsigned)s_recording_upload_stats.uploaded_bytes,
+             (unsigned)s_recording_upload_stats.upload_failures,
+             (unsigned)s_recording_upload_stats.read_failures,
+             (unsigned)s_recording_upload_stats.read_timeouts,
+             (unsigned)s_recording_upload_stats.max_pending_chunks,
+             (long long)min_post_ms,
+             (long long)avg_post_ms,
+             (long long)s_recording_upload_stats.post_duration_max_ms,
+             s_recording_upload_stats.start_rssi,
+             s_recording_upload_stats.stop_rssi);
+}
+
 static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len)
 {
     if (!audio || audio_len == 0 || s_recording_session_id[0] == '\0') {
@@ -1773,29 +1859,42 @@ static void recording_upload_task(void *arg)
         return;
     }
 
-    size_t uploaded = 0;
     while (vibe_audio_is_recording() || vibe_audio_pending_chunks() > 0) {
+        size_t pending = vibe_audio_pending_chunks();
+        if (pending > s_recording_upload_stats.max_pending_chunks) {
+            s_recording_upload_stats.max_pending_chunks = pending;
+        }
         size_t audio_len = 0;
         esp_err_t err = vibe_audio_read(buffer, RECORDING_UPLOAD_BUFFER_BYTES, &audio_len, 250);
         if (err == ESP_ERR_TIMEOUT) {
+            s_recording_upload_stats.read_timeouts++;
             continue;
         }
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "audio read for upload failed: %s", esp_err_to_name(err));
+            s_recording_upload_stats.read_failures++;
             s_recording_upload_failed = true;
             continue;
         }
+        int64_t post_start_ms = esp_timer_get_time() / 1000;
         err = upload_recording_chunk(buffer, audio_len);
+        int64_t post_duration_ms = esp_timer_get_time() / 1000 - post_start_ms;
+        record_upload_duration(post_duration_ms);
         if (err != ESP_OK) {
+            s_recording_upload_stats.upload_failures++;
             s_recording_upload_failed = true;
         } else {
-            uploaded += audio_len;
+            s_recording_upload_stats.uploaded_chunks++;
+            s_recording_upload_stats.uploaded_bytes += audio_len;
         }
     }
 
     heap_caps_free(buffer);
-    ESP_LOGI(TAG, "recording upload task done bytes=%u failed=%d",
-             (unsigned)uploaded, s_recording_upload_failed);
+    ESP_LOGI(TAG, "recording upload task done chunks=%u bytes=%u failures=%u failed=%d",
+             (unsigned)s_recording_upload_stats.uploaded_chunks,
+             (unsigned)s_recording_upload_stats.uploaded_bytes,
+             (unsigned)s_recording_upload_stats.upload_failures,
+             s_recording_upload_failed);
     s_recording_upload_task = NULL;
     vTaskDelete(NULL);
 }
@@ -1803,6 +1902,7 @@ static void recording_upload_task(void *arg)
 static void start_recording_upload_task(void)
 {
     s_recording_upload_failed = false;
+    reset_recording_upload_stats();
     s_recording_upload_task = NULL;
     BaseType_t ok = xTaskCreatePinnedToCore(recording_upload_task, "recording_upload", 6144,
                                             NULL, 4, &s_recording_upload_task,
@@ -1905,6 +2005,7 @@ static void handle_recording_stop(const char *event_name)
         ESP_LOGW(TAG, "recording stop sound skipped: %s", esp_err_to_name(sound_err));
     }
     wait_recording_upload_task();
+    log_recording_diagnostics();
     vibe_audio_clear();
 
     show_recording_overlay("正在识别", "", true);

@@ -18,12 +18,22 @@ typedef enum {
     VIBE_STICK_SOUND_RECORDING_STOP,
 } agent_sound_t;
 
+typedef struct {
+    size_t chunks_read;
+    size_t chunks_queued;
+    size_t chunks_dropped;
+    size_t bytes_read;
+    size_t bytes_queued;
+    size_t bytes_dropped;
+} vibe_audio_stats_t;
+
 esp_err_t vibe_audio_init(void);
 esp_err_t vibe_audio_start(void);
 esp_err_t vibe_audio_stop(void);
 esp_err_t vibe_audio_play_sound(agent_sound_t sound);
 esp_err_t vibe_audio_read(uint8_t *buffer, size_t capacity, size_t *len, uint32_t timeout_ms);
 size_t vibe_audio_pending_chunks(void);
+void vibe_audio_stats(vibe_audio_stats_t *stats);
 bool vibe_audio_is_recording(void);
 const uint8_t *vibe_audio_data(size_t *len);
 void vibe_audio_clear(void);
