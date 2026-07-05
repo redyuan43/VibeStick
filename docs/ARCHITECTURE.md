@@ -28,8 +28,8 @@ It owns:
 - Screen rendering with LVGL.
 - Wi-Fi connection.
 - Polling `GET /state`.
-- Posting button events to `/event` and `/quota/refresh`.
-- Front-button push-to-talk recording.
+- Posting quota refresh events to `/quota/refresh`.
+- Front-button tap-to-talk and push-to-talk recording.
 - 16 kHz / 16-bit / mono PCM recording from the device microphone.
 - Uploading PCM to `/recording/audio`; low-memory targets use append-style chunk uploads.
 - Agent status sounds through the board speaker path.
@@ -72,13 +72,14 @@ BLE is not part of the current mainline transport. USB is used for flashing and 
 
 ## Recording Flow
 
-1. User long-presses the blue front button.
+1. User taps the blue front button, or long-presses it for push-to-talk.
 2. Firmware starts StickS3 microphone recording and posts `/recording/start`.
 3. Firmware shows a full-screen listening overlay.
-4. User releases the button.
-5. Firmware stops recording, uploads PCM to `/recording/audio`, then posts `/recording/stop`.
-6. Bridge writes a local WAV file, runs ASR, and pastes the transcript when successful.
-7. Recording start and stop do not play agent alert sounds.
+4. Firmware continuously uploads PCM chunks to `/recording/audio`.
+5. User taps the front button again, or releases the long press.
+6. Firmware stops recording, drains pending PCM chunks, then posts `/recording/stop`.
+7. Bridge writes a local WAV file, runs ASR, and pastes the transcript when successful.
+8. Recording start and stop do not play agent alert sounds.
 
 ## Status And Quota
 

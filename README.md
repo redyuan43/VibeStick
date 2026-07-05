@@ -105,9 +105,9 @@ Aim for all required checks to pass. Then glance at the StickS3: Codex / Claude 
 
 If Codex works but the Claude column shows `--%`, that is expected: Claude usage is disabled by default (safer), so to display it set `VIBE_STICK_CLAUDE_USAGE=on` and make sure Claude Code is logged in via `claude` and `/login`.
 
-11. 👤 Open any text box, long-press the front blue button, speak, and release. VibeStick should transcribe and paste the text automatically.
+11. 👤 Open any text box, press the front blue button once, speak, and press it again to send. Long-press and release still works as push-to-talk. In both modes, VibeStick transcribes audio from the device microphone and pastes the text automatically.
 
-StickS3 and M5StickC Plus also support lift-to-talk mode. The default `PTT` mode keeps push-to-talk behavior. Long-press the side button to switch to `LIFT`; the device uses its boot-time flat desktop pose as the baseline, starts recording when lifted, and sends recognition after it is placed back flat and stable. Short-pressing the side button still switches Codex / Claude.
+StickS3 and M5StickC Plus also support lift-to-talk mode. The default `PTT` mode supports front-button tap-to-talk and push-to-talk behavior. Long-press the side button to switch to `LIFT`; the device uses its boot-time flat desktop pose as the baseline, starts recording when lifted, and sends recognition after it is placed back flat and stable.
 
 For development without installing LaunchAgents, run `./scripts/dev.sh` from the repository root instead of `./scripts/install.sh`.
 

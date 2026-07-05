@@ -103,9 +103,9 @@ ls /dev/cu.*
 
 如果 Codex 已经能用、而 Claude 那栏显示 `--%`，这是正常的：Claude 用量默认关闭（更安全）；如需显示，请设置 `VIBE_STICK_CLAUDE_USAGE=on`，并确保 Claude Code 已通过 `claude` 和 `/login` 登录。
 
-11. 👤 打开任意文本框，长按正面蓝键说话，松开后 VibeStick 应自动转写并粘贴。
+11. 👤 打开任意文本框，单击正面蓝键开始说话，再单击一次发送。长按后松开仍保留按住说话模式。两种方式都会使用设备内置麦克风录音，VibeStick 应自动转写并粘贴。
 
-StickS3 和 M5StickC Plus 都支持拿起录音模式：默认是 `PTT` 按住说话；长按侧键可切到 `LIFT`，设备会用开机时的桌面平放状态做基线，拿起开始录音，放回桌面并稳定后发送识别。侧键短按仍用于切换 Codex / Claude。
+StickS3 和 M5StickC Plus 都支持拿起录音模式：默认 `PTT` 支持正面按键单击开关录音和长按说话；长按侧键可切到 `LIFT`，设备会用开机时的桌面平放状态做基线，拿起开始录音，放回桌面并稳定后发送识别。
 
 开发调试时可以用 `./scripts/dev.sh` 替代 `./scripts/install.sh`，它会在当前终端里运行 bridge。
 
