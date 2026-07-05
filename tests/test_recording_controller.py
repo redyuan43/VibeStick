@@ -21,6 +21,24 @@ class FakeMicRecorder:
 
 
 class RecordingControllerTests(unittest.TestCase):
+    def test_sticks3_source_uses_device_pcm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(recorder, "RECORDINGS_DIR", Path(tmp)):
+            controller = RecordingController(Path(tmp) / "recording.json")
+            fake_mic = FakeMicRecorder()
+            controller.audio_recorder = fake_mic
+
+            with patch.object(recorder, "show_hud"):
+                session = controller.start(
+                    {
+                        "audio_source": "sticks3_pcm",
+                        "session_id": "abcdef123456",
+                    }
+                )
+
+            self.assertFalse(fake_mic.started)
+            self.assertEqual(session.audio_source, "sticks3_pcm")
+            self.assertEqual(session.status, "recording")
+
     def test_stickc_plus_source_uses_device_pcm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.object(recorder, "RECORDINGS_DIR", Path(tmp)):
             controller = RecordingController(Path(tmp) / "recording.json")
