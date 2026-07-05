@@ -176,7 +176,8 @@ esp_err_t vibe_board_init_power(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_HOLD_CFG,
                                             hold_cfg | M5PM1_HOLD_CFG_LDO_HOLD));
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(M5PM1_REG_GPIO_FUNC0,
-                                             M5PM1_GPIO2_L3B_POWER_EN, 0));
+                                             M5PM1_GPIO_FUNC_MASK(2),
+                                             M5PM1_GPIO_FUNC_GPIO(2)));
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(M5PM1_REG_GPIO_MODE,
                                              0, M5PM1_GPIO2_L3B_POWER_EN));
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(M5PM1_REG_GPIO_DRV,

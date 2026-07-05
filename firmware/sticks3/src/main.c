@@ -564,6 +564,7 @@ static esp_err_t init_display(void)
         .trans_queue_depth = 10,
         .on_color_trans_done = notify_lvgl_flush_ready,
         .user_ctx = NULL,
+        .flags.sio_mode = VIBE_BOARD_LCD_SPI_SIO_MODE,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle),
                         TAG, "panel io");
