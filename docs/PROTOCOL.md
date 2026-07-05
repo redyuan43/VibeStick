@@ -107,10 +107,6 @@ Receives generic firmware or debug events.
 Examples:
 
 ```json
-{"event":"button_short","source":"sticks3"}
-```
-
-```json
 {"event":"test_agent_status","source":"manual_test","status":"DONE","message":"test done"}
 ```
 
@@ -137,12 +133,14 @@ Starts a recording session:
 
 ```json
 {
-  "event": "button_long_start",
+  "event": "button_tap_start",
   "source": "sticks3",
   "audio_source": "sticks3_pcm",
   "session_id": "<firmware-generated-id>"
 }
 ```
+
+Push-to-talk uses `button_long_start`; lift-to-talk uses `motion_lift_start`.
 
 ## POST /recording/audio
 
@@ -166,7 +164,9 @@ The bridge rejects audio uploads larger than `VIBE_STICK_MAX_RECORDING_AUDIO_BYT
 Stops the session and runs transcription:
 
 ```json
-{"event":"button_long_stop","source":"sticks3","paste":true}
+{"event":"button_tap_stop","source":"sticks3","paste":true}
 ```
+
+Push-to-talk uses `button_long_stop`; lift-to-talk uses `motion_lift_stop`.
 
 When transcription succeeds, the bridge pastes the transcript into the focused macOS app. Recording status does not trigger agent alert sounds.

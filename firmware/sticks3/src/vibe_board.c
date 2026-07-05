@@ -8,7 +8,7 @@
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 
-#define I2C_FREQ_HZ 100000
+#define I2C_FREQ_HZ 400000
 
 static const char *TAG = "vibe_board";
 static i2c_master_bus_handle_t s_i2c_bus;
@@ -50,15 +50,13 @@ static i2c_master_dev_handle_t s_pmic_dev;
 #define AXP192_ADDR 0x34
 #define AXP192_REG_INPUT_STATUS 0x00
 #define AXP192_REG_POWER_STATUS 0x01
-#define AXP192_REG_EXTEN_DCDC2_CTRL 0x10
 #define AXP192_REG_OUTPUT_CTRL 0x12
-#define AXP192_REG_VOFF_SET 0x31
+#define AXP192_REG_VBUS_IPSOUT_PATH 0x30
 #define AXP192_REG_CHARGE_CTRL1 0x33
 #define AXP192_REG_BACKUP_CHARGE_CTRL 0x35
 #define AXP192_REG_PEK 0x36
 #define AXP192_REG_TEMP_PROTECT 0x39
 #define AXP192_REG_ADC_ENABLE1 0x82
-#define AXP192_REG_ADC_SPEED 0x84
 #define AXP192_REG_GPIO0_CTRL 0x90
 #define AXP192_REG_GPIO0_LDO_VOLT 0x91
 #define AXP192_REG_LDO23_VOLT 0x28
@@ -301,18 +299,16 @@ esp_err_t vibe_board_init_power(void)
     ESP_RETURN_ON_ERROR(init_i2c(), TAG, "init i2c");
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_LDO23_VOLT, 0xcc));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_ADC_SPEED, 0xf2));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_ADC_ENABLE1, 0xff));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_CHARGE_CTRL1, 0xc0));
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(AXP192_REG_OUTPUT_CTRL, BIT(4), 0x4d));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_PEK, 0x0c));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_GPIO0_LDO_VOLT, 0xa0));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_GPIO0_LDO_VOLT, 0xf0));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_GPIO0_CTRL, 0x02));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_EXTEN_DCDC2_CTRL, 0x80));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_VBUS_IPSOUT_PATH, 0x80));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_TEMP_PROTECT, 0xfc));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_BACKUP_CHARGE_CTRL, 0xa2));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(0x32, 0x46));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(AXP192_REG_VOFF_SET, 0x07, BIT(2)));
     ESP_LOGI(TAG, "AXP192 power initialized");
     return ESP_OK;
 }
@@ -355,10 +351,7 @@ esp_err_t vibe_board_usb_powered(bool *usb_powered)
 
 esp_err_t vibe_board_speaker_set_enabled(bool enabled)
 {
-    if (!enabled) {
-        gpio_set_direction(VIBE_BOARD_PIN_SPEAKER, GPIO_MODE_OUTPUT);
-        gpio_set_level(VIBE_BOARD_PIN_SPEAKER, 0);
-    }
+    (void)enabled;
     return ESP_OK;
 }
 

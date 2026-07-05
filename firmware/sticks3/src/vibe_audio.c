@@ -6,6 +6,7 @@
 
 #include "vibe_board.h"
 #include "vibe_board_profile.h"
+#include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "driver/ledc.h"
 #include "esp_check.h"
@@ -35,8 +36,8 @@
 #define VIBE_STICK_SOUND_FADE_MS 8
 #define VIBE_STICK_SOUND_OUTPUT_VOLUME 85
 #define VIBE_STICK_TWO_PI 6.28318530717958647692f
-#define TONE_DUTY_RES LEDC_TIMER_10_BIT
-#define TONE_DUTY_ON 512
+#define VIBE_STICK_TONE_DUTY ((1 << 9) - 1)
+#define VIBE_STICK_BEEP_MS 200
 
 typedef struct {
     size_t len;
@@ -333,45 +334,81 @@ static esp_err_t play_sound_segments(const sound_segment_t *segments, size_t cou
 #endif
 
 #if VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+#define VIBE_STICK_TONE_SPEED_MODE LEDC_HIGH_SPEED_MODE
+#define VIBE_STICK_TONE_CHANNEL LEDC_CHANNEL_0
+#define VIBE_STICK_TONE_TIMER LEDC_TIMER_0
+#define VIBE_STICK_TONE_RESOLUTION LEDC_TIMER_10_BIT
+
 static esp_err_t init_tone_output(void)
 {
     ledc_timer_config_t timer = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = LEDC_TIMER_1,
-        .duty_resolution = TONE_DUTY_RES,
-        .freq_hz = 1000,
+        .speed_mode = VIBE_STICK_TONE_SPEED_MODE,
+        .duty_resolution = VIBE_STICK_TONE_RESOLUTION,
+        .timer_num = VIBE_STICK_TONE_TIMER,
+        .freq_hz = 4000,
         .clk_cfg = LEDC_AUTO_CLK,
     };
     ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "tone timer");
+
     ledc_channel_config_t channel = {
         .gpio_num = VIBE_BOARD_PIN_SPEAKER,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_1,
-        .timer_sel = LEDC_TIMER_1,
+        .speed_mode = VIBE_STICK_TONE_SPEED_MODE,
+        .channel = VIBE_STICK_TONE_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = VIBE_STICK_TONE_TIMER,
         .duty = 0,
         .hpoint = 0,
     };
-    return ledc_channel_config(&channel);
+    ESP_RETURN_ON_ERROR(ledc_channel_config(&channel), TAG, "tone channel");
+    ESP_RETURN_ON_ERROR(gpio_set_drive_capability(VIBE_BOARD_PIN_SPEAKER, GPIO_DRIVE_CAP_3),
+                        TAG, "tone gpio drive");
+    return gpio_set_level(VIBE_BOARD_PIN_SPEAKER, 0);
+}
+
+static esp_err_t mute_tone_output(void)
+{
+    ESP_RETURN_ON_ERROR(ledc_set_duty(VIBE_STICK_TONE_SPEED_MODE, VIBE_STICK_TONE_CHANNEL, 0),
+                        TAG, "tone duty off");
+    ESP_RETURN_ON_ERROR(ledc_update_duty(VIBE_STICK_TONE_SPEED_MODE, VIBE_STICK_TONE_CHANNEL),
+                        TAG, "tone update off");
+    return gpio_set_level(VIBE_BOARD_PIN_SPEAKER, 0);
+}
+
+static esp_err_t play_ledc_tone(uint16_t freq_hz, uint16_t duration_ms)
+{
+    if (freq_hz == 0 || duration_ms == 0) {
+        vTaskDelay(pdMS_TO_TICKS(duration_ms));
+        return ESP_OK;
+    }
+
+    ledc_timer_config_t timer = {
+        .speed_mode = VIBE_STICK_TONE_SPEED_MODE,
+        .duty_resolution = VIBE_STICK_TONE_RESOLUTION,
+        .timer_num = VIBE_STICK_TONE_TIMER,
+        .freq_hz = freq_hz,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "tone timer set");
+    ESP_RETURN_ON_ERROR(ledc_set_duty(VIBE_STICK_TONE_SPEED_MODE,
+                                      VIBE_STICK_TONE_CHANNEL,
+                                      VIBE_STICK_TONE_DUTY),
+                        TAG, "tone duty on");
+    ESP_RETURN_ON_ERROR(ledc_update_duty(VIBE_STICK_TONE_SPEED_MODE, VIBE_STICK_TONE_CHANNEL),
+                        TAG, "tone update on");
+    ESP_LOGD(TAG, "ledc tone freq=%u duty=%u duration=%u",
+             (unsigned)freq_hz, (unsigned)VIBE_STICK_TONE_DUTY, (unsigned)duration_ms);
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+    return mute_tone_output();
 }
 
 static esp_err_t play_tone_segments(const sound_segment_t *segments, size_t count)
 {
     ESP_RETURN_ON_ERROR(init_tone_output(), TAG, "tone output");
     for (size_t i = 0; i < count; ++i) {
-        if (segments[i].freq_hz > 0) {
-            ESP_RETURN_ON_ERROR(ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1, segments[i].freq_hz),
-                                TAG, "tone freq");
-            ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, TONE_DUTY_ON),
-                                TAG, "tone duty");
-        } else {
-            ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0),
-                                TAG, "tone silence");
-        }
-        ESP_RETURN_ON_ERROR(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1), TAG, "tone update");
-        vTaskDelay(pdMS_TO_TICKS(segments[i].duration_ms));
+        ESP_RETURN_ON_ERROR(play_ledc_tone(segments[i].freq_hz, segments[i].duration_ms),
+                            TAG, "tone segment");
     }
-    ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0), TAG, "tone off");
-    ESP_RETURN_ON_ERROR(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1), TAG, "tone off update");
+    ESP_RETURN_ON_ERROR(mute_tone_output(), TAG, "tone mute");
     return vibe_board_speaker_set_enabled(false);
 }
 #endif
@@ -379,21 +416,27 @@ static esp_err_t play_tone_segments(const sound_segment_t *segments, size_t coun
 static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *count)
 {
     static const sound_segment_t done[] = {
-        {.freq_hz = 880, .duration_ms = 80},
+        {.freq_hz = 880, .duration_ms = VIBE_STICK_BEEP_MS},
         {.freq_hz = 0, .duration_ms = 40},
-        {.freq_hz = 1320, .duration_ms = 120},
+        {.freq_hz = 1320, .duration_ms = VIBE_STICK_BEEP_MS},
     };
     static const sound_segment_t error[] = {
-        {.freq_hz = 240, .duration_ms = 100},
+        {.freq_hz = 240, .duration_ms = VIBE_STICK_BEEP_MS},
         {.freq_hz = 0, .duration_ms = 60},
-        {.freq_hz = 240, .duration_ms = 100},
+        {.freq_hz = 240, .duration_ms = VIBE_STICK_BEEP_MS},
         {.freq_hz = 0, .duration_ms = 60},
-        {.freq_hz = 240, .duration_ms = 100},
+        {.freq_hz = 240, .duration_ms = VIBE_STICK_BEEP_MS},
     };
     static const sound_segment_t approval[] = {
-        {.freq_hz = 600, .duration_ms = 100},
+        {.freq_hz = 600, .duration_ms = VIBE_STICK_BEEP_MS},
         {.freq_hz = 0, .duration_ms = 60},
-        {.freq_hz = 800, .duration_ms = 100},
+        {.freq_hz = 800, .duration_ms = VIBE_STICK_BEEP_MS},
+    };
+    static const sound_segment_t recording_start[] = {
+        {.freq_hz = 4000, .duration_ms = VIBE_STICK_BEEP_MS},
+    };
+    static const sound_segment_t recording_stop[] = {
+        {.freq_hz = 2600, .duration_ms = VIBE_STICK_BEEP_MS},
     };
 
     switch (sound) {
@@ -406,6 +449,12 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
     case VIBE_STICK_SOUND_APPROVAL:
         *count = sizeof(approval) / sizeof(approval[0]);
         return approval;
+    case VIBE_STICK_SOUND_RECORDING_START:
+        *count = sizeof(recording_start) / sizeof(recording_start[0]);
+        return recording_start;
+    case VIBE_STICK_SOUND_RECORDING_STOP:
+        *count = sizeof(recording_stop) / sizeof(recording_stop[0]);
+        return recording_stop;
     default:
         *count = 0;
         return NULL;
@@ -466,6 +515,9 @@ esp_err_t vibe_audio_init(void)
         s_audio_queue = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(audio_chunk_t));
         ESP_RETURN_ON_FALSE(s_audio_queue != NULL, ESP_ERR_NO_MEM, TAG, "audio queue");
     }
+#if VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+    ESP_RETURN_ON_ERROR(init_tone_output(), TAG, "tone init");
+#endif
     s_initialized = true;
     return ESP_OK;
 }
@@ -539,6 +591,17 @@ bool vibe_audio_is_recording(void)
 esp_err_t vibe_audio_play_sound(agent_sound_t sound)
 {
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "not initialized");
+#if VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+    size_t segment_count = 0;
+    const sound_segment_t *segments = sound_segments_for(sound, &segment_count);
+    ESP_RETURN_ON_FALSE(segments != NULL && segment_count > 0, ESP_ERR_INVALID_ARG, TAG, "invalid tone");
+
+    esp_err_t err = play_tone_segments(segments, segment_count);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "tone playback failed: %s", esp_err_to_name(err));
+    }
+    return err;
+#else
     ESP_RETURN_ON_FALSE(s_audio_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "audio mutex missing");
     if (vibe_audio_is_recording()) {
         return ESP_ERR_INVALID_STATE;
@@ -584,6 +647,7 @@ esp_err_t vibe_audio_play_sound(agent_sound_t sound)
         ESP_LOGI(TAG, "sound played id=%d", (int)sound);
     }
     return err;
+#endif
 }
 
 esp_err_t vibe_audio_read(uint8_t *buffer, size_t capacity, size_t *len, uint32_t timeout_ms)

@@ -12,6 +12,7 @@ This audit documents the v0.1.1 repository state after cleanup.
 | `firmware/sticks3/generated/vibe_stick_ui_assets.c/.h` | Generated from project-owned PNG icons | LVGL image descriptors for provider icons | MIT under this repository | Low | Keep. |
 | `firmware/sticks3/assets/wowotou/**` and `firmware/sticks3/generated/vibe_stick_pet_assets.c/.h` | User-authorized Wowotou theme artwork from MiniCPM-Desk-Pet-client / clawd-on-desk | M5Stack firmware home-screen pet frames | User confirmed usage rights for this VibeStick repository; not general-purpose MIT artwork | Medium | Keep source SVGs and generated bitmaps together with NOTICE attribution. Do not reuse outside this repository without checking artwork rights. |
 | `firmware/sticks3/generated/vibe_stick_cn_16.c` | Generated from Source Han Sans K Regular | LVGL Chinese glyph subset for StickS3 UI | Source font is SIL Open Font License 1.1, copyright Adobe 2014-2021 | Medium | Keep with NOTICE attribution. Do not use the reserved Source name as an VibeStick brand. |
+| `firmware/sticks3/include/vibe_bmi270_config.h` | Derived from M5Unified `BMI270_config.inl` | BMI270 firmware configuration blob for StickS3 lift-to-talk IMU reads | MIT, copyright M5Stack | Low | Keep with source comment. Review upstream before replacing the blob. |
 | `firmware/sticks3/src/idf_component.yml` dependencies: `espressif/button`, `espressif/esp_codec_dev`, `lvgl/lvgl` | ESP Component Registry | Build-time firmware dependencies | External open-source components, not vendored after cleanup | Low | Keep dependency manifest and lock file. Review component licenses before binary release. |
 | ESP-IDF framework | Espressif | Firmware framework | External SDK, not vendored | Low | Keep as build prerequisite. |
 | Groq ASR API | Optional external service | Optional speech-to-text when configured | Service API, no source vendored | Medium | Document that audio leaves the Mac when Groq is configured. Do not commit API keys. |
@@ -23,6 +24,6 @@ This audit documents the v0.1.1 repository state after cleanup.
 
 ## Summary
 
-No third-party source code is intentionally vendored in this repository after cleanup. The repository includes the generated Chinese LVGL glyph subset derived from Source Han Sans K under the SIL Open Font License 1.1, plus user-authorized Wowotou artwork used only for the firmware home-screen pet. Build-time firmware dependencies are resolved through the ESP-IDF component manager and are not committed as vendored source.
+No third-party source code is intentionally vendored in this repository after cleanup. The repository includes the generated Chinese LVGL glyph subset derived from Source Han Sans K under the SIL Open Font License 1.1, the M5Unified BMI270 configuration blob under MIT, and user-authorized Wowotou artwork used only for the firmware home-screen pet. Build-time firmware dependencies are resolved through the ESP-IDF component manager and are not committed as vendored source.
 
 Before a public binary release, review the exact ESP-IDF/component licenses included in the firmware image and ensure the Source Han Sans K and Wowotou attributions remain in NOTICE.
