@@ -5,6 +5,7 @@ import hmac
 import ipaddress
 import json
 import os
+import shutil
 import threading
 import time
 from http import HTTPStatus
@@ -47,6 +48,7 @@ PLACEHOLDER_BRIDGE_TOKENS = {
     "changeme",
     "change-me",
 }
+OTA_BOARDS = {"sticks3", "stickc_plus"}
 
 
 class BridgeStateStore:
@@ -292,9 +294,14 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
         server_version = "VibeStick/0.1"
 
         def do_GET(self) -> None:
-            if self.path == "/state":
+            parsed = urlparse(self.path)
+            if parsed.path in _protected_get_paths() and not self._is_authorized():
+                self._send_error(HTTPStatus.UNAUTHORIZED, "Unauthorized")
+                return
+
+            if parsed.path == "/state":
                 self._send_json(_with_bridge_metadata(store.get_state().to_jsonable()))
-            elif self.path == "/health":
+            elif parsed.path == "/health":
                 self._send_json(
                     {
                         "ok": True,
@@ -302,6 +309,16 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                         "bridge_version": BRIDGE_VERSION,
                     }
                 )
+            elif parsed.path == "/ota/manifest":
+                board = _first(parse_qs(parsed.query), "board")
+                self._send_json(_ota_manifest_payload(store._project_root, board))
+            elif parsed.path == "/ota/bin":
+                board = _first(parse_qs(parsed.query), "board")
+                binary = _ota_binary_path(store._project_root, board)
+                if binary is None:
+                    self._send_error(HTTPStatus.NOT_FOUND, "OTA image not found")
+                    return
+                self._send_file(binary, "application/octet-stream")
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
 
@@ -399,6 +416,20 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
         def _send_error(self, status: HTTPStatus, message: str) -> None:
             self._send_json({"error": message}, status=status)
 
+        def _send_file(self, path: Path, content_type: str) -> None:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                self._send_error(HTTPStatus.NOT_FOUND, "File not found")
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1")
+            self.end_headers()
+            with path.open("rb") as file:
+                shutil.copyfileobj(file, self.wfile)
+
     return VibeStickHandler
 
 
@@ -425,11 +456,75 @@ def _protected_paths() -> set[str]:
     }
 
 
+def _protected_get_paths() -> set[str]:
+    return {
+        "/ota/manifest",
+        "/ota/bin",
+    }
+
+
 def _bridge_token() -> str:
     token = os.environ.get("VIBE_STICK_BRIDGE_TOKEN", "").strip()
     if token.lower() in PLACEHOLDER_BRIDGE_TOKENS:
         return ""
     return token
+
+
+def _ota_dir(project_root: Path) -> Path:
+    return project_root / "firmware" / "sticks3" / "ota"
+
+
+def _safe_ota_board(raw: str) -> str:
+    board = raw.strip()
+    return board if board in OTA_BOARDS else ""
+
+
+def _ota_manifest_path(project_root: Path, board: str) -> Path | None:
+    board = _safe_ota_board(board)
+    if not board:
+        return None
+    return _ota_dir(project_root) / f"{board}.json"
+
+
+def _load_ota_manifest(project_root: Path, board: str) -> dict[str, Any] | None:
+    manifest_path = _ota_manifest_path(project_root, board)
+    if manifest_path is None:
+        return None
+    try:
+        data = json.loads(manifest_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _ota_manifest_payload(project_root: Path, board: str) -> dict[str, Any]:
+    safe_board = _safe_ota_board(board)
+    if not safe_board:
+        return {"available": False, "error": "unknown board"}
+    manifest = _load_ota_manifest(project_root, safe_board)
+    if manifest is None:
+        return {"available": False, "board": safe_board}
+    payload = dict(manifest)
+    payload["available"] = bool(payload.get("available", True))
+    payload["board"] = safe_board
+    payload.setdefault("url", f"/ota/bin?board={safe_board}")
+    return payload
+
+
+def _ota_binary_path(project_root: Path, board: str) -> Path | None:
+    safe_board = _safe_ota_board(board)
+    if not safe_board:
+        return None
+    manifest = _load_ota_manifest(project_root, safe_board)
+    if manifest is None:
+        return None
+    file_name = str(manifest.get("file_name") or f"{safe_board}.bin")
+    binary = _ota_dir(project_root) / Path(file_name).name
+    try:
+        binary.relative_to(_ota_dir(project_root))
+    except ValueError:
+        return None
+    return binary if binary.exists() else None
 
 
 def _enforce_bind_security(host: str) -> None:
