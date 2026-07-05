@@ -58,7 +58,7 @@ static const char *TAG = "vibe_stick";
 
 typedef enum {
     VIBE_STICK_EVENT_POLL_STATE,
-    VIBE_STICK_EVENT_SHORT_PRESS,
+    VIBE_STICK_EVENT_RECORDING_TOGGLE,
     VIBE_STICK_EVENT_DOUBLE_CLICK,
     VIBE_STICK_EVENT_LONG_START,
     VIBE_STICK_EVENT_LONG_STOP,
@@ -146,6 +146,7 @@ static bool s_wifi_connected;
 static bool s_recording_overlay_visible;
 static bool s_long_press_active;
 static bool s_motion_recording_active;
+static bool s_tap_recording_active;
 static char s_last_alert_event_id[56];
 static char s_last_alert_type[24];
 static bool s_alert_sound_baseline_ready;
@@ -1677,6 +1678,7 @@ static void handle_recording_stop(const char *event_name)
         vibe_audio_clear();
         poll_state();
         show_recording_overlay(NULL, NULL, false);
+        s_tap_recording_active = false;
         return;
     }
 
@@ -1717,8 +1719,23 @@ static void handle_recording_stop(const char *event_name)
         vTaskDelay(pdMS_TO_TICKS(900));
     }
     s_recording_session_id[0] = '\0';
+    s_tap_recording_active = false;
     poll_state();
     show_recording_overlay(NULL, NULL, false);
+}
+
+static void handle_recording_toggle(void)
+{
+    if (s_recording_mode != RECORDING_MODE_PUSH_TO_TALK) {
+        ESP_LOGI(TAG, "front tap ignored in %s mode", recording_mode_label());
+        return;
+    }
+    if (s_tap_recording_active || vibe_audio_is_recording() || s_recording_session_id[0] != '\0') {
+        handle_recording_stop("button_tap_stop");
+        s_tap_recording_active = false;
+        return;
+    }
+    s_tap_recording_active = handle_recording_start("button_tap_start", "再按发送");
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -1767,7 +1784,7 @@ static void button_single_click_cb(void *button_handle, void *usr_data)
 {
     (void)button_handle;
     (void)usr_data;
-    queue_event(VIBE_STICK_EVENT_SHORT_PRESS);
+    queue_event(VIBE_STICK_EVENT_RECORDING_TOGGLE);
 }
 
 static void button_double_click_cb(void *button_handle, void *usr_data)
@@ -1797,6 +1814,10 @@ static void button_long_start_cb(void *button_handle, void *usr_data)
     (void)usr_data;
     if (s_recording_mode != RECORDING_MODE_PUSH_TO_TALK) {
         ESP_LOGI(TAG, "front long press ignored in %s mode", recording_mode_label());
+        return;
+    }
+    if (s_tap_recording_active || vibe_audio_is_recording() || s_recording_session_id[0] != '\0') {
+        ESP_LOGI(TAG, "front long press ignored while tap recording is active");
         return;
     }
     s_long_press_active = true;
@@ -1888,8 +1909,8 @@ static void app_task(void *arg)
         case VIBE_STICK_EVENT_POLL_STATE:
             poll_state();
             break;
-        case VIBE_STICK_EVENT_SHORT_PRESS:
-            post_simple_event("button_short", NULL);
+        case VIBE_STICK_EVENT_RECORDING_TOGGLE:
+            handle_recording_toggle();
             break;
         case VIBE_STICK_EVENT_DOUBLE_CLICK:
             post_simple_event("button_double", VIBE_STICK_QUOTA_REFRESH_PATH);
