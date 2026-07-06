@@ -70,7 +70,7 @@
 #define VIBE_STICK_IDLE_STATE_POLL_MS 10000
 #define VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS 60
 #define VIBE_STICK_BACKLIGHT_FADE_STEP 5
-#define VIBE_STICK_DEEP_SLEEP_FAST_RESUME_MS 5000
+#define VIBE_STICK_PET_FAST_RESUME_MAX_MS 15000
 #define RECORDING_RSSI_UNKNOWN -127
 #define WIFI_PROFILE_NAMESPACE "vibe_wifi"
 #define WIFI_PROFILE_BLOB_KEY "profiles"
@@ -256,6 +256,7 @@ static lv_obj_t *s_mode_label;
 static lv_obj_t *s_pet_image;
 static bool s_woke_from_deep_sleep;
 static bool s_wake_front_button_pending;
+static bool s_pet_fast_resume_pending;
 static int64_t s_pet_animation_resume_ms;
 static lv_obj_t *s_recording_overlay;
 static lv_obj_t *s_recording_wave_group;
@@ -1153,6 +1154,12 @@ static int pet_frame_delay_ms(pet_sequence_t sequence)
     return 1000 + (int)(esp_random() % 4001);
 }
 
+static void complete_pet_fast_resume(void)
+{
+    s_pet_fast_resume_pending = false;
+    s_woke_from_deep_sleep = false;
+}
+
 static void update_pet_visual(void)
 {
     if (s_display_power_state != DISPLAY_POWER_ACTIVE && !s_recording_overlay_visible) {
@@ -1167,8 +1174,11 @@ static void update_pet_visual(void)
     const agent_provider_config_t *provider = current_provider_config();
     const char *status = provider->implemented ? display_state->status : "UNIMPLEMENTED";
     const int64_t now_ms = esp_timer_get_time() / 1000;
-    if (s_woke_from_deep_sleep && now_ms < s_pet_animation_resume_ms) {
-        return;
+    if (s_pet_fast_resume_pending) {
+        if (now_ms < s_pet_animation_resume_ms) {
+            return;
+        }
+        complete_pet_fast_resume();
     }
 
     pet_sequence_t sequence = pet_sequence_for_state(status);
@@ -2001,6 +2011,7 @@ static void poll_state(void)
         render_state();
         return;
     }
+    complete_pet_fast_resume();
     render_state();
     maybe_handle_alert();
 }
@@ -2014,6 +2025,7 @@ static void post_simple_event(const char *event_name, const char *path)
     const char *target_path = path ? path : VIBE_STICK_EVENT_PATH;
     esp_err_t err = http_request("POST", target_path, body, response, sizeof(response));
     if (err == ESP_OK && response[0] != '\0' && parse_state_json(response)) {
+        complete_pet_fast_resume();
         render_state();
     }
 }
@@ -2290,6 +2302,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
             strlcpy(s_recording_session_id, response_session_id, sizeof(s_recording_session_id));
         }
         if (parse_state_json(response)) {
+            complete_pet_fast_resume();
             render_state();
         }
     } else {
@@ -2363,6 +2376,7 @@ static void finish_recording_stop(const char *event_name)
             }
         }
         if (parse_state_json(response)) {
+            complete_pet_fast_resume();
             render_state();
         }
     }
@@ -2886,8 +2900,9 @@ void app_main(void)
     uint64_t ext1_wake_status = esp_sleep_get_ext1_wakeup_status();
     s_woke_from_deep_sleep = wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED;
     if (s_woke_from_deep_sleep) {
+        s_pet_fast_resume_pending = true;
         s_pet_animation_resume_ms = (esp_timer_get_time() / 1000) +
-                                    VIBE_STICK_DEEP_SLEEP_FAST_RESUME_MS;
+                                    VIBE_STICK_PET_FAST_RESUME_MAX_MS;
     }
     ESP_LOGI(TAG, "boot %s board=%s version=%s build=%s transport=%s",
              FIRMWARE_NAME, VIBE_BOARD_NAME, FIRMWARE_VERSION, FIRMWARE_BUILD_ID, TRANSPORT);
