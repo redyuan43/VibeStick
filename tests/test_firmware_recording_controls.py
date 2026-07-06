@@ -39,6 +39,7 @@ def test_idle_backlight_has_dim_and_off_states() -> None:
 
     assert "VIBE_STICK_IDLE_DIM_MS 30000" in source
     assert "VIBE_STICK_IDLE_OFF_MS 60000" in source
+    assert "VIBE_STICK_IDLE_STATE_POLL_MS 60000" in source
     assert "VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS" in source
     assert "fade_backlight_toward(target, now_ms)" in source
     assert "DISPLAY_POWER_DIMMED" in source
@@ -95,7 +96,7 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
 
-    assert "VIBE_STICK_DEEP_SLEEP_MS VIBE_STICK_IDLE_OFF_MS" in source
+    assert "VIBE_STICK_DEEP_SLEEP_MS 600000" in source
     assert "maybe_enter_deep_sleep(now_ms)" in source
     assert "esp_deep_sleep_start()" in source
     assert "esp_sleep_enable_ext0_wakeup(ext0_gpio, 0)" in source
