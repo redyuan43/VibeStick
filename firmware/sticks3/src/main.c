@@ -874,7 +874,7 @@ static int pet_frame_delay_ms(pet_sequence_t sequence)
     if (sequence.key != 0) {
         return sequence.frame_ms;
     }
-    return 120 + (int)(esp_random() % 520);
+    return 1000 + (int)(esp_random() % 4001);
 }
 
 static void update_pet_visual(void)
