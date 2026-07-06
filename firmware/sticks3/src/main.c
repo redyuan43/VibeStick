@@ -764,17 +764,9 @@ typedef struct {
 
 static const vibe_stick_pet_frame_id_t s_pet_idle_frames[] = {
     VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
-    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
-    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
-    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
     VIBE_STICK_PET_FRAME_CLOUDLING_IDLE_BLINK_LEFT,
-    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
     VIBE_STICK_PET_FRAME_CLOUDLING_IDLE_BLINK_RIGHT,
-    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
     VIBE_STICK_PET_FRAME_CLOUDLING_IDLE_BLINK_BOTH,
-    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
-    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
-    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
 };
 
 static const vibe_stick_pet_frame_id_t s_pet_running_frames[] = {
@@ -874,7 +866,15 @@ static pet_sequence_t pet_sequence_for_state(const char *status)
     }
     return (pet_sequence_t){s_pet_idle_frames,
                             sizeof(s_pet_idle_frames) / sizeof(s_pet_idle_frames[0]),
-                            260, 0};
+                            220, 0};
+}
+
+static int pet_frame_delay_ms(pet_sequence_t sequence)
+{
+    if (sequence.key != 0) {
+        return sequence.frame_ms;
+    }
+    return 120 + (int)(esp_random() % 520);
 }
 
 static void update_pet_visual(void)
@@ -896,16 +896,22 @@ static void update_pet_visual(void)
     bool should_refresh_frame = false;
     if (sequence.key != s_pet_sequence_key) {
         s_pet_sequence_key = sequence.key;
-        s_pet_sequence_index = 0;
+        s_pet_sequence_index = sequence.key == 0
+            ? (int)(esp_random() % (uint32_t)sequence.frame_count)
+            : 0;
         s_pet_next_frame_ms = 0;
         should_refresh_frame = true;
     } else if (now_ms >= s_pet_next_frame_ms) {
-        s_pet_sequence_index = (s_pet_sequence_index + 1) % sequence.frame_count;
+        if (sequence.key == 0) {
+            s_pet_sequence_index = (int)(esp_random() % (uint32_t)sequence.frame_count);
+        } else {
+            s_pet_sequence_index = (s_pet_sequence_index + 1) % sequence.frame_count;
+        }
         should_refresh_frame = true;
     }
     if (should_refresh_frame) {
         set_pet_frame(sequence.frames[s_pet_sequence_index]);
-        s_pet_next_frame_ms = now_ms + sequence.frame_ms;
+        s_pet_next_frame_ms = now_ms + pet_frame_delay_ms(sequence);
     }
     lv_obj_align(s_pet_image, LV_ALIGN_CENTER, 0, 14 + bob_offsets[s_pet_bob_step]);
     s_pet_bob_step = (s_pet_bob_step + 1) %
