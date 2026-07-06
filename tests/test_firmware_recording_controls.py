@@ -52,7 +52,19 @@ def test_usb_power_keeps_display_active() -> None:
     assert "static bool external_powered(void)" in source
     assert "return s_state.battery_charging || s_state.usb_powered;" in source
     assert "return external_powered() ||" in source
-    assert "display_should_stay_active() ||" in source
+    assert "deep_sleep_should_stay_awake() ||" in source
+
+
+def test_ota_check_blocks_sleep_without_waking_display() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    display_guard = source.split("static bool display_should_stay_active(void)", 1)[1]
+    display_guard = display_guard.split("static bool deep_sleep_should_stay_awake(void)", 1)[0]
+
+    assert "ota_in_progress()" not in display_guard
+    assert "static bool deep_sleep_should_stay_awake(void)" in source
+    assert "return display_should_stay_active() || ota_in_progress();" in source
+    assert "deep_sleep_should_stay_awake() ||" in source
 
 
 def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:

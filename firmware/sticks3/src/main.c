@@ -705,8 +705,12 @@ static bool display_should_stay_active(void)
            s_tap_recording_active ||
            s_motion_recording_active ||
            s_motion_calibrating ||
-           ota_in_progress() ||
            recording_finalize_active();
+}
+
+static bool deep_sleep_should_stay_awake(void)
+{
+    return display_should_stay_active() || ota_in_progress();
 }
 
 static bool front_button_is_pressed(void)
@@ -845,7 +849,7 @@ static void enter_deep_sleep(void)
 static void maybe_enter_deep_sleep(int64_t now_ms)
 {
     if (s_last_activity_ms == 0 ||
-        display_should_stay_active() ||
+        deep_sleep_should_stay_awake() ||
         s_current_backlight != LCD_BACKLIGHT_OFF) {
         return;
     }
