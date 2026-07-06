@@ -215,6 +215,7 @@ static bool s_long_press_active;
 static bool s_motion_recording_active;
 static bool s_motion_calibrating;
 static bool s_motion_lift_armed;
+static bool s_motion_start_pending;
 static bool s_tap_recording_active;
 static char s_last_alert_event_id[56];
 static char s_last_alert_type[24];
@@ -387,13 +388,13 @@ static void copy_json_string(cJSON *root, const char *key, char *target, size_t 
 static void register_activity(void);
 static void update_power_saving(int64_t now_ms);
 
-static void queue_event(agent_event_type_t type)
+static bool queue_event(agent_event_type_t type)
 {
     if (!s_event_queue) {
-        return;
+        return false;
     }
     agent_event_t event = {.type = type};
-    (void)xQueueSend(s_event_queue, &event, 0);
+    return xQueueSend(s_event_queue, &event, 0) == pdTRUE;
 }
 
 static const agent_provider_config_t *provider_config(agent_provider_t provider)
@@ -510,11 +511,13 @@ static void toggle_recording_mode(void)
         s_recording_mode = RECORDING_MODE_LIFT_TO_TALK;
         s_motion_calibrating = true;
         s_motion_lift_armed = false;
+        s_motion_start_pending = false;
     } else {
         s_recording_mode = RECORDING_MODE_PUSH_TO_TALK;
         s_motion_recording_active = false;
         s_motion_calibrating = false;
         s_motion_lift_armed = false;
+        s_motion_start_pending = false;
     }
     ESP_LOGI(TAG, "recording mode switched to %s", recording_mode_label());
     esp_err_t sound_err = vibe_audio_play_sound(VIBE_STICK_SOUND_APPROVAL);
@@ -656,6 +659,30 @@ static void update_power_saving(int64_t now_ms)
         fade_backlight_toward(target, now_ms);
     }
     s_display_power_state = next_state;
+}
+
+static void request_motion_recording_start(void)
+{
+    if (s_motion_recording_active) {
+        s_motion_start_pending = false;
+        return;
+    }
+    if (recording_network_busy()) {
+        if (!s_motion_start_pending) {
+            ESP_LOGI(TAG, "motion lift start deferred while recording network is busy");
+        }
+        s_motion_start_pending = true;
+        s_motion_lift_armed = false;
+        return;
+    }
+    if (queue_event(VIBE_STICK_EVENT_MOTION_START)) {
+        s_motion_start_pending = false;
+        s_motion_lift_armed = false;
+    } else {
+        ESP_LOGW(TAG, "motion lift start deferred because event queue is full");
+        s_motion_start_pending = true;
+        s_motion_lift_armed = false;
+    }
 }
 
 static void init_backlight(void)
@@ -2559,18 +2586,27 @@ static void app_task(void *arg)
             if (s_motion_calibrating && !vibe_motion_is_calibrating()) {
                 s_motion_calibrating = false;
                 s_motion_lift_armed = true;
+                s_motion_start_pending = false;
                 ESP_LOGI(TAG, "lift recording mode calibration complete");
                 render_state();
             }
-            if (!s_motion_calibrating && s_motion_lift_armed &&
-                motion_event == VIBE_MOTION_EVENT_LIFTED &&
-                !s_motion_recording_active && !recording_network_busy()) {
-                s_motion_lift_armed = false;
-                queue_event(VIBE_STICK_EVENT_MOTION_START);
-            } else if (!s_motion_calibrating && motion_event == VIBE_MOTION_EVENT_FLAT && s_motion_recording_active) {
-                queue_event(VIBE_STICK_EVENT_MOTION_STOP);
-            } else if (!s_motion_calibrating && motion_event == VIBE_MOTION_EVENT_FLAT && !s_motion_lift_armed) {
-                s_motion_lift_armed = true;
+            if (!s_motion_calibrating && motion_event == VIBE_MOTION_EVENT_FLAT) {
+                if (s_motion_start_pending) {
+                    ESP_LOGI(TAG, "motion lift start deferred request cancelled by flat posture");
+                    s_motion_start_pending = false;
+                }
+                if (s_motion_recording_active) {
+                    (void)queue_event(VIBE_STICK_EVENT_MOTION_STOP);
+                } else if (!s_motion_lift_armed) {
+                    s_motion_lift_armed = true;
+                }
+            } else if (!s_motion_calibrating && s_motion_lift_armed &&
+                       motion_event == VIBE_MOTION_EVENT_LIFTED &&
+                       !s_motion_recording_active) {
+                request_motion_recording_start();
+            } else if (!s_motion_calibrating && s_motion_start_pending &&
+                       !s_motion_recording_active) {
+                request_motion_recording_start();
             }
         }
         if (xQueueReceive(s_event_queue, &event, pdMS_TO_TICKS(20)) != pdTRUE) {
@@ -2605,6 +2641,7 @@ static void app_task(void *arg)
             break;
         case VIBE_STICK_EVENT_MOTION_START:
             if (s_recording_mode == RECORDING_MODE_LIFT_TO_TALK && !s_motion_recording_active) {
+                s_motion_start_pending = false;
                 s_motion_recording_active =
                     handle_recording_start("motion_lift_start", "放回发送");
                 if (!s_motion_recording_active) {
@@ -2617,6 +2654,7 @@ static void app_task(void *arg)
                 handle_recording_stop("motion_lift_stop");
                 s_motion_recording_active = false;
                 s_motion_lift_armed = true;
+                s_motion_start_pending = false;
             }
             break;
         case VIBE_STICK_EVENT_OTA_CHECK:

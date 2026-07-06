@@ -43,6 +43,17 @@ def test_idle_backlight_has_dim_and_off_states() -> None:
     assert "fade_backlight_toward(target, now_ms)" in source
     assert "DISPLAY_POWER_DIMMED" in source
     assert "DISPLAY_POWER_OFF" in source
+    assert "#define VIBE_BOARD_LCD_BACKLIGHT_IDLE 45" in board_profile
+
+
+def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert "s_motion_start_pending" in source
+    assert "request_motion_recording_start()" in source
+    assert "motion lift start deferred while recording network is busy" in source
+    assert "motion lift start deferred request cancelled by flat posture" in source
+    assert "queue_event(VIBE_STICK_EVENT_MOTION_START)" in source
 
 
 def test_wifi_profiles_are_persisted_and_rotated() -> None:
