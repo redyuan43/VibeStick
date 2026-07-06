@@ -41,7 +41,7 @@ open -e firmware/sticks3/include/vibe_stick_secrets.h
 open -e .env
 ```
 
-In `vibe_stick_secrets.h`, set Wi-Fi SSID, Wi-Fi password, and the Mac bridge host. `scripts/setup.sh` tries to auto-fill `VIBE_STICK_BRIDGE_HOST` with the detected en0 LAN IP when the file still has the example placeholder.
+In `vibe_stick_secrets.h`, set Wi-Fi SSID, Wi-Fi password, and the Mac bridge host. `scripts/setup.sh` tries to auto-fill `VIBE_STICK_BRIDGE_HOST` with the detected en0 LAN IP when the file still has the example placeholder. Add `VIBE_STICK_WIFI_PROFILES` there if the device should remember multiple 2.4 GHz networks; the firmware stores those profiles in ESP NVS so normal OTA updates keep them.
 
 In `.env`, set the ASR key and any provider choices. The default ASR example is SiliconFlow:
 

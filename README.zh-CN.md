@@ -22,6 +22,8 @@ VibeStick 面向 M5Stack StickS3 和 M5StickC Plus，不是 M5Stack 官方项目
 
 详细安装、USB 烧录、Wi-Fi OTA、S3 / Plus 双设备固件说明见：[docs/INSTALL.zh-CN.md](docs/INSTALL.zh-CN.md)。
 
+本地 Wi-Fi 密码、API key 和 token 的安全规则见：[docs/LOCAL_SECRETS.zh-CN.md](docs/LOCAL_SECRETS.zh-CN.md)。
+
 你可以手动执行，也可以交给 AI 编程 agent，例如 Claude Code 和 Codex。
 
 > 说明：标 👤 的步骤是需要人亲自动手的物理操作，例如插线、长按/短按电源键、在系统设置里授权。AI agent 请按顺序执行 shell 步骤，执行到 👤 步骤时暂停，让用户完成后再继续。
@@ -41,7 +43,7 @@ open -e firmware/sticks3/include/vibe_stick_secrets.h
 open -e .env
 ```
 
-在 `vibe_stick_secrets.h` 里填写 Wi-Fi 名称、Wi-Fi 密码、Mac bridge host。只要文件里还保留示例占位值，`scripts/setup.sh` 会尝试把 `VIBE_STICK_BRIDGE_HOST` 自动写成检测到的 en0 局域网 IP。
+在 `vibe_stick_secrets.h` 里填写 Wi-Fi 名称、Wi-Fi 密码、Mac bridge host。只要文件里还保留示例占位值，`scripts/setup.sh` 会尝试把 `VIBE_STICK_BRIDGE_HOST` 自动写成检测到的 en0 局域网 IP。需要记住多个地点的 2.4GHz Wi-Fi 时，可以在同一个 ignored 文件里增加 `VIBE_STICK_WIFI_PROFILES`；固件会把多组 profile 保存到 ESP NVS，普通 OTA 升级会保留。
 
 在 `.env` 里填写 ASR key 和需要的 provider 设置。默认推荐 SiliconFlow：
 

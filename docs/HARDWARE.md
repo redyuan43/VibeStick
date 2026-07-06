@@ -37,6 +37,11 @@ Edit:
 ```c
 #define VIBE_STICK_WIFI_SSID "your-wifi"
 #define VIBE_STICK_WIFI_PASSWORD "your-password"
+#define VIBE_STICK_WIFI_PROFILES \
+    { \
+        { VIBE_STICK_WIFI_SSID, VIBE_STICK_WIFI_PASSWORD }, \
+        { "your-second-wifi", "your-second-password" }, \
+    }
 #define VIBE_STICK_BRIDGE_HOST "192.168.1.10"
 #define VIBE_STICK_BRIDGE_PORT 8765
 #define VIBE_STICK_BRIDGE_TOKEN "paste-generated-token-here"
@@ -44,7 +49,7 @@ Edit:
 
 Do not commit `vibe_stick_secrets.h`.
 
-The Wi-Fi network must be 2.4 GHz. If the SSID is a combined 2.4/5 GHz network and the device cannot connect, create or select a dedicated 2.4 GHz SSID.
+The Wi-Fi network must be 2.4 GHz. If the SSID is a combined 2.4/5 GHz network and the device cannot connect, create or select a dedicated 2.4 GHz SSID. Multiple profiles are saved in ESP NVS and are kept across normal OTA updates and USB flashes that do not erase flash.
 
 ## Flashing
 

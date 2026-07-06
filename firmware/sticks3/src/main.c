@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,7 @@
 #include "freertos/task.h"
 #include "iot_button.h"
 #include "lvgl.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 
 #define LCD_HOST VIBE_BOARD_LCD_HOST
@@ -60,8 +62,35 @@
 #define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_IDLE_STATE_POLL_MS 10000
 #define RECORDING_RSSI_UNKNOWN -127
+#define WIFI_PROFILE_NAMESPACE "vibe_wifi"
+#define WIFI_PROFILE_BLOB_KEY "profiles"
+#define WIFI_PROFILE_MAGIC 0x56425746u
+#define WIFI_PROFILE_STORE_VERSION 1
+#define WIFI_PROFILE_MAX_COUNT 4
+#define WIFI_PROFILE_SSID_LEN 33
+#define WIFI_PROFILE_PASSWORD_LEN 65
+#define WIFI_PROFILE_RETRY_LIMIT 2
 
 static const char *TAG = "vibe_stick";
+
+typedef struct {
+    char ssid[WIFI_PROFILE_SSID_LEN];
+    char password[WIFI_PROFILE_PASSWORD_LEN];
+} wifi_profile_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t count;
+    wifi_profile_t profiles[WIFI_PROFILE_MAX_COUNT];
+} wifi_profile_store_t;
+
+#ifndef VIBE_STICK_WIFI_PROFILES
+#define VIBE_STICK_WIFI_PROFILES \
+    { { VIBE_STICK_WIFI_SSID, VIBE_STICK_WIFI_PASSWORD } }
+#endif
+
+static const wifi_profile_t k_configured_wifi_profiles[] = VIBE_STICK_WIFI_PROFILES;
 
 typedef enum {
     VIBE_STICK_EVENT_POLL_STATE,
@@ -170,6 +199,10 @@ typedef struct {
 static QueueHandle_t s_event_queue;
 static SemaphoreHandle_t s_lvgl_lock;
 static bool s_wifi_connected;
+static wifi_profile_t s_wifi_profiles[WIFI_PROFILE_MAX_COUNT];
+static size_t s_wifi_profile_count;
+static size_t s_wifi_profile_index;
+static int s_wifi_profile_retry_count;
 static bool s_recording_overlay_visible;
 static bool s_long_press_active;
 static bool s_motion_recording_active;
@@ -2059,19 +2092,174 @@ static void handle_recording_toggle(void)
     s_tap_recording_active = handle_recording_start("button_tap_start", "再按发送");
 }
 
+static bool wifi_profile_has_ssid(const wifi_profile_t *profile)
+{
+    return profile != NULL && profile->ssid[0] != '\0';
+}
+
+static void wifi_profile_copy(wifi_profile_t *dest, const wifi_profile_t *source)
+{
+    strlcpy(dest->ssid, source->ssid, sizeof(dest->ssid));
+    strlcpy(dest->password, source->password, sizeof(dest->password));
+}
+
+static bool wifi_profile_merge(const wifi_profile_t *profile)
+{
+    if (!wifi_profile_has_ssid(profile)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < s_wifi_profile_count; i++) {
+        if (strcmp(s_wifi_profiles[i].ssid, profile->ssid) == 0) {
+            if (strcmp(s_wifi_profiles[i].password, profile->password) == 0) {
+                return false;
+            }
+            wifi_profile_copy(&s_wifi_profiles[i], profile);
+            ESP_LOGI(TAG, "updated stored Wi-Fi profile ssid=%s", profile->ssid);
+            return true;
+        }
+    }
+
+    if (s_wifi_profile_count >= WIFI_PROFILE_MAX_COUNT) {
+        ESP_LOGW(TAG, "Wi-Fi profile store full; ignoring ssid=%s", profile->ssid);
+        return false;
+    }
+
+    wifi_profile_copy(&s_wifi_profiles[s_wifi_profile_count], profile);
+    s_wifi_profile_count++;
+    ESP_LOGI(TAG, "added stored Wi-Fi profile ssid=%s", profile->ssid);
+    return true;
+}
+
+static esp_err_t wifi_profiles_load_nvs(void)
+{
+    s_wifi_profile_count = 0;
+    s_wifi_profile_index = 0;
+    s_wifi_profile_retry_count = 0;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_PROFILE_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "open Wi-Fi profile NVS");
+
+    wifi_profile_store_t store = {0};
+    size_t required_size = sizeof(store);
+    err = nvs_get_blob(handle, WIFI_PROFILE_BLOB_KEY, &store, &required_size);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "read Wi-Fi profile NVS");
+
+    if (required_size != sizeof(store) ||
+        store.magic != WIFI_PROFILE_MAGIC ||
+        store.version != WIFI_PROFILE_STORE_VERSION ||
+        store.count > WIFI_PROFILE_MAX_COUNT) {
+        ESP_LOGW(TAG, "ignoring invalid Wi-Fi profile store");
+        return ESP_OK;
+    }
+
+    for (size_t i = 0; i < store.count; i++) {
+        wifi_profile_merge(&store.profiles[i]);
+    }
+    ESP_LOGI(TAG, "loaded %u Wi-Fi profile(s) from NVS", (unsigned)s_wifi_profile_count);
+    return ESP_OK;
+}
+
+static esp_err_t wifi_profiles_save_nvs(void)
+{
+    wifi_profile_store_t store = {
+        .magic = WIFI_PROFILE_MAGIC,
+        .version = WIFI_PROFILE_STORE_VERSION,
+        .count = (uint16_t)s_wifi_profile_count,
+    };
+    for (size_t i = 0; i < s_wifi_profile_count; i++) {
+        wifi_profile_copy(&store.profiles[i], &s_wifi_profiles[i]);
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_PROFILE_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "open Wi-Fi profile NVS for write");
+    err = nvs_set_blob(handle, WIFI_PROFILE_BLOB_KEY, &store, sizeof(store));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "write Wi-Fi profile NVS");
+    ESP_LOGI(TAG, "saved %u Wi-Fi profile(s) to NVS", (unsigned)s_wifi_profile_count);
+    return ESP_OK;
+}
+
+static bool wifi_profiles_merge_configured(void)
+{
+    bool changed = false;
+    const size_t configured_count =
+        sizeof(k_configured_wifi_profiles) / sizeof(k_configured_wifi_profiles[0]);
+    for (size_t i = 0; i < configured_count; i++) {
+        changed |= wifi_profile_merge(&k_configured_wifi_profiles[i]);
+    }
+    return changed;
+}
+
+static bool wifi_profiles_merge_driver_config(void)
+{
+    wifi_config_t config = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &config) != ESP_OK) {
+        return false;
+    }
+
+    wifi_profile_t profile = {0};
+    strlcpy(profile.ssid, (const char *)config.sta.ssid, sizeof(profile.ssid));
+    strlcpy(profile.password, (const char *)config.sta.password, sizeof(profile.password));
+    return wifi_profile_merge(&profile);
+}
+
+static esp_err_t wifi_apply_profile(size_t index)
+{
+    if (index >= s_wifi_profile_count) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const wifi_profile_t *profile = &s_wifi_profiles[index];
+    wifi_config_t wifi_config = {0};
+    strlcpy((char *)wifi_config.sta.ssid, profile->ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, profile->password, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    ESP_LOGI(TAG, "using Wi-Fi profile %u/%u ssid=%s",
+             (unsigned)(index + 1), (unsigned)s_wifi_profile_count, profile->ssid);
+    return esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     (void)arg;
-    (void)event_data;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *disconnected =
+            (const wifi_event_sta_disconnected_t *)event_data;
         s_wifi_connected = false;
+        if (s_wifi_profile_count > 1) {
+            s_wifi_profile_retry_count++;
+            if (s_wifi_profile_retry_count >= WIFI_PROFILE_RETRY_LIMIT) {
+                s_wifi_profile_index = (s_wifi_profile_index + 1) % s_wifi_profile_count;
+                s_wifi_profile_retry_count = 0;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(wifi_apply_profile(s_wifi_profile_index));
+            }
+        }
+        ESP_LOGW(TAG, "Wi-Fi disconnected reason=%d retry=%d profile=%u/%u",
+                 disconnected ? disconnected->reason : -1,
+                 s_wifi_profile_retry_count,
+                 (unsigned)(s_wifi_profile_index + 1),
+                 (unsigned)s_wifi_profile_count);
         esp_wifi_connect();
         render_state();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         s_wifi_connected = true;
+        s_wifi_profile_retry_count = 0;
         render_state();
         queue_event(VIBE_STICK_EVENT_POLL_STATE);
         queue_event(VIBE_STICK_EVENT_OTA_CHECK);
@@ -2080,10 +2268,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
 static esp_err_t init_wifi(void)
 {
-    if (strlen(VIBE_STICK_WIFI_SSID) == 0) {
-        ESP_LOGW(TAG, "VIBE_STICK_WIFI_SSID is empty; Wi-Fi disabled");
-        return ESP_OK;
-    }
     ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif init");
     ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop");
     esp_netif_create_default_wifi_sta();
@@ -2091,12 +2275,20 @@ static esp_err_t init_wifi(void)
     ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init");
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
-    wifi_config_t wifi_config = {0};
-    strlcpy((char *)wifi_config.sta.ssid, VIBE_STICK_WIFI_SSID, sizeof(wifi_config.sta.ssid));
-    strlcpy((char *)wifi_config.sta.password, VIBE_STICK_WIFI_PASSWORD, sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "wifi mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "wifi config");
+
+    ESP_RETURN_ON_ERROR(wifi_profiles_load_nvs(), TAG, "load Wi-Fi profiles");
+    bool profiles_changed = wifi_profiles_merge_configured();
+    profiles_changed |= wifi_profiles_merge_driver_config();
+    if (profiles_changed) {
+        ESP_RETURN_ON_ERROR(wifi_profiles_save_nvs(), TAG, "save Wi-Fi profiles");
+    }
+    if (s_wifi_profile_count == 0) {
+        ESP_LOGW(TAG, "no Wi-Fi profiles configured; Wi-Fi disabled");
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_ERROR(wifi_apply_profile(s_wifi_profile_index), TAG, "wifi config");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_MIN_MODEM), TAG, "wifi power save");
     return ESP_OK;

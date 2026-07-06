@@ -23,6 +23,8 @@ cd ~/github/VibeStick
 ./scripts/setup.sh
 ```
 
+本地账号、密码、API key 和 token 的提交规则见：[本地密钥与 Wi-Fi 配置](LOCAL_SECRETS.zh-CN.md)。
+
 编辑固件和 bridge 配置：
 
 ```sh
@@ -38,6 +40,18 @@ open -e .env
 #define VIBE_STICK_BRIDGE_HOST "192.168.x.x"
 #define VIBE_STICK_BRIDGE_PORT 8765
 ```
+
+如果需要让设备在多个地点自动连接不同 Wi-Fi，可以额外填写多组 profile：
+
+```c
+#define VIBE_STICK_WIFI_PROFILES \
+    { \
+        { VIBE_STICK_WIFI_SSID, VIBE_STICK_WIFI_PASSWORD }, \
+        { "your-office-2.4g-wifi", "your-office-password" }, \
+    }
+```
+
+固件会把这些 profile 合并保存到 ESP 的 NVS 中。普通 OTA 升级和不擦除 flash 的 USB 烧录会保留 NVS，所以设备从一个地点拿到另一个地点时，会在已保存的 Wi-Fi 之间自动重试切换。只有执行 `erase-flash` 或代码主动擦除 NVS 时才会清掉这些配置。
 
 Wi-Fi 必须是 2.4GHz。S3 / ESP32-S3 和 Plus / ESP32 都不能连接 5GHz Wi-Fi。
 

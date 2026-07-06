@@ -39,3 +39,14 @@ def test_idle_backlight_has_dim_and_off_states() -> None:
     assert "VIBE_STICK_IDLE_OFF_MS 60000" in source
     assert "DISPLAY_POWER_DIMMED" in source
     assert "DISPLAY_POWER_OFF" in source
+
+
+def test_wifi_profiles_are_persisted_and_rotated() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert "WIFI_PROFILE_NAMESPACE" in source
+    assert "wifi_profiles_load_nvs" in source
+    assert "wifi_profiles_save_nvs" in source
+    assert "wifi_profiles_merge_configured" in source
+    assert "VIBE_STICK_WIFI_PROFILES" in source
+    assert "s_wifi_profile_index = (s_wifi_profile_index + 1) % s_wifi_profile_count" in source

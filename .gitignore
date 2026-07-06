@@ -8,6 +8,9 @@ dist/
 build/
 /.tmp/
 .pytest_cache/
+# Local secrets: API keys, tokens, Wi-Fi credentials, and machine-specific hosts.
+# Keep these files local. Commit only the corresponding *.example files or docs
+# with placeholders.
 .env
 *.log
 *.wav
@@ -30,6 +33,9 @@ firmware/sticks3/sdkconfig
 firmware/sticks3/sdkconfig.*
 !firmware/sticks3/sdkconfig.defaults.*
 firmware/sticks3/sdkconfig.old
+
+# Firmware-local secrets: Wi-Fi profiles, bridge host, and bridge token.
+# This file is generated from vibe_stick_secrets.example.h and must stay local.
 firmware/sticks3/include/vibe_stick_secrets.h
 bridge/.vibestick-state.json
 docs/CLAUDE_PROVIDER_PLAN.md
