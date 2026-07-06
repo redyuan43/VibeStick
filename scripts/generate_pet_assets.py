@@ -36,8 +36,9 @@ ASSETS = [
     ("cloudling-idle-to-dozing.svg", 1.70),
     ("cloudling-idle-to-sleeping.svg", 1.70),
     ("cloudling-idle.svg", 1.70),
-    ("cloudling-idle-blink.svg", 1.70),
+    ("cloudling-idle-blink-left.svg", 1.70),
     ("cloudling-idle-blink-right.svg", 1.70),
+    ("cloudling-idle-blink-both.svg", 1.70),
     ("cloudling-juggling.svg", 1.70),
     ("cloudling-mini-alert.svg", 1.65),
     ("cloudling-mini-crabwalk.svg", 1.65),
@@ -58,8 +59,9 @@ ASSETS = [
 ]
 
 SOURCE_ALIASES = {
-    "cloudling-idle-blink.svg": "cloudling-idle.svg",
+    "cloudling-idle-blink-left.svg": "cloudling-idle.svg",
     "cloudling-idle-blink-right.svg": "cloudling-idle.svg",
+    "cloudling-idle-blink-both.svg": "cloudling-idle.svg",
 }
 
 
@@ -198,7 +200,6 @@ def normalize_frame(image: Image.Image) -> Image.Image:
 
 def draw_closed_eye(draw: ImageDraw.ImageDraw, points: list[tuple[int, int]]) -> None:
     draw.line(points, fill=(33, 23, 15), width=3, joint="curve")
-    draw.line(points, fill=(255, 255, 255), width=1, joint="curve")
 
 
 def apply_idle_blink(frame: Image.Image, side: str) -> Image.Image:
@@ -318,10 +319,12 @@ def write_assets(sheet: Image.Image) -> None:
         x = (index % GRID_COLUMNS) * ASSET_SIZE
         y = (index // GRID_COLUMNS) * ASSET_SIZE
         frame = normalize_frame(sheet.crop((x, y, x + ASSET_SIZE, y + ASSET_SIZE)))
-        if filename == "cloudling-idle-blink.svg":
-            frame = apply_idle_blink(frame, "both")
+        if filename == "cloudling-idle-blink-left.svg":
+            frame = apply_idle_blink(frame, "left")
         elif filename == "cloudling-idle-blink-right.svg":
             frame = apply_idle_blink(frame, "right")
+        elif filename == "cloudling-idle-blink-both.svg":
+            frame = apply_idle_blink(frame, "both")
         data = encode_rle(rgb565_words(frame))
         compressed_sizes.append(len(data))
         source_lines.extend(
