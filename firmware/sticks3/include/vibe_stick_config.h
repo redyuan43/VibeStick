@@ -13,7 +13,6 @@
 #define VIBE_STICK_OTA_MANIFEST_PATH "/ota/manifest"
 #define VIBE_STICK_OTA_BIN_PATH "/ota/bin"
 #define VIBE_STICK_STATE_POLL_MS 2000
-#define VIBE_STICK_OTA_CHECK_MS 30000
 
 #if __has_include("vibe_stick_secrets.h")
 #include "vibe_stick_secrets.h"

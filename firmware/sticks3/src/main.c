@@ -233,7 +233,6 @@ static atomic_bool s_recording_finalize_active;
 static char s_recording_finalize_event_name[32];
 static TaskHandle_t s_ota_task;
 static atomic_bool s_ota_in_progress;
-static int64_t s_last_ota_check_ms;
 static int64_t s_last_activity_ms;
 static int64_t s_last_backlight_fade_ms;
 static uint8_t s_current_backlight = LCD_BACKLIGHT_DEFAULT;
@@ -2796,12 +2795,6 @@ static void app_task(void *arg)
             last_poll = now_ms;
             poll_state();
         }
-        if (wifi_connected() && !network_busy && !ota_in_progress() &&
-            s_last_ota_check_ms > 0 &&
-            now_ms - s_last_ota_check_ms >= VIBE_STICK_OTA_CHECK_MS) {
-            s_last_ota_check_ms = now_ms;
-            start_ota_check_task();
-        }
         if (vibe_motion_available() && s_recording_mode == RECORDING_MODE_LIFT_TO_TALK) {
             vibe_motion_event_t motion_event = vibe_motion_poll(now_ms);
             if (s_motion_calibrating && !vibe_motion_is_calibrating()) {
@@ -2881,7 +2874,6 @@ static void app_task(void *arg)
             }
             break;
         case VIBE_STICK_EVENT_OTA_CHECK:
-            s_last_ota_check_ms = now_ms;
             start_ota_check_task();
             break;
         }

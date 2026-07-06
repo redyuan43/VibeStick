@@ -67,6 +67,20 @@ def test_ota_check_blocks_sleep_without_waking_display() -> None:
     assert "deep_sleep_should_stay_awake() ||" in source
 
 
+def test_ota_check_runs_on_network_wake_without_periodic_polling() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    config = (ROOT / "firmware" / "sticks3" / "include" / "vibe_stick_config.h").read_text(
+        encoding="utf-8"
+    )
+
+    assert "queue_event(VIBE_STICK_EVENT_OTA_CHECK);" in source
+    assert "case VIBE_STICK_EVENT_OTA_CHECK:" in source
+    assert "start_ota_check_task();" in source
+    assert "s_last_ota_check_ms" not in source
+    assert "VIBE_STICK_OTA_CHECK_MS" not in source
+    assert "VIBE_STICK_OTA_CHECK_MS" not in config
+
+
 def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 
