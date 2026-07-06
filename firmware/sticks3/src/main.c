@@ -886,7 +886,7 @@ static void update_pet_visual(void)
         return;
     }
 
-    const int bob_offsets[] = {0, -1, -2, -1, 0, 1, 2, 1};
+    const int bob_offsets[] = {0, -2, -4, -2, 0, 2, 4, 2};
     const provider_display_state_t *display_state = current_provider_display_state();
     const agent_provider_config_t *provider = current_provider_config();
     const char *status = provider->implemented ? display_state->status : "UNIMPLEMENTED";
