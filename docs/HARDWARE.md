@@ -48,6 +48,8 @@ The Wi-Fi network must be 2.4 GHz. If the SSID is a combined 2.4/5 GHz network a
 
 ## Flashing
 
+For the full Chinese install and upgrade guide covering both USB and OTA paths for StickS3 and M5StickC Plus, see [`INSTALL.zh-CN.md`](INSTALL.zh-CN.md).
+
 Load ESP-IDF into every new terminal before running `idf.py`:
 
 ```sh
