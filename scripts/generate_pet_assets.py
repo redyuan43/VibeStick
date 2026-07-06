@@ -36,7 +36,7 @@ ASSETS = [
     ("cloudling-idle-to-dozing.svg", 1.70),
     ("cloudling-idle-to-sleeping.svg", 1.70),
     ("cloudling-idle.svg", 1.70),
-    ("cloudling-idle-blink-left.svg", 1.70),
+    ("cloudling-idle-blink.svg", 1.70),
     ("cloudling-idle-blink-right.svg", 1.70),
     ("cloudling-juggling.svg", 1.70),
     ("cloudling-mini-alert.svg", 1.65),
@@ -58,7 +58,7 @@ ASSETS = [
 ]
 
 SOURCE_ALIASES = {
-    "cloudling-idle-blink-left.svg": "cloudling-idle.svg",
+    "cloudling-idle-blink.svg": "cloudling-idle.svg",
     "cloudling-idle-blink-right.svg": "cloudling-idle.svg",
 }
 
@@ -196,19 +196,33 @@ def normalize_frame(image: Image.Image) -> Image.Image:
     return frame
 
 
+def draw_closed_eye(draw: ImageDraw.ImageDraw, points: list[tuple[int, int]]) -> None:
+    draw.line(points, fill=(33, 23, 15), width=3, joint="curve")
+    draw.line(points, fill=(255, 255, 255), width=1, joint="curve")
+
+
 def apply_idle_blink(frame: Image.Image, side: str) -> Image.Image:
     image = frame.copy()
     pixels = image.load()
-    body_fill = pixels[38, 57] if side == "left" else pixels[73, 57]
     draw = ImageDraw.Draw(image)
-    if side == "left":
-        cover_box = (30, 41, 48, 65)
-        line = [(32, 53), (36, 55), (43, 53), (47, 50)]
+
+    def close_left_eye() -> None:
+        body_fill = pixels[38, 57]
+        draw.ellipse((29, 37, 49, 61), fill=body_fill)
+        draw_closed_eye(draw, [(31, 49), (35, 52), (42, 52), (47, 49)])
+
+    def close_right_eye() -> None:
+        body_fill = pixels[73, 57]
+        draw.ellipse((63, 37, 83, 61), fill=body_fill)
+        draw_closed_eye(draw, [(65, 49), (70, 52), (77, 52), (81, 49)])
+
+    if side == "both":
+        close_left_eye()
+        close_right_eye()
+    elif side == "right":
+        close_right_eye()
     else:
-        cover_box = (64, 41, 82, 65)
-        line = [(65, 50), (69, 53), (76, 55), (80, 53)]
-    draw.ellipse(cover_box, fill=body_fill)
-    draw.line(line, fill=(58, 36, 27), width=2, joint="curve")
+        close_left_eye()
     return image
 
 
@@ -304,8 +318,8 @@ def write_assets(sheet: Image.Image) -> None:
         x = (index % GRID_COLUMNS) * ASSET_SIZE
         y = (index // GRID_COLUMNS) * ASSET_SIZE
         frame = normalize_frame(sheet.crop((x, y, x + ASSET_SIZE, y + ASSET_SIZE)))
-        if filename == "cloudling-idle-blink-left.svg":
-            frame = apply_idle_blink(frame, "left")
+        if filename == "cloudling-idle-blink.svg":
+            frame = apply_idle_blink(frame, "both")
         elif filename == "cloudling-idle-blink-right.svg":
             frame = apply_idle_blink(frame, "right")
         data = encode_rle(rgb565_words(frame))
