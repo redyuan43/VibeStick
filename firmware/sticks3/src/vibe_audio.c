@@ -55,6 +55,7 @@ static i2s_chan_handle_t s_tx_handle;
 static i2s_chan_handle_t s_rx_handle;
 static bool s_tx_enabled;
 static bool s_rx_enabled;
+static vibe_audio_stats_t s_audio_stats;
 
 #if VIBE_BOARD_HAS_ES8311
 static esp_codec_dev_handle_t s_codec;
@@ -482,7 +483,6 @@ static void audio_task(void *arg)
 {
     (void)arg;
     audio_chunk_t chunk = {0};
-    size_t dropped = 0;
 
     while (atomic_load(&s_running)) {
         esp_err_t err = read_audio_chunk(&chunk);
@@ -493,13 +493,23 @@ static void audio_task(void *arg)
         if (chunk.len == 0) {
             continue;
         }
+        s_audio_stats.chunks_read++;
+        s_audio_stats.bytes_read += chunk.len;
         if (xQueueSend(s_audio_queue, &chunk, 0) != pdTRUE) {
-            dropped += chunk.len;
+            s_audio_stats.chunks_dropped++;
+            s_audio_stats.bytes_dropped += chunk.len;
+        } else {
+            s_audio_stats.chunks_queued++;
+            s_audio_stats.bytes_queued += chunk.len;
         }
     }
 
-    ESP_LOGI(TAG, "recording stopped dropped=%u pending=%u",
-             (unsigned)dropped, (unsigned)uxQueueMessagesWaiting(s_audio_queue));
+    ESP_LOGI(TAG, "recording stopped read_chunks=%u queued_chunks=%u dropped_chunks=%u dropped_bytes=%u pending=%u",
+             (unsigned)s_audio_stats.chunks_read,
+             (unsigned)s_audio_stats.chunks_queued,
+             (unsigned)s_audio_stats.chunks_dropped,
+             (unsigned)s_audio_stats.bytes_dropped,
+             (unsigned)uxQueueMessagesWaiting(s_audio_queue));
     release_session_resources();
     s_audio_task = NULL;
     vTaskDelete(NULL);
@@ -537,6 +547,7 @@ esp_err_t vibe_audio_start(void)
     }
 
     vibe_audio_clear();
+    memset(&s_audio_stats, 0, sizeof(s_audio_stats));
 
     esp_err_t err = ESP_OK;
 #if VIBE_BOARD_HAS_ES8311
@@ -667,6 +678,14 @@ esp_err_t vibe_audio_read(uint8_t *buffer, size_t capacity, size_t *len, uint32_
 size_t vibe_audio_pending_chunks(void)
 {
     return s_audio_queue ? uxQueueMessagesWaiting(s_audio_queue) : 0;
+}
+
+void vibe_audio_stats(vibe_audio_stats_t *stats)
+{
+    if (!stats) {
+        return;
+    }
+    *stats = s_audio_stats;
 }
 
 const uint8_t *vibe_audio_data(size_t *len)

@@ -17,6 +17,7 @@ static i2c_master_dev_handle_t s_pmic_dev;
 #if VIBE_BOARD_HAS_ES8311
 
 #define M5PM1_ADDR 0x6e
+#define M5PM1_I2C_FREQ_HZ 100000
 #define M5PM1_REG_DEVICE_ID 0x00
 #define M5PM1_REG_PWR_CFG 0x06
 #define M5PM1_REG_HOLD_CFG 0x07
@@ -111,7 +112,11 @@ static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, ui
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = address,
-        .scl_speed_hz = I2C_FREQ_HZ,
+        .scl_speed_hz =
+#if VIBE_BOARD_HAS_ES8311
+            (address == M5PM1_ADDR) ? M5PM1_I2C_FREQ_HZ :
+#endif
+            I2C_FREQ_HZ,
     };
     return i2c_master_bus_add_device(s_i2c_bus, &dev_config, &s_pmic_dev);
 }
@@ -176,7 +181,8 @@ esp_err_t vibe_board_init_power(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_HOLD_CFG,
                                             hold_cfg | M5PM1_HOLD_CFG_LDO_HOLD));
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(M5PM1_REG_GPIO_FUNC0,
-                                             M5PM1_GPIO2_L3B_POWER_EN, 0));
+                                             M5PM1_GPIO_FUNC_MASK(2),
+                                             M5PM1_GPIO_FUNC_GPIO(2)));
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(M5PM1_REG_GPIO_MODE,
                                              0, M5PM1_GPIO2_L3B_POWER_EN));
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(M5PM1_REG_GPIO_DRV,
