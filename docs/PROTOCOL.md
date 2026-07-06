@@ -100,6 +100,58 @@ Returns bridge health metadata:
 }
 ```
 
+## GET /ota/manifest
+
+Returns the latest firmware update manifest for the requested board:
+
+```text
+GET /ota/manifest?board=stickc_plus
+```
+
+Supported board names are `sticks3` and `stickc_plus`.
+
+No update:
+
+```json
+{
+  "available": false,
+  "board": "stickc_plus"
+}
+```
+
+Update available:
+
+```json
+{
+  "available": true,
+  "board": "stickc_plus",
+  "version": "v0.1.4-3-gdirty",
+  "build_id": "Jul  5 2026 18:17:38 05bab9f8ded0",
+  "size": 1468000,
+  "sha256": "<bin-sha256>",
+  "elf_sha256": "<elf-sha256>",
+  "file_name": "stickc_plus.bin",
+  "url": "/ota/bin?board=stickc_plus"
+}
+```
+
+The firmware compares `elf_sha256` first. If it matches the currently running
+app, the device skips the update.
+
+## GET /ota/bin
+
+Returns the OTA firmware binary referenced by the manifest:
+
+```text
+GET /ota/bin?board=stickc_plus
+```
+
+The response body is `application/octet-stream`, and `Content-Length` should
+match the manifest `size`.
+
+See `docs/PC_CLIENT_INTEGRATION.md` for the PC-client integration checklist and
+OTA artifact layout.
+
 ## POST /event
 
 Receives generic firmware or debug events.
