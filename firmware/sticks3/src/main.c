@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "vibe_audio.h"
@@ -53,11 +54,15 @@
 #define LVGL_DRAW_BUF_LINES 24
 #define LVGL_TICK_PERIOD_MS 10
 #define BATTERY_FILL_MAX_WIDTH 20
-#define RECORDING_UPLOAD_BUFFER_BYTES 4096
+#define RECORDING_UPLOAD_BATCH_CHUNKS 4
+#define RECORDING_UPLOAD_BUFFER_BYTES 8192
 #define RECORDING_UPLOAD_WAIT_MS 10000
+#define RECORDING_START_TIMEOUT_MS 1200
 #define OTA_READ_BUFFER_BYTES 4096
 #define FIRMWARE_BUILD_ID __DATE__ " " __TIME__
-#define VIBE_STICK_CONTROL_CORE 0
+#define VIBE_STICK_APP_CORE 0
+#define VIBE_STICK_UI_CORE 1
+#define VIBE_STICK_NETWORK_CORE 1
 #define VIBE_STICK_IDLE_DIM_MS 30000
 #define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_IDLE_STATE_POLL_MS 10000
@@ -183,7 +188,7 @@ typedef enum {
 } display_power_state_t;
 
 typedef struct {
-    size_t uploaded_chunks;
+    size_t upload_posts;
     size_t uploaded_bytes;
     size_t upload_failures;
     size_t read_failures;
@@ -198,7 +203,7 @@ typedef struct {
 
 static QueueHandle_t s_event_queue;
 static SemaphoreHandle_t s_lvgl_lock;
-static bool s_wifi_connected;
+static atomic_bool s_wifi_connected;
 static wifi_profile_t s_wifi_profiles[WIFI_PROFILE_MAX_COUNT];
 static size_t s_wifi_profile_count;
 static size_t s_wifi_profile_index;
@@ -214,9 +219,12 @@ static char s_last_alert_type[24];
 static bool s_alert_sound_baseline_ready;
 static char s_recording_session_id[40];
 static TaskHandle_t s_recording_upload_task;
-static bool s_recording_upload_failed;
+static atomic_bool s_recording_upload_failed;
+static TaskHandle_t s_recording_finalize_task;
+static atomic_bool s_recording_finalize_active;
+static char s_recording_finalize_event_name[32];
 static TaskHandle_t s_ota_task;
-static bool s_ota_in_progress;
+static atomic_bool s_ota_in_progress;
 static int64_t s_last_ota_check_ms;
 static int64_t s_last_activity_ms;
 static uint8_t s_current_backlight = LCD_BACKLIGHT_DEFAULT;
@@ -243,6 +251,54 @@ static lv_obj_t *s_recording_wave_group;
 static lv_obj_t *s_recording_wave_bars[5];
 static lv_obj_t *s_recording_title;
 static lv_obj_t *s_recording_hint;
+
+static bool wifi_connected(void)
+{
+    return atomic_load(&s_wifi_connected);
+}
+
+static void set_wifi_connected(bool connected)
+{
+    atomic_store(&s_wifi_connected, connected);
+}
+
+static bool ota_in_progress(void)
+{
+    return atomic_load(&s_ota_in_progress);
+}
+
+static void set_ota_in_progress(bool in_progress)
+{
+    atomic_store(&s_ota_in_progress, in_progress);
+}
+
+static bool recording_upload_failed(void)
+{
+    return atomic_load(&s_recording_upload_failed);
+}
+
+static void set_recording_upload_failed(bool failed)
+{
+    atomic_store(&s_recording_upload_failed, failed);
+}
+
+static bool recording_finalize_active(void)
+{
+    return atomic_load(&s_recording_finalize_active);
+}
+
+static void set_recording_finalize_active(bool active)
+{
+    atomic_store(&s_recording_finalize_active, active);
+}
+
+static bool recording_network_busy(void)
+{
+    return vibe_audio_is_recording() ||
+           s_recording_session_id[0] != '\0' ||
+           s_recording_upload_task != NULL ||
+           recording_finalize_active();
+}
 
 static agent_state_t s_state = {
     .time = "--:--",
@@ -546,7 +602,8 @@ static bool display_should_stay_active(void)
            s_tap_recording_active ||
            s_motion_recording_active ||
            s_motion_calibrating ||
-           s_ota_in_progress;
+           ota_in_progress() ||
+           recording_finalize_active();
 }
 
 static void register_activity(void)
@@ -673,7 +730,7 @@ static esp_err_t init_display(void)
     ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_MS * 1000), TAG, "tick start");
 
     xTaskCreatePinnedToCore(lvgl_task, "lvgl", 4096, NULL, 3, NULL,
-                            VIBE_STICK_CONTROL_CORE);
+                            VIBE_STICK_UI_CORE);
     return ESP_OK;
 }
 
@@ -1048,9 +1105,10 @@ static void render_state(void)
     lvgl_lock();
     const agent_provider_config_t *provider = current_provider_config();
 
-    lv_label_set_text(s_wifi_label, s_wifi_connected ? "WiFi" : "OFF");
+    const bool connected = wifi_connected();
+    lv_label_set_text(s_wifi_label, connected ? "WiFi" : "OFF");
     lv_obj_set_style_text_color(s_wifi_label,
-                                s_wifi_connected ? lv_color_hex(0xf3f4f6) : lv_color_hex(0x686e78),
+                                connected ? lv_color_hex(0xf3f4f6) : lv_color_hex(0x686e78),
                                 0);
     set_battery_ui(s_state.battery, s_state.battery_charging, s_state.usb_powered);
     lv_label_set_text(s_mode_label, recording_mode_label());
@@ -1521,22 +1579,23 @@ static void ota_check_task(void *arg)
         }
     }
 
-    s_ota_in_progress = false;
+    set_ota_in_progress(false);
     s_ota_task = NULL;
     vTaskDelete(NULL);
 }
 
 static void start_ota_check_task(void)
 {
-    if (!s_wifi_connected || s_ota_in_progress) {
-        ESP_LOGD(TAG, "OTA check skipped wifi=%d busy=%d", s_wifi_connected, s_ota_in_progress);
+    if (!wifi_connected() || ota_in_progress() || recording_network_busy()) {
+        ESP_LOGD(TAG, "OTA check skipped wifi=%d ota=%d recording=%d",
+                 wifi_connected(), ota_in_progress(), recording_network_busy());
         return;
     }
-    s_ota_in_progress = true;
+    set_ota_in_progress(true);
     BaseType_t ok = xTaskCreatePinnedToCore(ota_check_task, "ota_check", 8192, NULL, 3,
-                                            &s_ota_task, VIBE_STICK_CONTROL_CORE);
+                                            &s_ota_task, VIBE_STICK_NETWORK_CORE);
     if (ok != pdPASS) {
-        s_ota_in_progress = false;
+        set_ota_in_progress(false);
         s_ota_task = NULL;
         ESP_LOGW(TAG, "OTA task create failed");
     }
@@ -1716,7 +1775,7 @@ static void poll_state(void)
     if (err != ESP_OK || response[0] == '\0' || !parse_state_json(response)) {
         provider_display_state_t *display_state = current_provider_display_state();
         strlcpy(display_state->status, "OFFLINE", sizeof(display_state->status));
-        s_state.wifi = s_wifi_connected;
+        s_state.wifi = wifi_connected();
         render_state();
         return;
     }
@@ -1727,7 +1786,8 @@ static void poll_state(void)
 static void post_simple_event(const char *event_name, const char *path)
 {
     char body[96];
-    snprintf(body, sizeof(body), "{\"event\":\"%s\",\"source\":\"sticks3\"}", event_name);
+    snprintf(body, sizeof(body), "{\"event\":\"%s\",\"source\":\"%s\"}",
+             event_name, VIBE_BOARD_EVENT_SOURCE);
     char response[512] = {0};
     const char *target_path = path ? path : VIBE_STICK_EVENT_PATH;
     esp_err_t err = http_request("POST", target_path, body, response, sizeof(response));
@@ -1803,7 +1863,7 @@ static void generate_recording_session_id(char *session_id, size_t session_id_le
 
 static int current_wifi_rssi(void)
 {
-    if (!s_wifi_connected) {
+    if (!wifi_connected()) {
         return RECORDING_RSSI_UNKNOWN;
     }
     wifi_ap_record_t ap = {0};
@@ -1841,16 +1901,16 @@ static void log_recording_diagnostics(void)
     vibe_audio_stats_t audio_stats = {0};
     vibe_audio_stats(&audio_stats);
     s_recording_upload_stats.stop_rssi = current_wifi_rssi();
-    const int64_t avg_post_ms = s_recording_upload_stats.uploaded_chunks > 0
+    const int64_t avg_post_ms = s_recording_upload_stats.upload_posts > 0
                                     ? s_recording_upload_stats.post_duration_total_ms /
-                                          (int64_t)s_recording_upload_stats.uploaded_chunks
+                                          (int64_t)s_recording_upload_stats.upload_posts
                                     : 0;
     const int64_t min_post_ms = s_recording_upload_stats.post_duration_min_ms >= 0
                                     ? s_recording_upload_stats.post_duration_min_ms
                                     : 0;
     ESP_LOGI(TAG,
              "recording diagnostics board=%s audio_read_chunks=%u audio_queued_chunks=%u "
-             "audio_dropped_chunks=%u audio_dropped_bytes=%u uploaded_chunks=%u uploaded_bytes=%u "
+             "audio_dropped_chunks=%u audio_dropped_bytes=%u upload_posts=%u uploaded_bytes=%u "
              "upload_failures=%u read_failures=%u read_timeouts=%u max_pending=%u "
              "post_ms_min=%lld post_ms_avg=%lld post_ms_max=%lld rssi_start=%d rssi_stop=%d",
              VIBE_BOARD_NAME,
@@ -1858,7 +1918,7 @@ static void log_recording_diagnostics(void)
              (unsigned)audio_stats.chunks_queued,
              (unsigned)audio_stats.chunks_dropped,
              (unsigned)audio_stats.bytes_dropped,
-             (unsigned)s_recording_upload_stats.uploaded_chunks,
+             (unsigned)s_recording_upload_stats.upload_posts,
              (unsigned)s_recording_upload_stats.uploaded_bytes,
              (unsigned)s_recording_upload_stats.upload_failures,
              (unsigned)s_recording_upload_stats.read_failures,
@@ -1896,7 +1956,7 @@ static void recording_upload_task(void *arg)
     uint8_t *buffer = heap_caps_malloc(RECORDING_UPLOAD_BUFFER_BYTES, MALLOC_CAP_8BIT);
     if (!buffer) {
         ESP_LOGW(TAG, "recording upload buffer allocation failed");
-        s_recording_upload_failed = true;
+        set_recording_upload_failed(true);
         s_recording_upload_task = NULL;
         vTaskDelete(NULL);
         return;
@@ -1908,7 +1968,8 @@ static void recording_upload_task(void *arg)
             s_recording_upload_stats.max_pending_chunks = pending;
         }
         size_t audio_len = 0;
-        esp_err_t err = vibe_audio_read(buffer, RECORDING_UPLOAD_BUFFER_BYTES, &audio_len, 250);
+        esp_err_t err = vibe_audio_read_batch(buffer, RECORDING_UPLOAD_BUFFER_BYTES, &audio_len,
+                                              RECORDING_UPLOAD_BATCH_CHUNKS, 250);
         if (err == ESP_ERR_TIMEOUT) {
             s_recording_upload_stats.read_timeouts++;
             continue;
@@ -1916,7 +1977,7 @@ static void recording_upload_task(void *arg)
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "audio read for upload failed: %s", esp_err_to_name(err));
             s_recording_upload_stats.read_failures++;
-            s_recording_upload_failed = true;
+            set_recording_upload_failed(true);
             continue;
         }
         int64_t post_start_ms = esp_timer_get_time() / 1000;
@@ -1925,36 +1986,38 @@ static void recording_upload_task(void *arg)
         record_upload_duration(post_duration_ms);
         if (err != ESP_OK) {
             s_recording_upload_stats.upload_failures++;
-            s_recording_upload_failed = true;
+            set_recording_upload_failed(true);
         } else {
-            s_recording_upload_stats.uploaded_chunks++;
+            s_recording_upload_stats.upload_posts++;
             s_recording_upload_stats.uploaded_bytes += audio_len;
         }
     }
 
     heap_caps_free(buffer);
-    ESP_LOGI(TAG, "recording upload task done chunks=%u bytes=%u failures=%u failed=%d",
-             (unsigned)s_recording_upload_stats.uploaded_chunks,
+    ESP_LOGI(TAG, "recording upload task done posts=%u bytes=%u failures=%u failed=%d",
+             (unsigned)s_recording_upload_stats.upload_posts,
              (unsigned)s_recording_upload_stats.uploaded_bytes,
              (unsigned)s_recording_upload_stats.upload_failures,
-             s_recording_upload_failed);
+             recording_upload_failed());
     s_recording_upload_task = NULL;
     vTaskDelete(NULL);
 }
 
-static void start_recording_upload_task(void)
+static bool start_recording_upload_task(void)
 {
-    s_recording_upload_failed = false;
+    set_recording_upload_failed(false);
     reset_recording_upload_stats();
     s_recording_upload_task = NULL;
     BaseType_t ok = xTaskCreatePinnedToCore(recording_upload_task, "recording_upload", 6144,
                                             NULL, 4, &s_recording_upload_task,
-                                            VIBE_STICK_CONTROL_CORE);
+                                            VIBE_STICK_NETWORK_CORE);
     if (ok != pdPASS) {
-        s_recording_upload_failed = true;
+        set_recording_upload_failed(true);
         s_recording_upload_task = NULL;
         ESP_LOGW(TAG, "recording upload task create failed");
+        return false;
     }
+    return true;
 }
 
 static void wait_recording_upload_task(void)
@@ -1965,14 +2028,14 @@ static void wait_recording_upload_task(void)
     }
     if (s_recording_upload_task != NULL) {
         ESP_LOGW(TAG, "recording upload task wait timeout");
-        s_recording_upload_failed = true;
+        set_recording_upload_failed(true);
     }
 }
 
 static bool handle_recording_start(const char *event_name, const char *hint)
 {
     register_activity();
-    if (vibe_audio_is_recording() || s_recording_session_id[0] != '\0') {
+    if (recording_network_busy() || s_tap_recording_active || s_motion_recording_active) {
         ESP_LOGI(TAG, "recording start ignored while already recording");
         return false;
     }
@@ -1983,19 +2046,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
     }
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_NONE));
-    esp_err_t sound_err = vibe_audio_play_sound(VIBE_STICK_SOUND_RECORDING_START);
-    if (sound_err != ESP_OK) {
-        ESP_LOGW(TAG, "recording start sound skipped: %s", esp_err_to_name(sound_err));
-    }
-
-    esp_err_t audio_err = vibe_audio_start();
-    if (audio_err != ESP_OK) {
-        ESP_LOGW(TAG, "hardware recording start failed: %s", esp_err_to_name(audio_err));
-        s_recording_session_id[0] = '\0';
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
-        return false;
-    }
-    show_recording_overlay("正在聆听", hint, true);
+    show_recording_overlay("正在连接", "", true);
 
     char body[192];
     snprintf(body, sizeof(body),
@@ -2006,39 +2057,60 @@ static bool handle_recording_start(const char *event_name, const char *hint)
              VIBE_BOARD_AUDIO_SOURCE,
              s_recording_session_id);
     char response[1024] = {0};
-    esp_err_t err = http_request("POST", VIBE_STICK_RECORDING_START_PATH, body, response, sizeof(response));
+    esp_err_t err = http_request_timeout("POST", VIBE_STICK_RECORDING_START_PATH, body, response,
+                                         sizeof(response), RECORDING_START_TIMEOUT_MS);
     if (err == ESP_OK && response[0] != '\0') {
         char response_session_id[40] = {0};
         parse_recording_session_id(response, response_session_id, sizeof(response_session_id));
         if (response_session_id[0] != '\0' &&
             strcmp(response_session_id, s_recording_session_id) != 0) {
             ESP_LOGW(TAG, "bridge returned a different recording session id");
+            strlcpy(s_recording_session_id, response_session_id, sizeof(s_recording_session_id));
         }
         if (parse_state_json(response)) {
             render_state();
         }
     } else {
         ESP_LOGW(TAG, "recording start bridge request failed: %s", esp_err_to_name(err));
+        show_recording_overlay("连接失败", "", true);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        show_recording_overlay(NULL, NULL, false);
+        s_recording_session_id[0] = '\0';
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
+        return false;
     }
 
-    start_recording_upload_task();
+    esp_err_t sound_err = vibe_audio_play_sound(VIBE_STICK_SOUND_RECORDING_START);
+    if (sound_err != ESP_OK) {
+        ESP_LOGW(TAG, "recording start sound skipped: %s", esp_err_to_name(sound_err));
+    }
+
+    esp_err_t audio_err = vibe_audio_start();
+    if (audio_err != ESP_OK) {
+        ESP_LOGW(TAG, "hardware recording start failed: %s", esp_err_to_name(audio_err));
+        show_recording_overlay("录音失败", "", true);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        show_recording_overlay(NULL, NULL, false);
+        s_recording_session_id[0] = '\0';
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
+        return false;
+    }
+    if (!start_recording_upload_task()) {
+        (void)vibe_audio_stop();
+        vibe_audio_clear();
+        show_recording_overlay("发送失败", "", true);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        show_recording_overlay(NULL, NULL, false);
+        s_recording_session_id[0] = '\0';
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
+        return false;
+    }
+    show_recording_overlay("正在聆听", hint, true);
     return true;
 }
 
-static void handle_recording_stop(const char *event_name)
+static void finish_recording_stop(const char *event_name)
 {
-    register_activity();
-    show_recording_overlay("正在发送", "", true);
-    if (s_recording_session_id[0] == '\0') {
-        (void)vibe_audio_stop();
-        vibe_audio_clear();
-        poll_state();
-        show_recording_overlay(NULL, NULL, false);
-        s_tap_recording_active = false;
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
-        return;
-    }
-
     esp_err_t audio_err = vibe_audio_stop();
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "hardware recording stop failed: %s", esp_err_to_name(audio_err));
@@ -2072,7 +2144,7 @@ static void handle_recording_stop(const char *event_name)
             render_state();
         }
     }
-    if (err != ESP_OK || recording_failed || s_recording_upload_failed) {
+    if (err != ESP_OK || recording_failed || recording_upload_failed()) {
         ESP_LOGW(TAG, "recording stop bridge request failed: %s", esp_err_to_name(err));
         const char *title = (strcmp(recording_status, "audio_skipped") == 0 ||
                              strcmp(recording_status, "transcript_rejected") == 0)
@@ -2082,9 +2154,53 @@ static void handle_recording_stop(const char *event_name)
     }
     s_recording_session_id[0] = '\0';
     s_tap_recording_active = false;
+    s_motion_recording_active = false;
     poll_state();
     show_recording_overlay(NULL, NULL, false);
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
+}
+
+static void recording_finalize_task(void *arg)
+{
+    (void)arg;
+    char event_name[sizeof(s_recording_finalize_event_name)];
+    strlcpy(event_name, s_recording_finalize_event_name, sizeof(event_name));
+    finish_recording_stop(event_name);
+    set_recording_finalize_active(false);
+    s_recording_finalize_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void handle_recording_stop(const char *event_name)
+{
+    register_activity();
+    if (recording_finalize_active()) {
+        ESP_LOGI(TAG, "recording stop ignored while finalize is active");
+        return;
+    }
+    show_recording_overlay("正在发送", "", true);
+    s_tap_recording_active = false;
+
+    if (s_recording_session_id[0] == '\0') {
+        (void)vibe_audio_stop();
+        vibe_audio_clear();
+        poll_state();
+        show_recording_overlay(NULL, NULL, false);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
+        return;
+    }
+
+    strlcpy(s_recording_finalize_event_name, event_name, sizeof(s_recording_finalize_event_name));
+    set_recording_finalize_active(true);
+    BaseType_t ok = xTaskCreatePinnedToCore(recording_finalize_task, "recording_finalize", 8192,
+                                            NULL, 4, &s_recording_finalize_task,
+                                            VIBE_STICK_NETWORK_CORE);
+    if (ok != pdPASS) {
+        ESP_LOGW(TAG, "recording finalize task create failed; running inline");
+        finish_recording_stop(event_name);
+        set_recording_finalize_active(false);
+        s_recording_finalize_task = NULL;
+    }
 }
 
 static void handle_recording_toggle(void)
@@ -2251,7 +2367,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *disconnected =
             (const wifi_event_sta_disconnected_t *)event_data;
-        s_wifi_connected = false;
+        set_wifi_connected(false);
         if (s_wifi_profile_count > 1) {
             s_wifi_profile_retry_count++;
             if (s_wifi_profile_retry_count >= WIFI_PROFILE_RETRY_LIMIT) {
@@ -2268,7 +2384,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         esp_wifi_connect();
         render_state();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        s_wifi_connected = true;
+        set_wifi_connected(true);
         s_wifi_profile_retry_count = 0;
         render_state();
         queue_event(VIBE_STICK_EVENT_POLL_STATE);
@@ -2408,11 +2524,12 @@ static void app_task(void *arg)
         update_power_saving(now_ms);
         const int state_poll_ms = s_display_power_state != DISPLAY_POWER_ACTIVE ?
             VIBE_STICK_IDLE_STATE_POLL_MS : VIBE_STICK_STATE_POLL_MS;
-        if (s_wifi_connected && now_ms - last_poll >= state_poll_ms) {
+        const bool network_busy = recording_network_busy();
+        if (wifi_connected() && !network_busy && now_ms - last_poll >= state_poll_ms) {
             last_poll = now_ms;
             poll_state();
         }
-        if (s_wifi_connected && !s_ota_in_progress &&
+        if (wifi_connected() && !network_busy && !ota_in_progress() &&
             s_last_ota_check_ms > 0 &&
             now_ms - s_last_ota_check_ms >= VIBE_STICK_OTA_CHECK_MS) {
             s_last_ota_check_ms = now_ms;
@@ -2428,7 +2545,7 @@ static void app_task(void *arg)
             }
             if (!s_motion_calibrating && s_motion_lift_armed &&
                 motion_event == VIBE_MOTION_EVENT_LIFTED &&
-                !s_motion_recording_active && !vibe_audio_is_recording()) {
+                !s_motion_recording_active && !recording_network_busy()) {
                 s_motion_lift_armed = false;
                 queue_event(VIBE_STICK_EVENT_MOTION_START);
             } else if (!s_motion_calibrating && motion_event == VIBE_MOTION_EVENT_FLAT && s_motion_recording_active) {
@@ -2442,14 +2559,18 @@ static void app_task(void *arg)
         }
         switch (event.type) {
         case VIBE_STICK_EVENT_POLL_STATE:
-            poll_state();
+            if (wifi_connected() && !recording_network_busy()) {
+                poll_state();
+            }
             break;
         case VIBE_STICK_EVENT_RECORDING_TOGGLE:
             handle_recording_toggle();
             break;
         case VIBE_STICK_EVENT_DOUBLE_CLICK:
-            post_simple_event("button_double", VIBE_STICK_QUOTA_REFRESH_PATH);
-            poll_state();
+            if (!recording_network_busy()) {
+                post_simple_event("button_double", VIBE_STICK_QUOTA_REFRESH_PATH);
+                poll_state();
+            }
             break;
         case VIBE_STICK_EVENT_LONG_START:
             (void)handle_recording_start("button_long_start", "松开发送");
@@ -2516,5 +2637,5 @@ void app_main(void)
     ESP_ERROR_CHECK(vibe_audio_init());
     ESP_ERROR_CHECK(init_wifi());
     xTaskCreatePinnedToCore(app_task, "agent_app", 6144, NULL, 4, NULL,
-                            VIBE_STICK_CONTROL_CORE);
+                            VIBE_STICK_APP_CORE);
 }

@@ -38,6 +38,7 @@
 #define VIBE_STICK_TWO_PI 6.28318530717958647692f
 #define VIBE_STICK_TONE_DUTY ((1 << 9) - 1)
 #define VIBE_STICK_BEEP_MS 200
+#define VIBE_STICK_AUDIO_CORE 1
 
 typedef struct {
     size_t len;
@@ -565,7 +566,8 @@ esp_err_t vibe_audio_start(void)
     }
 
     atomic_store(&s_running, true);
-    BaseType_t ok = xTaskCreatePinnedToCore(audio_task, "vibe_audio", 8192, NULL, 5, &s_audio_task, 1);
+    BaseType_t ok = xTaskCreatePinnedToCore(audio_task, "vibe_audio", 8192, NULL, 5,
+                                            &s_audio_task, VIBE_STICK_AUDIO_CORE);
     if (ok != pdPASS) {
         atomic_store(&s_running, false);
         release_session_resources();
@@ -672,6 +674,45 @@ esp_err_t vibe_audio_read(uint8_t *buffer, size_t capacity, size_t *len, uint32_
     }
     memcpy(buffer, chunk.data, chunk.len);
     *len = chunk.len;
+    return ESP_OK;
+}
+
+esp_err_t vibe_audio_read_batch(uint8_t *buffer, size_t capacity, size_t *len,
+                                size_t max_chunks, uint32_t timeout_ms)
+{
+    ESP_RETURN_ON_FALSE(buffer != NULL && len != NULL, ESP_ERR_INVALID_ARG, TAG, "null batch args");
+    ESP_RETURN_ON_FALSE(capacity >= AUDIO_CHUNK_BYTES, ESP_ERR_INVALID_ARG, TAG, "batch buffer too small");
+    if (max_chunks == 0) {
+        max_chunks = 1;
+    }
+
+    *len = 0;
+    audio_chunk_t chunk = {0};
+    if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (chunk.len > capacity) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(buffer, chunk.data, chunk.len);
+    *len = chunk.len;
+
+    for (size_t chunks = 1; chunks < max_chunks; ++chunks) {
+        if (capacity - *len < AUDIO_CHUNK_BYTES) {
+            break;
+        }
+        const TickType_t next_wait = atomic_load(&s_running)
+                                         ? pdMS_TO_TICKS(AUDIO_FRAME_MS + 10)
+                                         : 0;
+        if (xQueueReceive(s_audio_queue, &chunk, next_wait) != pdTRUE) {
+            break;
+        }
+        if (chunk.len > capacity - *len) {
+            break;
+        }
+        memcpy(buffer + *len, chunk.data, chunk.len);
+        *len += chunk.len;
+    }
     return ESP_OK;
 }
 

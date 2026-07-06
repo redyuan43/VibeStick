@@ -32,6 +32,8 @@ esp_err_t vibe_audio_start(void);
 esp_err_t vibe_audio_stop(void);
 esp_err_t vibe_audio_play_sound(agent_sound_t sound);
 esp_err_t vibe_audio_read(uint8_t *buffer, size_t capacity, size_t *len, uint32_t timeout_ms);
+esp_err_t vibe_audio_read_batch(uint8_t *buffer, size_t capacity, size_t *len,
+                                size_t max_chunks, uint32_t timeout_ms);
 size_t vibe_audio_pending_chunks(void);
 void vibe_audio_stats(vibe_audio_stats_t *stats);
 bool vibe_audio_is_recording(void);
