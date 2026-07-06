@@ -39,7 +39,7 @@ def test_idle_backlight_has_dim_and_off_states() -> None:
 
     assert "VIBE_STICK_IDLE_DIM_MS 30000" in source
     assert "VIBE_STICK_IDLE_OFF_MS 60000" in source
-    assert "VIBE_STICK_IDLE_STATE_POLL_MS 60000" in source
+    assert "VIBE_STICK_IDLE_STATE_POLL_MS" not in source
     assert "VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS" in source
     assert "fade_backlight_toward(target, now_ms)" in source
     assert "DISPLAY_POWER_DIMMED" in source
@@ -54,6 +54,14 @@ def test_usb_power_keeps_display_active() -> None:
     assert "return s_state.battery_charging || s_state.usb_powered;" in source
     assert "return external_powered() ||" in source
     assert "deep_sleep_should_stay_awake() ||" in source
+
+
+def test_state_polling_stops_while_screen_is_off() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert "s_display_power_state == DISPLAY_POWER_ACTIVE" in source
+    assert "now_ms - last_poll >= VIBE_STICK_STATE_POLL_MS" in source
+    assert "VIBE_STICK_IDLE_STATE_POLL_MS" not in source
 
 
 def test_ota_check_blocks_sleep_without_waking_display() -> None:

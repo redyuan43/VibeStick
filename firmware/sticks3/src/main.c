@@ -67,7 +67,6 @@
 #define VIBE_STICK_IDLE_DIM_MS 30000
 #define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_DEEP_SLEEP_MS 600000
-#define VIBE_STICK_IDLE_STATE_POLL_MS 60000
 #define VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS 60
 #define VIBE_STICK_BACKLIGHT_FADE_STEP 5
 #define VIBE_STICK_PET_FAST_RESUME_MAX_MS 15000
@@ -2806,10 +2805,10 @@ static void app_task(void *arg)
         update_power_saving(now_ms);
         maybe_enter_deep_sleep(now_ms);
         handle_deep_sleep_front_button_intent();
-        const int state_poll_ms = s_display_power_state != DISPLAY_POWER_ACTIVE ?
-            VIBE_STICK_IDLE_STATE_POLL_MS : VIBE_STICK_STATE_POLL_MS;
         const bool network_busy = recording_network_busy();
-        if (wifi_connected() && !network_busy && now_ms - last_poll >= state_poll_ms) {
+        if (s_display_power_state == DISPLAY_POWER_ACTIVE &&
+            wifi_connected() && !network_busy &&
+            now_ms - last_poll >= VIBE_STICK_STATE_POLL_MS) {
             last_poll = now_ms;
             poll_state();
         }
