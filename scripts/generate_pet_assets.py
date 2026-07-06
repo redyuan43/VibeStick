@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +36,8 @@ ASSETS = [
     ("cloudling-idle-to-dozing.svg", 1.70),
     ("cloudling-idle-to-sleeping.svg", 1.70),
     ("cloudling-idle.svg", 1.70),
+    ("cloudling-idle-blink-left.svg", 1.70),
+    ("cloudling-idle-blink-right.svg", 1.70),
     ("cloudling-juggling.svg", 1.70),
     ("cloudling-mini-alert.svg", 1.65),
     ("cloudling-mini-crabwalk.svg", 1.65),
@@ -54,6 +56,11 @@ ASSETS = [
     ("cloudling-thinking.svg", 1.70),
     ("cloudling-typing.svg", 1.70),
 ]
+
+SOURCE_ALIASES = {
+    "cloudling-idle-blink-left.svg": "cloudling-idle.svg",
+    "cloudling-idle-blink-right.svg": "cloudling-idle.svg",
+}
 
 
 def find_chromium() -> str:
@@ -80,7 +87,7 @@ def render_sheet(tmp_dir: Path) -> Image.Image:
     height = rows * ASSET_SIZE
     cells = []
     for filename, scale in ASSETS:
-        source = SOURCE_DIR / filename
+        source = SOURCE_DIR / SOURCE_ALIASES.get(filename, filename)
         if not source.exists():
             raise SystemExit(f"missing source SVG: {source}")
         scaled = round(ASSET_SIZE * scale)
@@ -189,6 +196,22 @@ def normalize_frame(image: Image.Image) -> Image.Image:
     return frame
 
 
+def apply_idle_blink(frame: Image.Image, side: str) -> Image.Image:
+    image = frame.copy()
+    pixels = image.load()
+    body_fill = pixels[38, 57] if side == "left" else pixels[73, 57]
+    draw = ImageDraw.Draw(image)
+    if side == "left":
+        cover_box = (30, 41, 48, 65)
+        line = [(32, 53), (36, 55), (43, 53), (47, 50)]
+    else:
+        cover_box = (64, 41, 82, 65)
+        line = [(65, 50), (69, 53), (76, 55), (80, 53)]
+    draw.ellipse(cover_box, fill=body_fill)
+    draw.line(line, fill=(58, 36, 27), width=2, joint="curve")
+    return image
+
+
 def rgb565_words(image: Image.Image) -> list[int]:
     words = []
     for red, green, blue in image.getdata():
@@ -281,6 +304,10 @@ def write_assets(sheet: Image.Image) -> None:
         x = (index % GRID_COLUMNS) * ASSET_SIZE
         y = (index // GRID_COLUMNS) * ASSET_SIZE
         frame = normalize_frame(sheet.crop((x, y, x + ASSET_SIZE, y + ASSET_SIZE)))
+        if filename == "cloudling-idle-blink-left.svg":
+            frame = apply_idle_blink(frame, "left")
+        elif filename == "cloudling-idle-blink-right.svg":
+            frame = apply_idle_blink(frame, "right")
         data = encode_rle(rgb565_words(frame))
         compressed_sizes.append(len(data))
         source_lines.extend(

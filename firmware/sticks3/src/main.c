@@ -764,13 +764,15 @@ typedef struct {
 
 static const vibe_stick_pet_frame_id_t s_pet_idle_frames[] = {
     VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
-    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE_READING,
-    VIBE_STICK_PET_FRAME_CLOUDLING_SWEEPING,
-    VIBE_STICK_PET_FRAME_CLOUDLING_BUILDING,
-    VIBE_STICK_PET_FRAME_CLOUDLING_CARRYING,
-    VIBE_STICK_PET_FRAME_CLOUDLING_CONDUCTING,
-    VIBE_STICK_PET_FRAME_CLOUDLING_JUGGLING,
-    VIBE_STICK_PET_FRAME_CLOUDLING_ATTENTION,
+    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
+    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
+    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
+    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE_BLINK_LEFT,
+    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
+    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE_BLINK_RIGHT,
+    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
+    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
+    VIBE_STICK_PET_FRAME_CLOUDLING_IDLE,
 };
 
 static const vibe_stick_pet_frame_id_t s_pet_running_frames[] = {
@@ -870,7 +872,7 @@ static pet_sequence_t pet_sequence_for_state(const char *status)
     }
     return (pet_sequence_t){s_pet_idle_frames,
                             sizeof(s_pet_idle_frames) / sizeof(s_pet_idle_frames[0]),
-                            1200, 0};
+                            260, 0};
 }
 
 static void update_pet_visual(void)
