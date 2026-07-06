@@ -90,6 +90,19 @@ def test_recording_mode_preference_survives_deep_sleep_restart() -> None:
     assert "vibe_motion_recalibrate()" in source
 
 
+def test_deep_sleep_button_wake_restores_ptt_hold() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert "VIBE_STICK_DEEP_SLEEP_FAST_RESUME_MS 5000" in source
+    assert "s_woke_from_deep_sleep = wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED;" in source
+    assert "capture_deep_sleep_front_button_intent()" in source
+    assert "handle_deep_sleep_front_button_intent()" in source
+    assert "front button held during deep sleep wake; pending PTT restore" in source
+    assert "restoring front long press after deep sleep wake" in source
+    assert "s_wake_front_button_pending = false;" in source
+    assert 'handle_recording_start("button_long_start", "松开发送")' in source
+
+
 def test_wifi_profiles_are_persisted_and_rotated() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 

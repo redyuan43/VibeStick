@@ -70,6 +70,7 @@
 #define VIBE_STICK_IDLE_STATE_POLL_MS 10000
 #define VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS 60
 #define VIBE_STICK_BACKLIGHT_FADE_STEP 5
+#define VIBE_STICK_DEEP_SLEEP_FAST_RESUME_MS 5000
 #define RECORDING_RSSI_UNKNOWN -127
 #define WIFI_PROFILE_NAMESPACE "vibe_wifi"
 #define WIFI_PROFILE_BLOB_KEY "profiles"
@@ -254,6 +255,9 @@ static lv_obj_t *s_battery_cap;
 static lv_obj_t *s_battery_bolt;
 static lv_obj_t *s_mode_label;
 static lv_obj_t *s_pet_image;
+static bool s_woke_from_deep_sleep;
+static bool s_wake_front_button_pending;
+static int64_t s_pet_animation_resume_ms;
 static lv_obj_t *s_recording_overlay;
 static lv_obj_t *s_recording_wave_group;
 static lv_obj_t *s_recording_wave_bars[5];
@@ -390,6 +394,7 @@ static const lv_point_precise_t s_battery_bolt_points[] = {
 static void render_state(void);
 static void copy_json_string(cJSON *root, const char *key, char *target, size_t target_len);
 static void register_activity(void);
+static bool front_button_is_pressed(void);
 static void update_power_saving(int64_t now_ms);
 static void maybe_enter_deep_sleep(int64_t now_ms);
 
@@ -702,6 +707,11 @@ static bool display_should_stay_active(void)
            s_motion_calibrating ||
            ota_in_progress() ||
            recording_finalize_active();
+}
+
+static bool front_button_is_pressed(void)
+{
+    return gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0;
 }
 
 static void register_activity(void)
@@ -1154,6 +1164,9 @@ static void update_pet_visual(void)
     const agent_provider_config_t *provider = current_provider_config();
     const char *status = provider->implemented ? display_state->status : "UNIMPLEMENTED";
     const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (s_woke_from_deep_sleep && now_ms < s_pet_animation_resume_ms) {
+        return;
+    }
 
     pet_sequence_t sequence = pet_sequence_for_state(status);
     bool should_refresh_frame = false;
@@ -2672,6 +2685,7 @@ static void button_up_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
+    s_wake_front_button_pending = false;
     if (s_long_press_active) {
         s_long_press_active = false;
         queue_event(VIBE_STICK_EVENT_LONG_STOP);
@@ -2720,6 +2734,47 @@ static esp_err_t init_button(void)
     return ESP_OK;
 }
 
+static void capture_deep_sleep_front_button_intent(void)
+{
+    if (!s_woke_from_deep_sleep || s_recording_mode != RECORDING_MODE_PUSH_TO_TALK) {
+        return;
+    }
+    if (!front_button_is_pressed()) {
+        return;
+    }
+    s_wake_front_button_pending = true;
+    ESP_LOGI(TAG, "front button held during deep sleep wake; pending PTT restore");
+}
+
+static void handle_deep_sleep_front_button_intent(void)
+{
+    if (!s_wake_front_button_pending) {
+        return;
+    }
+    if (!front_button_is_pressed()) {
+        s_wake_front_button_pending = false;
+        ESP_LOGI(TAG, "pending deep sleep PTT restore cancelled: front button released");
+        return;
+    }
+    if (s_recording_mode != RECORDING_MODE_PUSH_TO_TALK) {
+        s_wake_front_button_pending = false;
+        return;
+    }
+    if (s_long_press_active || s_tap_recording_active ||
+        vibe_audio_is_recording() || s_recording_session_id[0] != '\0') {
+        s_wake_front_button_pending = false;
+        return;
+    }
+    if (!wifi_connected() || recording_network_busy()) {
+        return;
+    }
+    s_wake_front_button_pending = false;
+    s_long_press_active = true;
+    register_activity();
+    ESP_LOGI(TAG, "restoring front long press after deep sleep wake");
+    queue_event(VIBE_STICK_EVENT_LONG_START);
+}
+
 static void app_task(void *arg)
 {
     (void)arg;
@@ -2729,6 +2784,7 @@ static void app_task(void *arg)
         int64_t now_ms = esp_timer_get_time() / 1000;
         update_power_saving(now_ms);
         maybe_enter_deep_sleep(now_ms);
+        handle_deep_sleep_front_button_intent();
         const int state_poll_ms = s_display_power_state != DISPLAY_POWER_ACTIVE ?
             VIBE_STICK_IDLE_STATE_POLL_MS : VIBE_STICK_STATE_POLL_MS;
         const bool network_busy = recording_network_busy();
@@ -2789,7 +2845,9 @@ static void app_task(void *arg)
             }
             break;
         case VIBE_STICK_EVENT_LONG_START:
-            (void)handle_recording_start("button_long_start", "松开发送");
+            if (!handle_recording_start("button_long_start", "松开发送")) {
+                s_long_press_active = false;
+            }
             break;
         case VIBE_STICK_EVENT_LONG_STOP:
             handle_recording_stop("button_long_stop");
@@ -2830,6 +2888,11 @@ void app_main(void)
 {
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
     uint64_t ext1_wake_status = esp_sleep_get_ext1_wakeup_status();
+    s_woke_from_deep_sleep = wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED;
+    if (s_woke_from_deep_sleep) {
+        s_pet_animation_resume_ms = (esp_timer_get_time() / 1000) +
+                                    VIBE_STICK_DEEP_SLEEP_FAST_RESUME_MS;
+    }
     ESP_LOGI(TAG, "boot %s board=%s version=%s build=%s transport=%s",
              FIRMWARE_NAME, VIBE_BOARD_NAME, FIRMWARE_VERSION, FIRMWARE_BUILD_ID, TRANSPORT);
     ESP_LOGI(TAG, "wake cause=%d ext1_status=0x%llx",
@@ -2858,6 +2921,7 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(restore_recording_mode_preference());
     render_state();
     ESP_ERROR_CHECK(init_button());
+    capture_deep_sleep_front_button_intent();
     ESP_ERROR_CHECK(vibe_audio_init());
     ESP_ERROR_CHECK(init_wifi());
     xTaskCreatePinnedToCore(app_task, "agent_app", 6144, NULL, 4, NULL,
