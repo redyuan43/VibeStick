@@ -46,6 +46,15 @@ def test_idle_backlight_has_dim_and_off_states() -> None:
     assert "#define VIBE_BOARD_LCD_BACKLIGHT_IDLE 45" in board_profile
 
 
+def test_usb_power_keeps_display_active() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert "static bool external_powered(void)" in source
+    assert "return s_state.battery_charging || s_state.usb_powered;" in source
+    assert "return external_powered() ||" in source
+    assert "display_should_stay_active() ||" in source
+
+
 def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 

@@ -619,9 +619,15 @@ static void fade_backlight_toward(uint8_t target, int64_t now_ms)
     s_last_backlight_fade_ms = now_ms;
 }
 
+static bool external_powered(void)
+{
+    return s_state.battery_charging || s_state.usb_powered;
+}
+
 static bool display_should_stay_active(void)
 {
-    return s_recording_overlay_visible ||
+    return external_powered() ||
+           s_recording_overlay_visible ||
            vibe_audio_is_recording() ||
            s_recording_session_id[0] != '\0' ||
            s_tap_recording_active ||
