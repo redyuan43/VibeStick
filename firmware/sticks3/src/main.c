@@ -991,7 +991,7 @@ static void create_ui(void)
     lv_obj_align_to(s_battery_cap, s_battery_icon, LV_ALIGN_OUT_RIGHT_MID, 1, 0);
 
     s_mode_label = make_label(screen, "PTT", &lv_font_montserrat_10, lv_color_hex(0x8a9099), 34, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(s_mode_label, LV_ALIGN_TOP_MID, 0, 9);
+    lv_obj_align(s_mode_label, LV_ALIGN_TOP_MID, -2, 9);
 
     s_pet_image = lv_image_create(screen);
     s_pet_pixels = heap_caps_malloc(VIBE_STICK_PET_PIXEL_BYTES, MALLOC_CAP_8BIT);
