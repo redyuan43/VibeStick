@@ -139,6 +139,18 @@ def test_deep_sleep_wake_defers_pet_animation_until_state_restores() -> None:
     assert "VIBE_STICK_DEEP_SLEEP_FAST_RESUME_MS" not in source
 
 
+def test_wifi_start_overlaps_display_setup_during_wake() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    app_main = source.split("void app_main(void)", 1)[1]
+
+    assert "static bool s_ui_ready;" in source
+    assert "if (!s_ui_ready)" in source
+    assert app_main.index("ESP_ERROR_CHECK(init_wifi());") < app_main.index(
+        "ESP_ERROR_CHECK(init_display());"
+    )
+    assert app_main.index("s_ui_ready = true;") < app_main.index("render_state();")
+
+
 def test_wifi_profiles_are_persisted_and_rotated() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 

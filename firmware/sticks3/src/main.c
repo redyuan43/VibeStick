@@ -254,6 +254,7 @@ static lv_obj_t *s_battery_cap;
 static lv_obj_t *s_battery_bolt;
 static lv_obj_t *s_mode_label;
 static lv_obj_t *s_pet_image;
+static bool s_ui_ready;
 static bool s_woke_from_deep_sleep;
 static bool s_wake_front_button_pending;
 static bool s_pet_fast_resume_pending;
@@ -1334,6 +1335,9 @@ static void create_ui(void)
 
 static void render_state(void)
 {
+    if (!s_ui_ready) {
+        return;
+    }
     lvgl_lock();
     const agent_provider_config_t *provider = current_provider_config();
 
@@ -2919,10 +2923,12 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_init_power());
     s_event_queue = xQueueCreate(16, sizeof(agent_event_t));
     s_lvgl_lock = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(init_wifi());
     ESP_ERROR_CHECK(init_display());
     register_activity();
     lvgl_lock();
     create_ui();
+    s_ui_ready = true;
     lvgl_unlock();
     render_state();
     esp_err_t motion_err = vibe_motion_init();
@@ -2934,7 +2940,6 @@ void app_main(void)
     ESP_ERROR_CHECK(init_button());
     capture_deep_sleep_front_button_intent();
     ESP_ERROR_CHECK(vibe_audio_init());
-    ESP_ERROR_CHECK(init_wifi());
     xTaskCreatePinnedToCore(app_task, "agent_app", 6144, NULL, 4, NULL,
                             VIBE_STICK_APP_CORE);
 }
