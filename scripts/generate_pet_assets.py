@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,10 +58,10 @@ ASSETS = [
     ("cloudling-typing.svg", 1.70),
 ]
 
-SOURCE_ALIASES = {
-    "cloudling-idle-blink-left.svg": "cloudling-idle.svg",
-    "cloudling-idle-blink-right.svg": "cloudling-idle.svg",
-    "cloudling-idle-blink-both.svg": "cloudling-idle.svg",
+IDLE_BLINK_VARIANTS = {
+    "cloudling-idle-blink-left.svg": "left",
+    "cloudling-idle-blink-right.svg": "right",
+    "cloudling-idle-blink-both.svg": "both",
 }
 
 
@@ -83,13 +83,68 @@ def data_symbol(filename: str) -> str:
     return "s_pet_frame_" + re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
 
 
+def closed_eye_svg(side: str) -> str:
+    left_eye = (
+        '<path d="M6.45 11.58 C7.10 12.28 8.90 12.28 10.05 11.58" '
+        'fill="none" stroke="#21170f" stroke-width="0.58" '
+        'stroke-linecap="round" stroke-linejoin="round" opacity="0.98"/>'
+    )
+    right_eye = (
+        '<path d="M13.95 11.58 C14.60 12.28 16.40 12.28 17.55 11.58" '
+        'fill="none" stroke="#21170f" stroke-width="0.58" '
+        'stroke-linecap="round" stroke-linejoin="round" opacity="0.98"/>'
+    )
+    open_left = """
+        <ellipse cx="8.25" cy="11.55" rx="1.95" ry="2.55" fill="#21170f" opacity="0.98"/>
+        <circle cx="7.55" cy="10.55" r="0.70" fill="#ffffff" opacity="0.92"/>
+        <circle cx="8.35" cy="12.95" r="0.42" fill="#ffffff" opacity="0.86"/>"""
+    open_right = """
+        <ellipse cx="15.75" cy="11.55" rx="1.95" ry="2.55" fill="#21170f" opacity="0.98"/>
+        <circle cx="15.05" cy="10.55" r="0.70" fill="#ffffff" opacity="0.92"/>
+        <circle cx="15.85" cy="12.95" r="0.42" fill="#ffffff" opacity="0.86"/>"""
+    left = left_eye if side in {"left", "both"} else open_left
+    right = right_eye if side in {"right", "both"} else open_right
+    return f"""
+      <g id="__wowotou-face" pointer-events="none">
+        {left}
+        {right}
+        <ellipse cx="5.80" cy="14.75" rx="1.50" ry="0.70" fill="#ff9fc2" opacity="0.34"/>
+        <ellipse cx="18.20" cy="14.75" rx="1.50" ry="0.70" fill="#ff9fc2" opacity="0.34"/>
+        <path d="M4.55 13.15 L2.85 12.92 M4.55 14.25 L2.72 14.32 M4.66 15.30 L3.05 15.78" stroke="#3a241b" stroke-width="0.32" stroke-linecap="round" opacity="0.82"/>
+        <path d="M19.45 13.15 L21.15 12.92 M19.45 14.25 L21.28 14.32 M19.34 15.30 L20.95 15.78" stroke="#3a241b" stroke-width="0.32" stroke-linecap="round" opacity="0.82"/>
+        <path d="M17.35 15.95 C16.72 15.18 15.55 15.56 15.56 16.55 C15.56 17.48 16.60 18.16 17.35 18.76 C18.10 18.16 19.14 17.48 19.14 16.55 C19.15 15.56 17.98 15.18 17.35 15.95 Z" fill="#ffc1d5" stroke="#3a241b" stroke-width="0.18" opacity="0.95"/>
+        <g filter="url(#drop)">
+          <path d="M17.75 6.05 L18.38 7.35 L19.82 7.55 L18.78 8.55 L19.03 9.98 L17.75 9.30 L16.47 9.98 L16.72 8.55 L15.68 7.55 L17.12 7.35 Z" fill="#ffd86e" stroke="#fff3bd" stroke-width="0.18" stroke-linejoin="round"/>
+        </g>
+      </g>"""
+
+
+def source_for_asset(filename: str, tmp_dir: Path) -> Path:
+    if filename not in IDLE_BLINK_VARIANTS:
+        return SOURCE_DIR / filename
+
+    base = (SOURCE_DIR / "cloudling-idle.svg").read_text(encoding="utf-8")
+    base = base.replace('<g id="eye-group">', '<g id="eye-group" opacity="0">', 1)
+    face = closed_eye_svg(IDLE_BLINK_VARIANTS[filename])
+    base = re.sub(
+        r'\s*<g id="__wowotou-face" pointer-events="none">.*?\n<script type',
+        f"\n{face}\n\n<script type",
+        base,
+        count=1,
+        flags=re.S,
+    )
+    target = tmp_dir / filename
+    target.write_text(base, encoding="utf-8")
+    return target
+
+
 def render_sheet(tmp_dir: Path) -> Image.Image:
     rows = (len(ASSETS) + GRID_COLUMNS - 1) // GRID_COLUMNS
     width = GRID_COLUMNS * ASSET_SIZE
     height = rows * ASSET_SIZE
     cells = []
     for filename, scale in ASSETS:
-        source = SOURCE_DIR / SOURCE_ALIASES.get(filename, filename)
+        source = source_for_asset(filename, tmp_dir)
         if not source.exists():
             raise SystemExit(f"missing source SVG: {source}")
         scaled = round(ASSET_SIZE * scale)
@@ -198,35 +253,6 @@ def normalize_frame(image: Image.Image) -> Image.Image:
     return frame
 
 
-def draw_closed_eye(draw: ImageDraw.ImageDraw, points: list[tuple[int, int]]) -> None:
-    draw.line(points, fill=(33, 23, 15), width=3, joint="curve")
-
-
-def apply_idle_blink(frame: Image.Image, side: str) -> Image.Image:
-    image = frame.copy()
-    pixels = image.load()
-    draw = ImageDraw.Draw(image)
-
-    def close_left_eye() -> None:
-        body_fill = pixels[38, 57]
-        draw.ellipse((29, 37, 49, 61), fill=body_fill)
-        draw_closed_eye(draw, [(31, 49), (35, 52), (42, 52), (47, 49)])
-
-    def close_right_eye() -> None:
-        body_fill = pixels[73, 57]
-        draw.ellipse((63, 37, 83, 61), fill=body_fill)
-        draw_closed_eye(draw, [(65, 49), (70, 52), (77, 52), (81, 49)])
-
-    if side == "both":
-        close_left_eye()
-        close_right_eye()
-    elif side == "right":
-        close_right_eye()
-    else:
-        close_left_eye()
-    return image
-
-
 def rgb565_words(image: Image.Image) -> list[int]:
     words = []
     for red, green, blue in image.getdata():
@@ -319,12 +345,6 @@ def write_assets(sheet: Image.Image) -> None:
         x = (index % GRID_COLUMNS) * ASSET_SIZE
         y = (index // GRID_COLUMNS) * ASSET_SIZE
         frame = normalize_frame(sheet.crop((x, y, x + ASSET_SIZE, y + ASSET_SIZE)))
-        if filename == "cloudling-idle-blink-left.svg":
-            frame = apply_idle_blink(frame, "left")
-        elif filename == "cloudling-idle-blink-right.svg":
-            frame = apply_idle_blink(frame, "right")
-        elif filename == "cloudling-idle-blink-both.svg":
-            frame = apply_idle_blink(frame, "both")
         data = encode_rle(rgb565_words(frame))
         compressed_sizes.append(len(data))
         source_lines.extend(
