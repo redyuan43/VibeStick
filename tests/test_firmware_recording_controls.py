@@ -56,6 +56,20 @@ def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
     assert "queue_event(VIBE_STICK_EVENT_MOTION_START)" in source
 
 
+def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
+
+    assert "VIBE_STICK_DEEP_SLEEP_MS VIBE_STICK_IDLE_OFF_MS" in source
+    assert "maybe_enter_deep_sleep(now_ms)" in source
+    assert "esp_deep_sleep_start()" in source
+    assert "esp_sleep_enable_ext0_wakeup(ext0_gpio, 0)" in source
+    assert "esp_sleep_enable_ext1_wakeup_io(wake_mask" in source
+    assert "vibe_motion_prepare_deep_sleep_wake()" in source
+    assert "#define VIBE_BOARD_PIN_IMU_INT GPIO_NUM_35" in board_profile
+    assert "#define VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE 0" in board_profile
+
+
 def test_wifi_profiles_are_persisted_and_rotated() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 

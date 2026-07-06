@@ -25,6 +25,12 @@
 #define MPU6886_CONFIG 0x1a
 #define MPU6886_ACCEL_CONFIG 0x1c
 #define MPU6886_ACCEL_CONFIG2 0x1d
+#define MPU6886_ACCEL_WOM_X_THR 0x20
+#define MPU6886_ACCEL_WOM_Y_THR 0x21
+#define MPU6886_ACCEL_WOM_Z_THR 0x22
+#define MPU6886_INT_PIN_CFG 0x37
+#define MPU6886_INT_ENABLE 0x38
+#define MPU6886_ACCEL_INTEL_CTRL 0x69
 #define MPU6886_ACCEL_XOUT_H 0x3b
 
 #define BMI270_ADDR 0x68
@@ -68,6 +74,9 @@
 #define MOTION_CALIBRATION_GYRO_DPS 120.0f
 #define MPU6886_ACCEL_SCALE_G 8192.0f
 #define MPU6886_GYRO_SCALE_DPS 65.5f
+#define MPU6886_WAKE_ACCEL_RANGE_16G 0x18
+#define MPU6886_WAKE_THRESHOLD_LSB 10
+#define MPU6886_WAKE_SAMPLE_DIV 19
 #define BMI270_ACCEL_SCALE_G (32768.0f / 2.0f)
 #define BMI270_GYRO_SCALE_DPS (32768.0f / 2000.0f)
 
@@ -380,6 +389,42 @@ esp_err_t vibe_motion_init(void)
 bool vibe_motion_available(void)
 {
     return s_available;
+}
+
+esp_err_t vibe_motion_prepare_deep_sleep_wake(void)
+{
+#if VIBE_BOARD_HAS_MPU6886 && VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    ESP_RETURN_ON_FALSE(s_available && s_motion_chip == MOTION_CHIP_MPU6886,
+                        ESP_ERR_INVALID_STATE, TAG, "mpu6886 unavailable");
+
+    uint8_t reg = MPU6886_WAKE_ACCEL_RANGE_16G;
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_CONFIG, reg), TAG, "mpu6886 wake accel range");
+
+    ESP_RETURN_ON_ERROR(read_regs(MPU6886_PWR_MGMT_1, &reg, 1), TAG, "read mpu6886 pwr1");
+    reg &= 0x8f;
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_1, reg), TAG, "mpu6886 wake pwr1");
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_2, 0x07), TAG, "mpu6886 accel-only wake");
+
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_CONFIG2, 0x21), TAG, "mpu6886 wake dlpf");
+
+    ESP_RETURN_ON_ERROR(read_regs(MPU6886_INT_PIN_CFG, &reg, 1), TAG, "read mpu6886 int pin");
+    reg = (reg | 0x80) & (uint8_t)~0x20;
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_INT_PIN_CFG, reg), TAG, "mpu6886 active-low int");
+
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_INT_ENABLE, 0xe0), TAG, "mpu6886 wake int enable");
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_WOM_X_THR, MPU6886_WAKE_THRESHOLD_LSB), TAG, "mpu6886 wom x");
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_WOM_Y_THR, MPU6886_WAKE_THRESHOLD_LSB), TAG, "mpu6886 wom y");
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_WOM_Z_THR, MPU6886_WAKE_THRESHOLD_LSB), TAG, "mpu6886 wom z");
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_INTEL_CTRL, 0xc2), TAG, "mpu6886 accel intel");
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_SMPLRT_DIV, MPU6886_WAKE_SAMPLE_DIV), TAG, "mpu6886 wake sample");
+
+    ESP_RETURN_ON_ERROR(read_regs(MPU6886_PWR_MGMT_1, &reg, 1), TAG, "read mpu6886 pwr1 cycle");
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_1, reg | 0x20), TAG, "mpu6886 wake cycle");
+    ESP_LOGI(TAG, "MPU6886 wake-on-motion prepared");
+    return ESP_OK;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }
 
 esp_err_t vibe_motion_recalibrate(void)

@@ -28,6 +28,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -65,6 +66,7 @@
 #define VIBE_STICK_NETWORK_CORE 1
 #define VIBE_STICK_IDLE_DIM_MS 30000
 #define VIBE_STICK_IDLE_OFF_MS 60000
+#define VIBE_STICK_DEEP_SLEEP_MS VIBE_STICK_IDLE_OFF_MS
 #define VIBE_STICK_IDLE_STATE_POLL_MS 10000
 #define VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS 60
 #define VIBE_STICK_BACKLIGHT_FADE_STEP 5
@@ -387,6 +389,7 @@ static void render_state(void);
 static void copy_json_string(cJSON *root, const char *key, char *target, size_t target_len);
 static void register_activity(void);
 static void update_power_saving(int64_t now_ms);
+static void maybe_enter_deep_sleep(int64_t now_ms);
 
 static bool queue_event(agent_event_type_t type)
 {
@@ -683,6 +686,90 @@ static void request_motion_recording_start(void)
         s_motion_start_pending = true;
         s_motion_lift_armed = false;
     }
+}
+
+static void configure_sleep_wake_gpio(gpio_num_t gpio)
+{
+    if (gpio == GPIO_NUM_NC) {
+        return;
+    }
+    gpio_config_t config = {
+        .pin_bit_mask = 1ULL << gpio,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&config));
+}
+
+static uint64_t sleep_button_wake_mask(void)
+{
+    return (1ULL << VIBE_BOARD_PIN_BUTTON_FRONT) |
+           (1ULL << VIBE_BOARD_PIN_BUTTON_SIDE);
+}
+
+static bool prepare_imu_deep_sleep_wake(uint64_t *wake_mask)
+{
+    if (s_recording_mode != RECORDING_MODE_LIFT_TO_TALK) {
+        return true;
+    }
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    esp_err_t err = vibe_motion_prepare_deep_sleep_wake();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: IMU wake prep failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    configure_sleep_wake_gpio(VIBE_BOARD_PIN_IMU_INT);
+    *wake_mask |= 1ULL << VIBE_BOARD_PIN_IMU_INT;
+    return true;
+#else
+    ESP_LOGI(TAG, "deep sleep skipped: %s lift mode has no verified IMU wake path",
+             VIBE_BOARD_NAME);
+    return false;
+#endif
+}
+
+static void enter_deep_sleep(void)
+{
+    uint64_t wake_mask = sleep_button_wake_mask();
+    configure_sleep_wake_gpio(VIBE_BOARD_PIN_BUTTON_FRONT);
+    configure_sleep_wake_gpio(VIBE_BOARD_PIN_BUTTON_SIDE);
+
+    if (!prepare_imu_deep_sleep_wake(&wake_mask)) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "entering deep sleep board=%s mode=%s wake_mask=0x%llx",
+             VIBE_BOARD_NAME, recording_mode_label(), (unsigned long long)wake_mask);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_stop());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;
+    if (s_recording_mode == RECORDING_MODE_LIFT_TO_TALK && VIBE_BOARD_PIN_IMU_INT != GPIO_NUM_NC) {
+        ext0_gpio = VIBE_BOARD_PIN_IMU_INT;
+    }
+    configure_sleep_wake_gpio(ext0_gpio);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_ext0_wakeup(ext0_gpio, 0));
+#else
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_ext1_wakeup_io(wake_mask,
+                                                                  ESP_EXT1_WAKEUP_ANY_LOW));
+#endif
+    vTaskDelay(pdMS_TO_TICKS(50));
+    esp_deep_sleep_start();
+}
+
+static void maybe_enter_deep_sleep(int64_t now_ms)
+{
+    if (s_last_activity_ms == 0 ||
+        display_should_stay_active() ||
+        s_current_backlight != LCD_BACKLIGHT_OFF) {
+        return;
+    }
+    if ((now_ms - s_last_activity_ms) < VIBE_STICK_DEEP_SLEEP_MS) {
+        return;
+    }
+    enter_deep_sleep();
 }
 
 static void init_backlight(void)
@@ -2568,6 +2655,7 @@ static void app_task(void *arg)
     while (true) {
         int64_t now_ms = esp_timer_get_time() / 1000;
         update_power_saving(now_ms);
+        maybe_enter_deep_sleep(now_ms);
         const int state_poll_ms = s_display_power_state != DISPLAY_POWER_ACTIVE ?
             VIBE_STICK_IDLE_STATE_POLL_MS : VIBE_STICK_STATE_POLL_MS;
         const bool network_busy = recording_network_busy();
@@ -2667,8 +2755,12 @@ static void app_task(void *arg)
 
 void app_main(void)
 {
+    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    uint64_t ext1_wake_status = esp_sleep_get_ext1_wakeup_status();
     ESP_LOGI(TAG, "boot %s board=%s version=%s build=%s transport=%s",
              FIRMWARE_NAME, VIBE_BOARD_NAME, FIRMWARE_VERSION, FIRMWARE_BUILD_ID, TRANSPORT);
+    ESP_LOGI(TAG, "wake cause=%d ext1_status=0x%llx",
+             wake_cause, (unsigned long long)ext1_wake_status);
     esp_err_t nvs = nvs_flash_init();
     if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
