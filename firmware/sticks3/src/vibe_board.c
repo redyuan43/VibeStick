@@ -63,6 +63,7 @@ static i2c_master_dev_handle_t s_pmic_dev;
 #define AXP192_REG_LDO23_VOLT 0x28
 #define AXP192_REG_VBUS_VOLTAGE 0x5a
 #define AXP192_REG_BAT_VOLTAGE 0x78
+#define AXP192_OUTPUT_CTRL_LDO2 BIT(2)
 
 #endif
 
@@ -364,11 +365,12 @@ esp_err_t vibe_board_speaker_set_enabled(bool enabled)
 esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
 {
     ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    if (brightness == 0) {
+        return update_reg(AXP192_REG_OUTPUT_CTRL, AXP192_OUTPUT_CTRL_LDO2, 0);
+    }
+
     uint8_t reg = 0;
     ESP_RETURN_ON_ERROR(read_reg(AXP192_REG_LDO23_VOLT, &reg), TAG, "read ldo23");
-    if (brightness == 0) {
-        return write_reg(AXP192_REG_LDO23_VOLT, reg & 0x0f);
-    }
     int percent = (brightness * 100) / 255;
     int voltage_mv = 2500 + ((3200 - 2500) * percent) / 100;
     int encoded = (voltage_mv - 1800) / 100;
@@ -377,7 +379,10 @@ esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
     } else if (encoded > 0x0f) {
         encoded = 0x0f;
     }
-    return write_reg(AXP192_REG_LDO23_VOLT, (reg & 0x0f) | ((uint8_t)encoded << 4));
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_LDO23_VOLT,
+                                  (reg & 0x0f) | ((uint8_t)encoded << 4)),
+                        TAG, "write ldo23");
+    return update_reg(AXP192_REG_OUTPUT_CTRL, 0, AXP192_OUTPUT_CTRL_LDO2);
 }
 
 #endif

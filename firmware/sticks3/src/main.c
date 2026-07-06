@@ -66,6 +66,8 @@
 #define VIBE_STICK_IDLE_DIM_MS 30000
 #define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_IDLE_STATE_POLL_MS 10000
+#define VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS 60
+#define VIBE_STICK_BACKLIGHT_FADE_STEP 5
 #define RECORDING_RSSI_UNKNOWN -127
 #define WIFI_PROFILE_NAMESPACE "vibe_wifi"
 #define WIFI_PROFILE_BLOB_KEY "profiles"
@@ -227,6 +229,7 @@ static TaskHandle_t s_ota_task;
 static atomic_bool s_ota_in_progress;
 static int64_t s_last_ota_check_ms;
 static int64_t s_last_activity_ms;
+static int64_t s_last_backlight_fade_ms;
 static uint8_t s_current_backlight = LCD_BACKLIGHT_DEFAULT;
 static display_power_state_t s_display_power_state = DISPLAY_POWER_ACTIVE;
 static recording_upload_stats_t s_recording_upload_stats;
@@ -588,15 +591,31 @@ static void set_backlight(uint8_t brightness)
     s_current_backlight = brightness;
 }
 
-static bool external_powered(void)
+static void fade_backlight_toward(uint8_t target, int64_t now_ms)
 {
-    return s_state.battery_charging || s_state.usb_powered;
+    if (target == s_current_backlight) {
+        return;
+    }
+    if (target > s_current_backlight) {
+        set_backlight(target);
+        s_last_backlight_fade_ms = now_ms;
+        return;
+    }
+    if (now_ms - s_last_backlight_fade_ms < VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS) {
+        return;
+    }
+
+    int next = (int)s_current_backlight - VIBE_STICK_BACKLIGHT_FADE_STEP;
+    if (next < target) {
+        next = target;
+    }
+    set_backlight((uint8_t)next);
+    s_last_backlight_fade_ms = now_ms;
 }
 
 static bool display_should_stay_active(void)
 {
-    return external_powered() ||
-           s_recording_overlay_visible ||
+    return s_recording_overlay_visible ||
            vibe_audio_is_recording() ||
            s_recording_session_id[0] != '\0' ||
            s_tap_recording_active ||
@@ -634,7 +653,7 @@ static void update_power_saving(int64_t now_ms)
         }
     }
     if (target != s_current_backlight) {
-        set_backlight(target);
+        fade_backlight_toward(target, now_ms);
     }
     s_display_power_state = next_state;
 }

@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_C = ROOT / "firmware" / "sticks3" / "src" / "main.c"
+BOARD_PROFILE_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board_profile.h"
 
 
 def test_front_single_click_toggles_device_recording() -> None:
@@ -18,7 +19,7 @@ def test_front_single_click_toggles_device_recording() -> None:
 def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 
-    assert "start_recording_upload_task();" in source
+    assert "start_recording_upload_task()" in source
     assert "upload_recording_chunk(buffer, audio_len)" in source
     assert "VIBE_STICK_RECORDING_AUDIO_PATH" in source
 
@@ -34,9 +35,12 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
 
 def test_idle_backlight_has_dim_and_off_states() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
 
     assert "VIBE_STICK_IDLE_DIM_MS 30000" in source
     assert "VIBE_STICK_IDLE_OFF_MS 60000" in source
+    assert "VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS" in source
+    assert "fade_backlight_toward(target, now_ms)" in source
     assert "DISPLAY_POWER_DIMMED" in source
     assert "DISPLAY_POWER_OFF" in source
 
