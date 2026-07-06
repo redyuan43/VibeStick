@@ -79,6 +79,17 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     assert "#define VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE 0" in board_profile
 
 
+def test_recording_mode_preference_survives_deep_sleep_restart() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert 'DEVICE_PREF_NAMESPACE "vibe_prefs"' in source
+    assert 'DEVICE_PREF_RECORDING_MODE_KEY "rec_mode"' in source
+    assert "save_recording_mode_preference(s_recording_mode)" in source
+    assert "restore_recording_mode_preference()" in source
+    assert "nvs_get_u8(handle, DEVICE_PREF_RECORDING_MODE_KEY" in source
+    assert "vibe_motion_recalibrate()" in source
+
+
 def test_wifi_profiles_are_persisted_and_rotated() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 

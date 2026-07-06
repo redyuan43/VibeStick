@@ -79,6 +79,8 @@
 #define WIFI_PROFILE_SSID_LEN 33
 #define WIFI_PROFILE_PASSWORD_LEN 65
 #define WIFI_PROFILE_RETRY_LIMIT 2
+#define DEVICE_PREF_NAMESPACE "vibe_prefs"
+#define DEVICE_PREF_RECORDING_MODE_KEY "rec_mode"
 
 static const char *TAG = "vibe_stick";
 
@@ -494,6 +496,73 @@ static const char *recording_mode_label(void)
     return s_recording_mode == RECORDING_MODE_LIFT_TO_TALK ? "LIFT" : "PTT";
 }
 
+static void reset_recording_mode_runtime_state(void)
+{
+    s_motion_recording_active = false;
+    s_motion_calibrating = false;
+    s_motion_lift_armed = false;
+    s_motion_start_pending = false;
+}
+
+static esp_err_t save_recording_mode_preference(recording_mode_t mode)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DEVICE_PREF_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "open device preference NVS for write");
+    err = nvs_set_u8(handle, DEVICE_PREF_RECORDING_MODE_KEY, (uint8_t)mode);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "write recording mode preference");
+    ESP_LOGI(TAG, "saved recording mode preference=%s", recording_mode_label());
+    return ESP_OK;
+}
+
+static esp_err_t restore_recording_mode_preference(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DEVICE_PREF_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "open device preference NVS");
+
+    uint8_t stored_mode = 0;
+    err = nvs_get_u8(handle, DEVICE_PREF_RECORDING_MODE_KEY, &stored_mode);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "read recording mode preference");
+
+    if (stored_mode == (uint8_t)RECORDING_MODE_LIFT_TO_TALK) {
+        if (!vibe_motion_available()) {
+            ESP_LOGW(TAG, "stored lift recording mode ignored: IMU is not ready");
+            s_recording_mode = RECORDING_MODE_PUSH_TO_TALK;
+            reset_recording_mode_runtime_state();
+            return ESP_OK;
+        }
+        err = vibe_motion_recalibrate();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "stored lift recording mode calibration failed: %s",
+                     esp_err_to_name(err));
+            s_recording_mode = RECORDING_MODE_PUSH_TO_TALK;
+            reset_recording_mode_runtime_state();
+            return ESP_OK;
+        }
+        s_recording_mode = RECORDING_MODE_LIFT_TO_TALK;
+        s_motion_calibrating = true;
+        s_motion_lift_armed = false;
+        s_motion_start_pending = false;
+    } else {
+        s_recording_mode = RECORDING_MODE_PUSH_TO_TALK;
+        reset_recording_mode_runtime_state();
+    }
+    ESP_LOGI(TAG, "restored recording mode preference=%s", recording_mode_label());
+    return ESP_OK;
+}
+
 static void toggle_recording_mode(void)
 {
     register_activity();
@@ -517,12 +586,10 @@ static void toggle_recording_mode(void)
         s_motion_start_pending = false;
     } else {
         s_recording_mode = RECORDING_MODE_PUSH_TO_TALK;
-        s_motion_recording_active = false;
-        s_motion_calibrating = false;
-        s_motion_lift_armed = false;
-        s_motion_start_pending = false;
+        reset_recording_mode_runtime_state();
     }
     ESP_LOGI(TAG, "recording mode switched to %s", recording_mode_label());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(save_recording_mode_preference(s_recording_mode));
     esp_err_t sound_err = vibe_audio_play_sound(VIBE_STICK_SOUND_APPROVAL);
     if (sound_err != ESP_OK) {
         ESP_LOGW(TAG, "recording mode switch sound skipped: %s", esp_err_to_name(sound_err));
@@ -2788,6 +2855,8 @@ void app_main(void)
     if (motion_err != ESP_OK && motion_err != ESP_ERR_NOT_SUPPORTED) {
         ESP_LOGW(TAG, "motion init failed: %s", esp_err_to_name(motion_err));
     }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(restore_recording_mode_preference());
+    render_state();
     ESP_ERROR_CHECK(init_button());
     ESP_ERROR_CHECK(vibe_audio_init());
     ESP_ERROR_CHECK(init_wifi());
