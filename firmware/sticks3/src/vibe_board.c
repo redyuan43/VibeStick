@@ -124,6 +124,38 @@ static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, ui
 
 static int voltage_to_percent(int voltage_mv)
 {
+#if defined(VIBE_BOARD_STICKC_PLUS)
+    static const struct {
+        int voltage_mv;
+        int percent;
+    } curve[] = {
+        {3350, 0},
+        {3450, 5},
+        {3600, 15},
+        {3700, 30},
+        {3800, 50},
+        {3900, 70},
+        {4000, 85},
+        {4100, 100},
+    };
+
+    if (voltage_mv <= curve[0].voltage_mv) {
+        return curve[0].percent;
+    }
+    const size_t last = sizeof(curve) / sizeof(curve[0]) - 1;
+    if (voltage_mv >= curve[last].voltage_mv) {
+        return curve[last].percent;
+    }
+    for (size_t i = 1; i <= last; i++) {
+        if (voltage_mv <= curve[i].voltage_mv) {
+            const int mv_span = curve[i].voltage_mv - curve[i - 1].voltage_mv;
+            const int pct_span = curve[i].percent - curve[i - 1].percent;
+            return curve[i - 1].percent +
+                   ((voltage_mv - curve[i - 1].voltage_mv) * pct_span + mv_span / 2) / mv_span;
+        }
+    }
+    return curve[last].percent;
+#else
     int level = (voltage_mv - 3300) * 100 / (4150 - 3350);
     if (level < 0) {
         return 0;
@@ -132,6 +164,7 @@ static int voltage_to_percent(int voltage_mv)
         return 100;
     }
     return level;
+#endif
 }
 
 #if VIBE_BOARD_HAS_ES8311
@@ -307,7 +340,8 @@ esp_err_t vibe_board_init_power(void)
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_LDO23_VOLT, 0xcc));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_ADC_ENABLE1, 0xff));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_CHARGE_CTRL1, 0xc0));
+    // Official M5StickC Plus 1.1 default: 4.2V charge voltage, 100mA charge current.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_CHARGE_CTRL1, VIBE_BOARD_AXP192_CHARGE_CTRL1));
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(AXP192_REG_OUTPUT_CTRL, BIT(4), 0x4d));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_PEK, 0x0c));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_GPIO0_LDO_VOLT, 0xf0));
@@ -316,7 +350,9 @@ esp_err_t vibe_board_init_power(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_TEMP_PROTECT, 0xfc));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(AXP192_REG_BACKUP_CHARGE_CTRL, 0xa2));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(0x32, 0x46));
-    ESP_LOGI(TAG, "AXP192 power initialized");
+    ESP_LOGI(TAG, "AXP192 power initialized model=%s battery=%dmAh charge=%dmA",
+             VIBE_BOARD_MODEL_NAME, VIBE_BOARD_BATTERY_CAPACITY_MAH,
+             VIBE_BOARD_AXP192_CHARGE_CURRENT_MA);
     return ESP_OK;
 }
 
@@ -374,10 +410,10 @@ esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
     int percent = (brightness * 100) / 255;
     int voltage_mv = 2500 + ((3200 - 2500) * percent) / 100;
     int encoded = (voltage_mv - 1800) / 100;
-    if (encoded < 0) {
-        encoded = 0;
-    } else if (encoded > 0x0f) {
-        encoded = 0x0f;
+    if (encoded < VIBE_BOARD_AXP192_BRIGHTNESS_MIN) {
+        encoded = VIBE_BOARD_AXP192_BRIGHTNESS_MIN;
+    } else if (encoded > VIBE_BOARD_AXP192_BRIGHTNESS_MAX) {
+        encoded = VIBE_BOARD_AXP192_BRIGHTNESS_MAX;
     }
     ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_LDO23_VOLT,
                                   (reg & 0x0f) | ((uint8_t)encoded << 4)),
