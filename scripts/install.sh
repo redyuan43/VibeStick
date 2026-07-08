@@ -94,6 +94,9 @@ mkdir -p "$LAUNCH_AGENTS_DIR"
 rm -rf "$RUNTIME_DIR"
 mkdir -p "$RUNTIME_DIR"
 cp -R "$ROOT_DIR/bridge" "$RUNTIME_DIR/bridge"
+python3 -m venv "$RUNTIME_DIR/venv"
+"$RUNTIME_DIR/venv/bin/python" -m pip install --upgrade pip
+"$RUNTIME_DIR/venv/bin/python" -m pip install "$RUNTIME_DIR/bridge"
 if [ -f "$ENV_PATH" ]; then
   cp "$ENV_PATH" "$CONFIG_DIR/.env"
 fi
@@ -107,7 +110,7 @@ if [ -f "$CONFIG_DIR/.env" ]; then
   . "$CONFIG_DIR/.env"
   set +a
 fi
-PYTHONPATH="$RUNTIME_DIR/bridge/src" exec python3 -m vibe_stick --host 0.0.0.0 --port 8765
+exec "$RUNTIME_DIR/venv/bin/python" -m vibe_stick --host 0.0.0.0 --port 8765
 RUNNER
 chmod +x "$RUNNER_PATH"
 

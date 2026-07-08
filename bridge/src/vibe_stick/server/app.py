@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import html
 import hmac
 import ipaddress
 import json
 import os
 import shutil
+import socket
 import threading
 import time
 from http import HTTPStatus
@@ -13,6 +15,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+try:
+    from zeroconf import IPVersion, ServiceInfo, Zeroconf
+except ImportError:  # pragma: no cover - optional at runtime for editable installs
+    IPVersion = None
+    ServiceInfo = None
+    Zeroconf = None
 
 from vibe_stick import __version__ as BRIDGE_VERSION
 from vibe_stick.audio.recorder import RecordingController
@@ -39,6 +48,9 @@ from vibe_stick.providers.codex import observe_codex
 
 MANUAL_STATUS_SECONDS = 60
 BRIDGE_NAME = "vibestick-bridge"
+MDNS_HOSTNAME = "vibestick.local."
+MDNS_SERVICE_NAME = "VibeStick Bridge._vibestick._tcp.local."
+MDNS_SERVICE_TYPE = "_vibestick._tcp.local."
 DEFAULT_MAX_RECORDING_AUDIO_BYTES = 2_000_000
 DEFAULT_CLAUDE_USAGE_INTERVAL_SECONDS = 300
 MIN_CLAUDE_USAGE_INTERVAL_SECONDS = 30
@@ -70,7 +82,50 @@ class BridgeStateStore:
         self._state.codex.quota_updated_at = quota.quota_updated_at
         self._state.codex.quota_stale = quota.quota_stale
         self.recording = RecordingController(RECORDING_PATH)
+        self._devices: dict[str, dict[str, Any]] = {}
         hide_hud()
+
+    def register_device_request(
+        self,
+        *,
+        client_ip: str,
+        path: str,
+        headers: Any,
+        authorized: bool,
+    ) -> None:
+        firmware = str(headers.get("X-Vibe-Stick-Firmware-Name") or "")
+        device_id = str(headers.get("X-Vibe-Stick-Device-Id") or "").strip()
+        if not firmware and not device_id:
+            return
+        now = time.time()
+        key = device_id or client_ip
+        with self._lock:
+            previous = self._devices.get(key, {})
+            self._devices[key] = {
+                "device_id": key,
+                "client_ip": client_ip,
+                "path": path,
+                "authorized": authorized,
+                "last_seen": now,
+                "last_seen_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+                "firmware_name": firmware,
+                "firmware_version": str(headers.get("X-Vibe-Stick-Firmware-Version") or ""),
+                "transport": str(headers.get("X-Vibe-Stick-Firmware-Transport") or ""),
+                "build_date": str(headers.get("X-Vibe-Stick-Firmware-Build-Date") or ""),
+                "board": str(headers.get("X-Vibe-Stick-Board") or ""),
+                "device_ip": str(headers.get("X-Vibe-Stick-Device-Ip") or client_ip),
+                "wifi_ssid": str(headers.get("X-Vibe-Stick-Wifi-Ssid") or ""),
+                "wifi_bssid": str(headers.get("X-Vibe-Stick-Wifi-Bssid") or ""),
+                "wifi_rssi": _int_header(headers.get("X-Vibe-Stick-Wifi-Rssi"), previous.get("wifi_rssi", 0)),
+            }
+
+    def devices(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return sorted(
+                (dict(device) for device in self._devices.values()),
+                key=lambda device: float(device.get("last_seen") or 0),
+                reverse=True,
+            )
 
     def get_state(self) -> VibeStickState:
         with self._lock:
@@ -295,7 +350,14 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path in _protected_get_paths() and not self._is_authorized():
+            authorized = self._is_authorized()
+            store.register_device_request(
+                client_ip=self.client_address[0],
+                path=parsed.path,
+                headers=self.headers,
+                authorized=authorized,
+            )
+            if parsed.path in _protected_get_paths() and not authorized:
                 self._send_error(HTTPStatus.UNAUTHORIZED, "Unauthorized")
                 return
 
@@ -309,6 +371,10 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                         "bridge_version": BRIDGE_VERSION,
                     }
                 )
+            elif parsed.path == "/devices":
+                self._send_json({"devices": store.devices()})
+            elif parsed.path in {"/", "/dashboard"}:
+                self._send_html(_dashboard_html(store, self.server.server_address))
             elif parsed.path == "/ota/manifest":
                 board = _first(parse_qs(parsed.query), "board")
                 self._send_json(_ota_manifest_payload(store._project_root, board))
@@ -324,7 +390,14 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path in _protected_paths() and not self._is_authorized():
+            authorized = self._is_authorized()
+            store.register_device_request(
+                client_ip=self.client_address[0],
+                path=parsed.path,
+                headers=self.headers,
+                authorized=authorized,
+            )
+            if parsed.path in _protected_paths() and not authorized:
                 self._send_error(HTTPStatus.UNAUTHORIZED, "Unauthorized")
                 return
 
@@ -413,6 +486,15 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_html(self, body: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+            data = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1")
+            self.end_headers()
+            self.wfile.write(data)
+
         def _send_error(self, status: HTTPStatus, message: str) -> None:
             self._send_json({"error": message}, status=status)
 
@@ -437,13 +519,19 @@ def run_server(host: str, port: int) -> None:
     _enforce_bind_security(host)
     store = BridgeStateStore()
     server = ThreadingHTTPServer((host, port), make_handler(store))
+    mdns = _start_mdns_advertisement(host, port)
     if not _bridge_token():
         print(
             "WARNING: VIBE_STICK_BRIDGE_TOKEN is not set; POST endpoints are unauthenticated on loopback only.",
             flush=True,
         )
     print(f"VibeStick Bridge listening on http://{host}:{port}", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        if mdns is not None:
+            mdns.unregister_all_services()
+            mdns.close()
 
 
 def _protected_paths() -> set[str]:
@@ -461,6 +549,66 @@ def _protected_get_paths() -> set[str]:
         "/ota/manifest",
         "/ota/bin",
     }
+
+
+def _start_mdns_advertisement(host: str, port: int) -> Any | None:
+    if Zeroconf is None or ServiceInfo is None:
+        print("WARNING: zeroconf is not installed; mDNS discovery is disabled.", flush=True)
+        return None
+    addresses = _advertised_addresses(host)
+    if not addresses:
+        print("WARNING: no LAN address available for mDNS discovery.", flush=True)
+        return None
+    info = ServiceInfo(
+        MDNS_SERVICE_TYPE,
+        MDNS_SERVICE_NAME,
+        addresses=[socket.inet_aton(address) for address in addresses],
+        port=port,
+        properties={
+            "bridge_name": BRIDGE_NAME,
+            "bridge_version": BRIDGE_VERSION,
+            "token_required": "1" if _bridge_token() else "0",
+        },
+        server=MDNS_HOSTNAME,
+    )
+    zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
+    zeroconf.register_service(info)
+    print(
+        "VibeStick Bridge mDNS advertised as "
+        f"{MDNS_HOSTNAME.rstrip('.')} -> {', '.join(addresses)}:{port}",
+        flush=True,
+    )
+    return zeroconf
+
+
+def _advertised_addresses(host: str) -> list[str]:
+    normalized = host.strip()
+    if normalized and normalized not in {"0.0.0.0", "::"}:
+        try:
+            address = ipaddress.ip_address(normalized.strip("[]"))
+        except ValueError:
+            return []
+        return [str(address)] if isinstance(address, ipaddress.IPv4Address) and not address.is_loopback else []
+
+    addresses: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = info[4][0]
+            ip = ipaddress.ip_address(address)
+            if not ip.is_loopback:
+                addresses.add(address)
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            address = sock.getsockname()[0]
+            ip = ipaddress.ip_address(address)
+            if not ip.is_loopback:
+                addresses.add(address)
+    except OSError:
+        pass
+    return sorted(addresses)
 
 
 def _bridge_token() -> str:
@@ -606,6 +754,73 @@ def _with_bridge_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     payload["bridge_name"] = BRIDGE_NAME
     payload["bridge_version"] = BRIDGE_VERSION
     return payload
+
+
+def _dashboard_html(store: BridgeStateStore, server_address: tuple[Any, ...]) -> str:
+    host, port = server_address[:2]
+    devices = store.devices()
+    rows = "\n".join(_device_row(device) for device in devices)
+    if not rows:
+        rows = "<tr><td colspan=\"8\" class=\"empty\">No VibeStick devices seen yet.</td></tr>"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VibeStick Bridge</title>
+<style>
+body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111827; color: #f9fafb; }}
+main {{ max-width: 1120px; margin: 0 auto; padding: 28px 20px; }}
+h1 {{ margin: 0 0 8px; font-size: 28px; font-weight: 700; }}
+.meta {{ color: #9ca3af; margin-bottom: 24px; }}
+table {{ width: 100%; border-collapse: collapse; background: #1f2937; border: 1px solid #374151; }}
+th, td {{ padding: 10px 12px; border-bottom: 1px solid #374151; text-align: left; font-size: 14px; }}
+th {{ color: #d1d5db; background: #111827; font-weight: 600; }}
+.empty {{ color: #9ca3af; text-align: center; padding: 24px; }}
+.muted {{ color: #9ca3af; }}
+.ok {{ color: #86efac; }}
+.bad {{ color: #fca5a5; }}
+</style>
+</head>
+<body>
+<main>
+<h1>VibeStick Bridge</h1>
+<div class="meta">Listening on {html.escape(str(host))}:{int(port)} &middot; mDNS: {MDNS_HOSTNAME.rstrip(".")}</div>
+<table>
+<thead>
+<tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Last Path</th></tr>
+</thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</main>
+</body>
+</html>
+"""
+
+
+def _device_row(device: dict[str, Any]) -> str:
+    rssi = int(device.get("wifi_rssi") or 0)
+    rssi_class = "ok" if rssi >= -67 else "bad" if rssi < -75 else "muted"
+    firmware = " ".join(
+        part for part in [
+            str(device.get("firmware_name") or ""),
+            str(device.get("firmware_version") or ""),
+        ] if part
+    )
+    return (
+        "<tr>"
+        f"<td>{html.escape(str(device.get('device_id') or ''))}</td>"
+        f"<td>{html.escape(str(device.get('device_ip') or device.get('client_ip') or ''))}</td>"
+        f"<td>{html.escape(str(device.get('board') or ''))}</td>"
+        f"<td>{html.escape(firmware)}</td>"
+        f"<td>{html.escape(str(device.get('wifi_ssid') or ''))}</td>"
+        f"<td class=\"{rssi_class}\">{rssi}</td>"
+        f"<td>{html.escape(str(device.get('last_seen_text') or ''))}</td>"
+        f"<td class=\"muted\">{html.escape(str(device.get('path') or ''))}</td>"
+        "</tr>"
+    )
 
 
 def _configured_provider() -> str:

@@ -88,6 +88,43 @@ Returns the current bridge state:
 
 `active_provider` selects which normalized `provider` block the firmware should render. `provider.quota_5h_remaining` and `provider.quota_7d_remaining` are remaining percentages from `0` to `100`; `null` means unknown and the firmware renders `--%`. The legacy `codex` block remains present for backward compatibility.
 
+## Discovery and device registry
+
+Bridge instances advertise `vibestick.local` with the DNS-SD service
+`_vibestick._tcp.local` when `zeroconf` is available. Firmware first tries the
+last working bridge saved in NVS for the current Wi-Fi SSID, then mDNS, then a
+same-subnet `/health` scan on the configured bridge port, and finally the
+compile-time fallback host.
+
+Firmware requests include these inventory headers when available:
+
+- `X-Vibe-Stick-Device-Id`
+- `X-Vibe-Stick-Board`
+- `X-Vibe-Stick-Device-Ip`
+- `X-Vibe-Stick-Wifi-Ssid`
+- `X-Vibe-Stick-Wifi-Bssid`
+- `X-Vibe-Stick-Wifi-Rssi`
+
+`GET /devices` returns the bridge's recent in-memory device registry:
+
+```json
+{
+  "devices": [
+    {
+      "device_id": "aa:bb:cc:dd:ee:ff",
+      "device_ip": "192.168.31.91",
+      "board": "stickc_plus",
+      "firmware_version": "0.1.4",
+      "wifi_ssid": "330",
+      "wifi_rssi": -43,
+      "last_seen_text": "2026-07-08 14:30:00"
+    }
+  ]
+}
+```
+
+`GET /dashboard` serves a local HTML status page for the same device registry.
+
 ## GET /health
 
 Returns bridge health metadata:
