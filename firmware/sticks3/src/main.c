@@ -67,6 +67,7 @@
 #define VIBE_STICK_IDLE_DIM_MS 30000
 #define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_DEEP_SLEEP_MS 600000
+#define VIBE_STICK_POWER_STATUS_POLL_MS 2000
 #define VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS 60
 #define VIBE_STICK_BACKLIGHT_FADE_STEP 5
 #define VIBE_STICK_PET_FAST_RESUME_MAX_MS 15000
@@ -142,6 +143,7 @@ typedef struct {
     int battery;
     bool battery_charging;
     bool usb_powered;
+    char wifi_ip[16];
     char codex_status[24];
     char project[40];
     int quota_5h;
@@ -177,6 +179,7 @@ typedef struct {
     char board[24];
     char version[48];
     char build_id[64];
+    char sha256[65];
     char elf_sha256[65];
     char url[160];
     int size;
@@ -234,6 +237,7 @@ static TaskHandle_t s_ota_task;
 static atomic_bool s_ota_in_progress;
 static int64_t s_last_activity_ms;
 static int64_t s_last_backlight_fade_ms;
+static int64_t s_last_power_status_poll_ms;
 static uint8_t s_current_backlight = LCD_BACKLIGHT_DEFAULT;
 static display_power_state_t s_display_power_state = DISPLAY_POWER_ACTIVE;
 static recording_upload_stats_t s_recording_upload_stats;
@@ -252,6 +256,7 @@ static lv_obj_t *s_battery_fill;
 static lv_obj_t *s_battery_cap;
 static lv_obj_t *s_battery_bolt;
 static lv_obj_t *s_mode_label;
+static lv_obj_t *s_ip_label;
 static lv_obj_t *s_pet_image;
 static bool s_ui_ready;
 static bool s_woke_from_deep_sleep;
@@ -319,6 +324,7 @@ static agent_state_t s_state = {
     .battery = 0,
     .battery_charging = false,
     .usb_powered = false,
+    .wifi_ip = "",
     .codex_status = "OFFLINE",
     .project = "vibestick",
     .quota_5h = 0,
@@ -1282,6 +1288,9 @@ static void create_ui(void)
     s_mode_label = make_label(screen, "PTT", &lv_font_montserrat_10, lv_color_hex(0x8a9099), 34, LV_TEXT_ALIGN_CENTER);
     lv_obj_align(s_mode_label, LV_ALIGN_TOP_MID, -2, 9);
 
+    s_ip_label = make_label(screen, "IP --", &lv_font_montserrat_10, lv_color_hex(0x686e78), 128, LV_TEXT_ALIGN_CENTER);
+    lv_obj_align(s_ip_label, LV_ALIGN_BOTTOM_MID, 0, -7);
+
     s_pet_image = lv_image_create(screen);
     s_pet_pixels = heap_caps_malloc(VIBE_STICK_PET_PIXEL_BYTES, MALLOC_CAP_8BIT);
     if (s_pet_pixels) {
@@ -1344,6 +1353,13 @@ static void render_state(void)
     lv_label_set_text(s_wifi_label, connected ? "WiFi" : "OFF");
     lv_obj_set_style_text_color(s_wifi_label,
                                 connected ? lv_color_hex(0xf3f4f6) : lv_color_hex(0x686e78),
+                                0);
+    char ip_text[24];
+    snprintf(ip_text, sizeof(ip_text), "IP %s",
+             connected && s_state.wifi_ip[0] != '\0' ? s_state.wifi_ip : "--");
+    lv_label_set_text(s_ip_label, ip_text);
+    lv_obj_set_style_text_color(s_ip_label,
+                                connected ? lv_color_hex(0x8a9099) : lv_color_hex(0x4b515a),
                                 0);
     set_battery_ui(s_state.battery, s_state.battery_charging, s_state.usb_powered);
     lv_label_set_text(s_mode_label, recording_mode_label());
@@ -1593,6 +1609,7 @@ static bool parse_ota_manifest(const char *json, ota_manifest_t *manifest)
     copy_json_string(root, "board", manifest->board, sizeof(manifest->board));
     copy_json_string(root, "version", manifest->version, sizeof(manifest->version));
     copy_json_string(root, "build_id", manifest->build_id, sizeof(manifest->build_id));
+    copy_json_string(root, "sha256", manifest->sha256, sizeof(manifest->sha256));
     copy_json_string(root, "elf_sha256", manifest->elf_sha256, sizeof(manifest->elf_sha256));
     copy_json_string(root, "url", manifest->url, sizeof(manifest->url));
     cJSON *size = cJSON_GetObjectItemCaseSensitive(root, "size");
@@ -1626,6 +1643,27 @@ static bool ota_manifest_is_new(const ota_manifest_t *manifest)
         ESP_LOGW(TAG, "OTA manifest board mismatch got=%s expected=%s",
                  manifest->board, VIBE_BOARD_NAME);
         return false;
+    }
+    if (manifest->sha256[0] != '\0') {
+        uint8_t running_sha256[32] = {0};
+        const esp_partition_t *running_partition = esp_ota_get_running_partition();
+        if (running_partition &&
+            esp_partition_get_sha256(running_partition, running_sha256) == ESP_OK) {
+            char current_sha256[65] = {0};
+            for (size_t i = 0; i < sizeof(running_sha256); i++) {
+                snprintf(current_sha256 + i * 2, sizeof(current_sha256) - i * 2,
+                         "%02x", running_sha256[i]);
+            }
+            if (strcmp(manifest->sha256, current_sha256) == 0) {
+                ESP_LOGI(TAG, "OTA manifest is current image sha256=%.12s",
+                         manifest->sha256);
+                return false;
+            }
+            ESP_LOGI(TAG, "OTA manifest is new image sha256=%.12s current=%.12s",
+                     manifest->sha256, current_sha256);
+            return true;
+        }
+        ESP_LOGW(TAG, "OTA running partition sha256 unavailable; falling back");
     }
     if (manifest->elf_sha256[0] != '\0') {
         const char *current_elf_sha256 = esp_app_get_elf_sha256_str();
@@ -1975,9 +2013,9 @@ static bool parse_state_json(const char *json)
     return true;
 }
 
-static void poll_state(void)
+static void refresh_power_status(bool force_log)
 {
-    char response[1536] = {0};
+    bool was_external_powered = external_powered();
     int battery_level = 0;
     if (vibe_board_battery_level(&battery_level) == ESP_OK) {
         s_state.battery = battery_level;
@@ -1993,11 +2031,16 @@ static void poll_state(void)
         s_state.usb_powered = usb_powered;
         power_read_ok = true;
     }
+    if (power_read_ok && was_external_powered && !external_powered()) {
+        ESP_LOGI(TAG, "external power removed; reset idle timer");
+        register_activity();
+    }
     static bool last_power_logged = false;
     static bool last_charging = false;
     static bool last_usb_powered = false;
     if (power_read_ok &&
-        (!last_power_logged ||
+        (force_log ||
+         !last_power_logged ||
          last_charging != s_state.battery_charging ||
          last_usb_powered != s_state.usb_powered)) {
         ESP_LOGI(TAG, "power status battery=%d charging=%d usb=%d",
@@ -2006,6 +2049,22 @@ static void poll_state(void)
         last_charging = s_state.battery_charging;
         last_usb_powered = s_state.usb_powered;
     }
+}
+
+static void maybe_refresh_power_status(int64_t now_ms)
+{
+    if (s_last_power_status_poll_ms != 0 &&
+        now_ms - s_last_power_status_poll_ms < VIBE_STICK_POWER_STATUS_POLL_MS) {
+        return;
+    }
+    s_last_power_status_poll_ms = now_ms;
+    refresh_power_status(false);
+}
+
+static void poll_state(void)
+{
+    char response[1536] = {0};
+    refresh_power_status(false);
     esp_err_t err = http_request("GET", VIBE_STICK_STATE_PATH, NULL, response, sizeof(response));
     if (err != ESP_OK || response[0] == '\0' || !parse_state_json(response)) {
         provider_display_state_t *display_state = current_provider_display_state();
@@ -2607,6 +2666,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         const wifi_event_sta_disconnected_t *disconnected =
             (const wifi_event_sta_disconnected_t *)event_data;
         set_wifi_connected(false);
+        s_state.wifi_ip[0] = '\0';
         if (s_wifi_profile_count > 1) {
             s_wifi_profile_retry_count++;
             if (s_wifi_profile_retry_count >= WIFI_PROFILE_RETRY_LIMIT) {
@@ -2623,7 +2683,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         esp_wifi_connect();
         render_state();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *got_ip = (const ip_event_got_ip_t *)event_data;
         set_wifi_connected(true);
+        if (got_ip) {
+            snprintf(s_state.wifi_ip, sizeof(s_state.wifi_ip),
+                     IPSTR, IP2STR(&got_ip->ip_info.ip));
+        }
         s_wifi_profile_retry_count = 0;
         render_state();
         queue_event(VIBE_STICK_EVENT_POLL_STATE);
@@ -2802,6 +2867,7 @@ static void app_task(void *arg)
     int64_t last_poll = 0;
     while (true) {
         int64_t now_ms = esp_timer_get_time() / 1000;
+        maybe_refresh_power_status(now_ms);
         update_power_saving(now_ms);
         maybe_enter_deep_sleep(now_ms);
         handle_deep_sleep_front_button_intent();

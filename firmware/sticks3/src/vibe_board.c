@@ -64,6 +64,8 @@ static i2c_master_dev_handle_t s_pmic_dev;
 #define AXP192_REG_VBUS_VOLTAGE 0x5a
 #define AXP192_REG_BAT_VOLTAGE 0x78
 #define AXP192_OUTPUT_CTRL_LDO2 BIT(2)
+#define AXP192_INPUT_STATUS_VBUS_PRESENT BIT(5)
+#define AXP192_INPUT_STATUS_VBUS_VALID BIT(4)
 
 #endif
 
@@ -386,6 +388,14 @@ esp_err_t vibe_board_usb_powered(bool *usb_powered)
 {
     ESP_RETURN_ON_FALSE(usb_powered != NULL, ESP_ERR_INVALID_ARG, TAG, "null usb powered");
     ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+
+    uint8_t status = 0;
+    ESP_RETURN_ON_ERROR(read_reg(AXP192_REG_INPUT_STATUS, &status), TAG, "read input status");
+    if ((status & (AXP192_INPUT_STATUS_VBUS_PRESENT | AXP192_INPUT_STATUS_VBUS_VALID)) ==
+        (AXP192_INPUT_STATUS_VBUS_PRESENT | AXP192_INPUT_STATUS_VBUS_VALID)) {
+        *usb_powered = true;
+        return ESP_OK;
+    }
 
     int voltage_mv = (int)((read_12bit_adc(AXP192_REG_VBUS_VOLTAGE) * 17 + 5) / 10);
     *usb_powered = voltage_mv > 4500;
