@@ -99,10 +99,15 @@ def test_followup_enter_and_escape_use_distinct_buzz_sounds() -> None:
     assert "VIBE_STICK_SOUND_FOLLOWUP_ESCAPE" in header
     assert "VIBE_STICK_FOLLOWUP_BUZZ_MS" in source
     assert "VIBE_STICK_FOLLOWUP_BUZZ_GAP_MS" in source
+    assert "VIBE_STICK_ESCAPE_GLITCH_SHORT_MS" in source
+    assert "VIBE_STICK_ESCAPE_GLITCH_LONG_MS" in source
+    assert "VIBE_STICK_ESCAPE_GLITCH_GAP_MS" in source
     assert "{.freq_hz = 2600, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS}" in followup_enter
     assert "{.freq_hz = 3200, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS}" in followup_enter
-    assert "{.freq_hz = 2100, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS}" in followup_escape
-    assert "{.freq_hz = 1200, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS}" in followup_escape
+    assert "{.freq_hz = 3600, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS}" in followup_escape
+    assert "{.freq_hz = 760, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS}" in followup_escape
+    assert "{.freq_hz = 3200, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS}" in followup_escape
+    assert "{.freq_hz = 520, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS}" in followup_escape
     assert followup_enter != followup_escape
     assert "post_ptt_followup_key_event(\"button_followup_enter\"" in main_source
     assert "post_ptt_followup_key_event(\"button_followup_escape\"" in main_source

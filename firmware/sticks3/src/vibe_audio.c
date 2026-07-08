@@ -42,6 +42,9 @@
 #define VIBE_STICK_RECORDING_CHIRP_GAP_MS 18
 #define VIBE_STICK_FOLLOWUP_BUZZ_MS 55
 #define VIBE_STICK_FOLLOWUP_BUZZ_GAP_MS 22
+#define VIBE_STICK_ESCAPE_GLITCH_SHORT_MS 45
+#define VIBE_STICK_ESCAPE_GLITCH_LONG_MS 105
+#define VIBE_STICK_ESCAPE_GLITCH_GAP_MS 28
 #define VIBE_STICK_AUDIO_CORE 1
 
 typedef struct {
@@ -452,9 +455,13 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
         {.freq_hz = 3200, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
     };
     static const sound_segment_t followup_escape[] = {
-        {.freq_hz = 2100, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
-        {.freq_hz = 0, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_GAP_MS},
-        {.freq_hz = 1200, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
+        {.freq_hz = 3600, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS},
+        {.freq_hz = 0, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_GAP_MS},
+        {.freq_hz = 760, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS},
+        {.freq_hz = 0, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_GAP_MS},
+        {.freq_hz = 3200, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS},
+        {.freq_hz = 0, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_GAP_MS},
+        {.freq_hz = 520, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS},
     };
 
     switch (sound) {
