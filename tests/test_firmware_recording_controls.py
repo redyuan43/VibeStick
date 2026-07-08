@@ -17,6 +17,34 @@ def test_front_single_click_toggles_device_recording() -> None:
     assert 'post_simple_event("button_short", NULL)' not in source
 
 
+def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    button_single_click = source.split("static void button_single_click_cb", 1)[1]
+    button_single_click = button_single_click.split("static void button_double_click_cb", 1)[0]
+
+    assert "#define PTT_ENTER_GRACE_MS 5000" in source
+    assert "VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER" in source
+    assert '\\"event\\":\\"button_followup_enter\\"' in source
+    assert '\\"session_id\\":\\"%s\\"' in source
+    assert button_single_click.index("consume_ptt_followup_enter_window()") < button_single_click.index(
+        "queue_event(VIBE_STICK_EVENT_RECORDING_TOGGLE)"
+    )
+
+
+def test_ptt_followup_enter_only_arms_after_long_press_stop() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    handle_stop = source.split("static void handle_recording_stop", 1)[1]
+    handle_stop = handle_stop.split("static void handle_recording_toggle", 1)[0]
+    handle_toggle = source.split("static void handle_recording_toggle", 1)[1]
+    handle_toggle = handle_toggle.split("static bool wifi_profile_has_ssid", 1)[0]
+
+    assert 'strcmp(event_name, "button_long_stop") == 0' in handle_stop
+    assert "arm_ptt_followup_enter_window();" in handle_stop
+    assert "clear_ptt_followup_enter_window();" in handle_stop
+    assert 'handle_recording_stop("button_tap_stop")' in handle_toggle
+    assert 'handle_recording_start("button_tap_start", "再按发送")' in handle_toggle
+
+
 def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 

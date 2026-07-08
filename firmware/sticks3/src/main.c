@@ -61,6 +61,7 @@
 #define RECORDING_UPLOAD_BUFFER_BYTES 8192
 #define RECORDING_UPLOAD_WAIT_MS 10000
 #define RECORDING_START_TIMEOUT_MS 1200
+#define PTT_ENTER_GRACE_MS 5000
 #define OTA_READ_BUFFER_BYTES 4096
 #define HTTP_CLIENT_BUFFER_SIZE 2048
 #define FIRMWARE_BUILD_ID __DATE__ " " __TIME__
@@ -125,6 +126,7 @@ typedef enum {
     VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE,
     VIBE_STICK_EVENT_MOTION_START,
     VIBE_STICK_EVENT_MOTION_STOP,
+    VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER,
     VIBE_STICK_EVENT_OTA_CHECK,
 } agent_event_type_t;
 
@@ -262,6 +264,8 @@ static atomic_bool s_recording_upload_failed;
 static TaskHandle_t s_recording_finalize_task;
 static atomic_bool s_recording_finalize_active;
 static char s_recording_finalize_event_name[32];
+static char s_ptt_followup_session_id[40];
+static int64_t s_ptt_followup_enter_deadline_ms;
 static TaskHandle_t s_ota_task;
 static atomic_bool s_ota_in_progress;
 static int64_t s_last_activity_ms;
@@ -2449,6 +2453,66 @@ static void post_simple_event(const char *event_name, const char *path)
     }
 }
 
+static void clear_ptt_followup_enter_window(void)
+{
+    s_ptt_followup_session_id[0] = '\0';
+    s_ptt_followup_enter_deadline_ms = 0;
+}
+
+static void arm_ptt_followup_enter_window(void)
+{
+    if (s_recording_session_id[0] == '\0') {
+        clear_ptt_followup_enter_window();
+        return;
+    }
+    strlcpy(s_ptt_followup_session_id, s_recording_session_id,
+            sizeof(s_ptt_followup_session_id));
+    s_ptt_followup_enter_deadline_ms = (esp_timer_get_time() / 1000) + PTT_ENTER_GRACE_MS;
+}
+
+static bool consume_ptt_followup_enter_window(void)
+{
+    if (s_recording_mode != RECORDING_MODE_PUSH_TO_TALK ||
+        s_ptt_followup_session_id[0] == '\0' ||
+        s_ptt_followup_enter_deadline_ms <= 0) {
+        clear_ptt_followup_enter_window();
+        return false;
+    }
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (now_ms > s_ptt_followup_enter_deadline_ms) {
+        clear_ptt_followup_enter_window();
+        return false;
+    }
+    return true;
+}
+
+static void post_ptt_followup_enter_event(void)
+{
+    char session_id[sizeof(s_ptt_followup_session_id)];
+    strlcpy(session_id, s_ptt_followup_session_id, sizeof(session_id));
+    clear_ptt_followup_enter_window();
+
+    if (session_id[0] == '\0') {
+        return;
+    }
+
+    char body[160];
+    snprintf(body, sizeof(body),
+             "{\"event\":\"button_followup_enter\",\"source\":\"%s\",\"session_id\":\"%s\"}",
+             VIBE_BOARD_EVENT_SOURCE,
+             session_id);
+    char response[512] = {0};
+    esp_err_t err = http_request("POST", VIBE_STICK_EVENT_PATH, body, response,
+                                 sizeof(response));
+    if (err == ESP_OK && response[0] != '\0' && parse_state_json(response)) {
+        complete_pet_fast_resume();
+        render_state();
+    } else if (err != ESP_OK) {
+        ESP_LOGW(TAG, "PTT follow-up enter event failed: %s", esp_err_to_name(err));
+    }
+}
+
 static bool parse_recording_session_id(const char *json, char *session_id, size_t session_id_len)
 {
     cJSON *root = cJSON_Parse(json);
@@ -2688,6 +2752,7 @@ static void wait_recording_upload_task(void)
 static bool handle_recording_start(const char *event_name, const char *hint)
 {
     register_activity();
+    clear_ptt_followup_enter_window();
     if (recording_network_busy() || s_tap_recording_active || s_motion_recording_active) {
         ESP_LOGI(TAG, "recording start ignored while already recording");
         return false;
@@ -2839,10 +2904,17 @@ static void handle_recording_stop(const char *event_name)
     if (s_recording_session_id[0] == '\0') {
         (void)vibe_audio_stop();
         vibe_audio_clear();
+        clear_ptt_followup_enter_window();
         poll_state();
         show_recording_overlay(NULL, NULL, false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
         return;
+    }
+
+    if (strcmp(event_name, "button_long_stop") == 0) {
+        arm_ptt_followup_enter_window();
+    } else {
+        clear_ptt_followup_enter_window();
     }
 
     strlcpy(s_recording_finalize_event_name, event_name, sizeof(s_recording_finalize_event_name));
@@ -3086,6 +3158,12 @@ static void button_single_click_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
+    if (consume_ptt_followup_enter_window()) {
+        if (!queue_event(VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER)) {
+            clear_ptt_followup_enter_window();
+        }
+        return;
+    }
     queue_event(VIBE_STICK_EVENT_RECORDING_TOGGLE);
 }
 
@@ -3312,6 +3390,9 @@ static void app_task(void *arg)
                 s_motion_lift_armed = true;
                 s_motion_start_pending = false;
             }
+            break;
+        case VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER:
+            post_ptt_followup_enter_event();
             break;
         case VIBE_STICK_EVENT_OTA_CHECK:
             start_ota_check_task();
