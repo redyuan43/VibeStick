@@ -86,11 +86,10 @@ def publish(board: str, image: Path) -> Path:
     file_name = f"{board}.bin"
     target_image = target_dir / file_name
     shutil.copy2(image, target_image)
-    elf_sha256 = info.get("elf_file_sha256", "")
+    file_sha256 = sha256(target_image)
+    image_sha256 = info.get("validation_hash", "").split()[0] or file_sha256
     compile_time = info.get("compile_time", "")
-    build_id = compile_time
-    if elf_sha256:
-        build_id = f"{compile_time} {elf_sha256[:12]}".strip()
+    build_id = f"{compile_time} {image_sha256[:12]}".strip()
 
     manifest = {
         "available": True,
@@ -100,8 +99,8 @@ def publish(board: str, image: Path) -> Path:
         "project_name": info.get("project_name", ""),
         "idf_version": info.get("esp-idf", ""),
         "size": target_image.stat().st_size,
-        "sha256": sha256(target_image),
-        "elf_sha256": elf_sha256,
+        "sha256": image_sha256,
+        "file_sha256": file_sha256,
         "file_name": file_name,
         "url": f"/ota/bin?board={board}",
     }
