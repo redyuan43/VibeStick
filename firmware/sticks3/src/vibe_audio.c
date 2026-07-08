@@ -40,6 +40,8 @@
 #define VIBE_STICK_BEEP_MS 200
 #define VIBE_STICK_RECORDING_CHIRP_MS 90
 #define VIBE_STICK_RECORDING_CHIRP_GAP_MS 18
+#define VIBE_STICK_FOLLOWUP_BUZZ_MS 55
+#define VIBE_STICK_FOLLOWUP_BUZZ_GAP_MS 22
 #define VIBE_STICK_AUDIO_CORE 1
 
 typedef struct {
@@ -444,6 +446,16 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
     static const sound_segment_t recording_stop[] = {
         {.freq_hz = 4000, .duration_ms = VIBE_STICK_BEEP_MS},
     };
+    static const sound_segment_t followup_enter[] = {
+        {.freq_hz = 2600, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
+        {.freq_hz = 0, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_GAP_MS},
+        {.freq_hz = 3200, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
+    };
+    static const sound_segment_t followup_escape[] = {
+        {.freq_hz = 2100, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
+        {.freq_hz = 0, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_GAP_MS},
+        {.freq_hz = 1200, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
+    };
 
     switch (sound) {
     case VIBE_STICK_SOUND_DONE:
@@ -461,6 +473,12 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
     case VIBE_STICK_SOUND_RECORDING_STOP:
         *count = sizeof(recording_stop) / sizeof(recording_stop[0]);
         return recording_stop;
+    case VIBE_STICK_SOUND_FOLLOWUP_ENTER:
+        *count = sizeof(followup_enter) / sizeof(followup_enter[0]);
+        return followup_enter;
+    case VIBE_STICK_SOUND_FOLLOWUP_ESCAPE:
+        *count = sizeof(followup_escape) / sizeof(followup_escape[0]);
+        return followup_escape;
     default:
         *count = 0;
         return NULL;

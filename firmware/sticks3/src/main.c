@@ -127,6 +127,7 @@ typedef enum {
     VIBE_STICK_EVENT_MOTION_START,
     VIBE_STICK_EVENT_MOTION_STOP,
     VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER,
+    VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE,
     VIBE_STICK_EVENT_OTA_CHECK,
 } agent_event_type_t;
 
@@ -2487,7 +2488,7 @@ static bool consume_ptt_followup_enter_window(void)
     return true;
 }
 
-static void post_ptt_followup_enter_event(void)
+static void post_ptt_followup_key_event(const char *event_name, agent_sound_t sound)
 {
     char session_id[sizeof(s_ptt_followup_session_id)];
     strlcpy(session_id, s_ptt_followup_session_id, sizeof(session_id));
@@ -2497,9 +2498,15 @@ static void post_ptt_followup_enter_event(void)
         return;
     }
 
+    esp_err_t sound_err = vibe_audio_play_sound(sound);
+    if (sound_err != ESP_OK) {
+        ESP_LOGW(TAG, "follow-up key sound failed: %s", esp_err_to_name(sound_err));
+    }
+
     char body[160];
     snprintf(body, sizeof(body),
-             "{\"event\":\"button_followup_enter\",\"source\":\"%s\",\"session_id\":\"%s\"}",
+             "{\"event\":\"%s\",\"source\":\"%s\",\"session_id\":\"%s\"}",
+             event_name,
              VIBE_BOARD_EVENT_SOURCE,
              session_id);
     char response[512] = {0};
@@ -2509,7 +2516,7 @@ static void post_ptt_followup_enter_event(void)
         complete_pet_fast_resume();
         render_state();
     } else if (err != ESP_OK) {
-        ESP_LOGW(TAG, "PTT follow-up enter event failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "PTT follow-up key event failed: %s", esp_err_to_name(err));
     }
 }
 
@@ -2911,7 +2918,8 @@ static void handle_recording_stop(const char *event_name)
         return;
     }
 
-    if (strcmp(event_name, "button_long_stop") == 0) {
+    if (strcmp(event_name, "button_long_stop") == 0 ||
+        strcmp(event_name, "button_tap_stop") == 0) {
         arm_ptt_followup_enter_window();
     } else {
         clear_ptt_followup_enter_window();
@@ -3172,6 +3180,12 @@ static void button_double_click_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
+    if (consume_ptt_followup_enter_window()) {
+        if (!queue_event(VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE)) {
+            clear_ptt_followup_enter_window();
+        }
+        return;
+    }
     queue_event(VIBE_STICK_EVENT_DOUBLE_CLICK);
 }
 
@@ -3392,7 +3406,12 @@ static void app_task(void *arg)
             }
             break;
         case VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER:
-            post_ptt_followup_enter_event();
+            post_ptt_followup_key_event("button_followup_enter",
+                                        VIBE_STICK_SOUND_FOLLOWUP_ENTER);
+            break;
+        case VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE:
+            post_ptt_followup_key_event("button_followup_escape",
+                                        VIBE_STICK_SOUND_FOLLOWUP_ESCAPE);
             break;
         case VIBE_STICK_EVENT_OTA_CHECK:
             start_ota_check_task();
