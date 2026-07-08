@@ -1,19 +1,19 @@
 # States And Sounds
 
-VibeStick v0.1.2 plays sounds only for key agent status changes on the home screen. Recording states do not play sounds.
+VibeStick plays short local tones for key agent status changes and recording feedback.
 
 | State | Trigger | Sound |
 | --- | --- | --- |
-| Completed / 完成 | Codex or Claude reports `DONE`, `COMPLETED`, or `SUCCESS` | 880 Hz 80 ms, 40 ms gap, 1320 Hz 120 ms |
-| Error / 报错 | Codex or Claude reports `ERROR`, `FAILED`, or `FAILURE` | 240 Hz 100 ms, 60 ms gap, repeated 3 times |
-| Waiting for approval / 等待审批 | Codex or Claude reports `APPROVAL`, `WAITING_APPROVAL`, `PENDING_APPROVAL`, or `NEEDS_APPROVAL` | 600 Hz 100 ms, 60 ms gap, 800 Hz 100 ms |
+| Completed / 完成 | Codex or Claude reports `DONE`, `COMPLETED`, or `SUCCESS` | 880 Hz 200 ms, 40 ms gap, 1320 Hz 200 ms |
+| Error / 报错 | Codex or Claude reports `ERROR`, `FAILED`, or `FAILURE` | 240 Hz 200 ms, 60 ms gap, repeated 3 times |
+| Waiting for approval / 等待审批 | Codex or Claude reports `APPROVAL`, `WAITING_APPROVAL`, `PENDING_APPROVAL`, or `NEEDS_APPROVAL` | 600 Hz 200 ms, 60 ms gap, 800 Hz 200 ms |
+| Recording start / 开始录音 | Device recording starts successfully | 3600 Hz 90 ms, 18 ms gap, 1800 Hz 90 ms |
+| Recording stop / 结束录音 | Device recording stops before upload finalization | 4000 Hz 200 ms |
 
 ## No Sound
 
 These states and events do not play sounds:
 
-- Recording start.
-- Recording stop.
 - Recording in progress.
 - Idle.
 - Ready.

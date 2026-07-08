@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_C = ROOT / "firmware" / "sticks3" / "src" / "main.c"
+AUDIO_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_audio.c"
 BOARD_PROFILE_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board_profile.h"
 
 
@@ -22,6 +23,22 @@ def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
     assert "start_recording_upload_task()" in source
     assert "upload_recording_chunk(buffer, audio_len)" in source
     assert "VIBE_STICK_RECORDING_AUDIO_PATH" in source
+
+
+def test_recording_start_uses_descending_chirp_and_stop_uses_legacy_beep() -> None:
+    source = AUDIO_C.read_text(encoding="utf-8")
+    recording_start = source.split("static const sound_segment_t recording_start[] = {", 1)[1]
+    recording_start = recording_start.split("};", 1)[0]
+    recording_stop = source.split("static const sound_segment_t recording_stop[] = {", 1)[1]
+    recording_stop = recording_stop.split("};", 1)[0]
+
+    assert "VIBE_STICK_RECORDING_CHIRP_MS" in source
+    assert "VIBE_STICK_RECORDING_CHIRP_GAP_MS" in source
+    assert "{.freq_hz = 3600, .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS}" in recording_start
+    assert "{.freq_hz = 1800, .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS}" in recording_start
+    assert "{.freq_hz = 4000, .duration_ms = VIBE_STICK_BEEP_MS}" in recording_stop
+    assert "VIBE_STICK_SOUND_RECORDING_START" in source
+    assert "VIBE_STICK_SOUND_RECORDING_STOP" in source
 
 
 def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:

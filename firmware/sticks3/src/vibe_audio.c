@@ -38,6 +38,8 @@
 #define VIBE_STICK_TWO_PI 6.28318530717958647692f
 #define VIBE_STICK_TONE_DUTY ((1 << 9) - 1)
 #define VIBE_STICK_BEEP_MS 200
+#define VIBE_STICK_RECORDING_CHIRP_MS 90
+#define VIBE_STICK_RECORDING_CHIRP_GAP_MS 18
 #define VIBE_STICK_AUDIO_CORE 1
 
 typedef struct {
@@ -435,10 +437,12 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
         {.freq_hz = 800, .duration_ms = VIBE_STICK_BEEP_MS},
     };
     static const sound_segment_t recording_start[] = {
-        {.freq_hz = 4000, .duration_ms = VIBE_STICK_BEEP_MS},
+        {.freq_hz = 3600, .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS},
+        {.freq_hz = 0, .duration_ms = VIBE_STICK_RECORDING_CHIRP_GAP_MS},
+        {.freq_hz = 1800, .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS},
     };
     static const sound_segment_t recording_stop[] = {
-        {.freq_hz = 2600, .duration_ms = VIBE_STICK_BEEP_MS},
+        {.freq_hz = 4000, .duration_ms = VIBE_STICK_BEEP_MS},
     };
 
     switch (sound) {
