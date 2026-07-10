@@ -126,19 +126,21 @@ static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, ui
 
 static int voltage_to_percent(int voltage_mv)
 {
-#if defined(VIBE_BOARD_STICKC_PLUS)
     static const struct {
         int voltage_mv;
         int percent;
     } curve[] = {
         {3350, 0},
-        {3450, 5},
-        {3600, 15},
-        {3700, 30},
-        {3800, 50},
-        {3900, 70},
-        {4000, 85},
-        {4100, 100},
+        {3500, 10},
+        {3600, 20},
+        {3680, 30},
+        {3730, 40},
+        {3790, 50},
+        {3850, 60},
+        {3920, 70},
+        {4000, 80},
+        {4100, 90},
+        {4180, 100},
     };
 
     if (voltage_mv <= curve[0].voltage_mv) {
@@ -157,16 +159,6 @@ static int voltage_to_percent(int voltage_mv)
         }
     }
     return curve[last].percent;
-#else
-    int level = (voltage_mv - 3300) * 100 / (4150 - 3350);
-    if (level < 0) {
-        return 0;
-    }
-    if (level > 100) {
-        return 100;
-    }
-    return level;
-#endif
 }
 
 #if VIBE_BOARD_HAS_ES8311
@@ -244,14 +236,24 @@ esp_err_t vibe_board_init_power(void)
     return ESP_OK;
 }
 
-esp_err_t vibe_board_battery_level(int *level_percent)
+esp_err_t vibe_board_battery_voltage_mv(int *voltage_mv)
 {
-    ESP_RETURN_ON_FALSE(level_percent != NULL, ESP_ERR_INVALID_ARG, TAG, "null level");
+    ESP_RETURN_ON_FALSE(voltage_mv != NULL, ESP_ERR_INVALID_ARG, TAG, "null voltage");
     ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
 
     uint8_t data[2] = {0};
     ESP_RETURN_ON_ERROR(read_regs(M5PM1_REG_BAT_L, data, sizeof(data)), TAG, "read bat");
-    *level_percent = voltage_to_percent((data[1] << 8) | data[0]);
+    *voltage_mv = (data[1] << 8) | data[0];
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_battery_level(int *level_percent)
+{
+    ESP_RETURN_ON_FALSE(level_percent != NULL, ESP_ERR_INVALID_ARG, TAG, "null level");
+
+    int voltage_mv = 0;
+    ESP_RETURN_ON_ERROR(vibe_board_battery_voltage_mv(&voltage_mv), TAG, "read bat voltage");
+    *level_percent = voltage_to_percent(voltage_mv);
     return ESP_OK;
 }
 
@@ -363,12 +365,21 @@ i2c_master_bus_handle_t vibe_board_i2c_bus(void)
     return s_i2c_bus;
 }
 
+esp_err_t vibe_board_battery_voltage_mv(int *voltage_mv)
+{
+    ESP_RETURN_ON_FALSE(voltage_mv != NULL, ESP_ERR_INVALID_ARG, TAG, "null voltage");
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+
+    *voltage_mv = (int)((read_12bit_adc(AXP192_REG_BAT_VOLTAGE) * 11 + 5) / 10);
+    return ESP_OK;
+}
+
 esp_err_t vibe_board_battery_level(int *level_percent)
 {
     ESP_RETURN_ON_FALSE(level_percent != NULL, ESP_ERR_INVALID_ARG, TAG, "null level");
-    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
 
-    int voltage_mv = (int)((read_12bit_adc(AXP192_REG_BAT_VOLTAGE) * 11 + 5) / 10);
+    int voltage_mv = 0;
+    ESP_RETURN_ON_ERROR(vibe_board_battery_voltage_mv(&voltage_mv), TAG, "read bat voltage");
     *level_percent = voltage_to_percent(voltage_mv);
     return ESP_OK;
 }

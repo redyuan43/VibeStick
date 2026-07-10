@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -74,6 +75,25 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def firmware_build_id(image: Path, fallback: str) -> str:
+    data = image.read_bytes()
+    pattern = rb"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ 0-9]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}"
+    matches = re.findall(pattern, data)
+    if not matches:
+        return fallback
+    return matches[-1].decode("ascii")
+
+
+def firmware_version() -> str:
+    config_path = repo_root() / "firmware" / "sticks3" / "include" / "vibe_stick_config.h"
+    try:
+        text = config_path.read_text()
+    except OSError:
+        return ""
+    match = re.search(r'#define\s+FIRMWARE_VERSION\s+"([^"]+)"', text)
+    return match.group(1) if match else ""
+
+
 def publish(board: str, image: Path) -> Path:
     if board not in BOARDS:
         raise SystemExit(f"Unsupported board: {board}")
@@ -89,17 +109,20 @@ def publish(board: str, image: Path) -> Path:
     file_sha256 = sha256(target_image)
     image_sha256 = info.get("validation_hash", "").split()[0] or file_sha256
     compile_time = info.get("compile_time", "")
-    build_id = f"{compile_time} {image_sha256[:12]}".strip()
+    build_id = firmware_build_id(target_image, compile_time)
+    elf_sha256 = info.get("elf_file_sha256", "").split()[0]
+    version = firmware_version() or info.get("app_version", "")
 
     manifest = {
         "available": True,
         "board": board,
-        "version": info.get("app_version", ""),
+        "version": version,
         "build_id": build_id,
         "project_name": info.get("project_name", ""),
         "idf_version": info.get("esp-idf", ""),
         "size": target_image.stat().st_size,
         "sha256": image_sha256,
+        "elf_sha256": elf_sha256,
         "file_sha256": file_sha256,
         "file_name": file_name,
         "url": f"/ota/bin?board={board}",

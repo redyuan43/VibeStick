@@ -4,6 +4,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_C = ROOT / "firmware" / "sticks3" / "src" / "main.c"
 AUDIO_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_audio.c"
+BOARD_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_board.c"
+BOARD_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board.h"
 BOARD_PROFILE_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board_profile.h"
 
 
@@ -14,7 +16,28 @@ def test_front_single_click_toggles_device_recording() -> None:
     assert "queue_event(VIBE_STICK_EVENT_RECORDING_TOGGLE);" in source
     assert 'handle_recording_start("button_tap_start", "再按发送")' in source
     assert 'handle_recording_stop("button_tap_stop")' in source
+    assert "front tap toggle mode=%s" in source
+    assert "front button down mode=%s" in source
+    assert "front single click mode=%s" in source
+    assert "front gpio fallback down mode=%s" in source
+    assert "front gpio fallback single duration=%lld mode=%s" in source
     assert 'post_simple_event("button_short", NULL)' not in source
+
+
+def test_cyber_front_gpio_fallback_does_not_duplicate_iot_button_events() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    fallback = source.split("static void poll_front_button_fallback", 1)[1]
+    fallback = fallback.split("static void register_activity", 1)[0]
+    button_up = source.split("static void button_up_cb", 1)[1]
+    button_up = button_up.split("static esp_err_t init_button", 1)[0]
+
+    assert "static bool front_button_iot_handled_press" in source
+    assert "s_front_button_iot_up_ms" in source
+    assert "s_front_fallback_suppressed = front_button_iot_handled_press(now_ms);" in fallback
+    assert "front_button_iot_handled_press(now_ms)" in fallback
+    assert "now_ms - s_front_button_iot_single_ms < 250" in fallback
+    assert "now_ms - s_front_button_iot_up_ms < 250" in fallback
+    assert "s_front_button_iot_up_ms = esp_timer_get_time() / 1000;" in button_up
 
 
 def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> None:
@@ -27,6 +50,10 @@ def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> Non
     assert '\\"event\\":\\"%s\\"' in source
     assert '"button_followup_enter"' in source
     assert '\\"session_id\\":\\"%s\\"' in source
+    assert "recording_intent_is_cyber()" in button_single_click
+    assert button_single_click.index("recording_intent_is_cyber()") < button_single_click.index(
+        "consume_ptt_followup_enter_window()"
+    )
     assert button_single_click.index("consume_ptt_followup_enter_window()") < button_single_click.index(
         "queue_event(VIBE_STICK_EVENT_RECORDING_TOGGLE)"
     )
@@ -54,6 +81,7 @@ def test_ptt_followup_enter_arms_after_long_press_or_tap_stop() -> None:
 
     assert 'strcmp(event_name, "button_long_stop") == 0' in handle_stop
     assert 'strcmp(event_name, "button_tap_stop") == 0' in handle_stop
+    assert "!recording_intent_is_cyber()" in handle_stop
     assert "arm_ptt_followup_enter_window();" in handle_stop
     assert "clear_ptt_followup_enter_window();" in handle_stop
     assert 'handle_recording_stop("button_tap_stop")' in handle_toggle
@@ -66,6 +94,21 @@ def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
     assert "start_recording_upload_task()" in source
     assert "upload_recording_chunk(buffer, audio_len)" in source
     assert "VIBE_STICK_RECORDING_AUDIO_PATH" in source
+    assert '\\"session_id\\":\\"%s\\",\\"intent\\":\\"%s\\",\\"mode\\":\\"%s\\"' in source
+
+
+def test_bridge_health_probe_accepts_vibestick_and_capswriter_identity() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    bridge_probe = source.split("static bool bridge_probe_target_timeout", 1)[1]
+    bridge_probe = bridge_probe.split("static bool bridge_probe_target", 1)[0]
+    bridge_load = source.split("static esp_err_t bridge_target_load_nvs", 1)[1]
+    bridge_load = bridge_load.split("static esp_err_t bridge_target_save_nvs", 1)[0]
+
+    assert 'cJSON_GetObjectItemCaseSensitive(root, "bridge_name")' in bridge_probe
+    assert "cJSON_IsString(bridge_name)" in bridge_probe
+    assert 'strcmp(bridge_name->valuestring, "vibestick-bridge") == 0' in bridge_probe
+    assert 'strcmp(bridge_name->valuestring, "capswriter-m5-voice-bridge") == 0' in bridge_probe
+    assert "port != VIBE_STICK_BRIDGE_PORT" in bridge_load
 
 
 def test_recording_start_uses_descending_chirp_and_stop_uses_legacy_beep() -> None:
@@ -145,6 +188,33 @@ def test_usb_power_keeps_display_active() -> None:
     assert "deep_sleep_should_stay_awake() ||" in source
 
 
+def test_battery_level_uses_voltage_curve_and_voltage_api() -> None:
+    board_source = BOARD_C.read_text(encoding="utf-8")
+    board_header = BOARD_H.read_text(encoding="utf-8")
+
+    assert "esp_err_t vibe_board_battery_voltage_mv(int *voltage_mv);" in board_header
+    assert "esp_err_t vibe_board_battery_voltage_mv(int *voltage_mv)" in board_source
+    assert "{3350, 0}" in board_source
+    assert "{4180, 100}" in board_source
+    assert "int level = (voltage_mv - 3300) * 100 / (4150 - 3350);" not in board_source
+    assert "vibe_board_battery_voltage_mv(&voltage_mv)" in board_source
+
+
+def test_battery_display_filters_raw_voltage_status() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert "VIBE_STICK_BATTERY_SAMPLE_COUNT 5" in source
+    assert "VIBE_STICK_BATTERY_USB_UNPLUG_HOLD_MS 30000" in source
+    assert "VIBE_STICK_BATTERY_WAKE_STABILIZE_MS 5000" in source
+    assert "median_battery_sample()" in source
+    assert "battery_drop_hold_active(now_ms)" in source
+    assert "RTC_DATA_ATTR static int s_retained_battery_display_level" in source
+    assert "s_retained_battery_magic == VIBE_STICK_BATTERY_RTC_MAGIC" in source
+    assert "s_deep_sleep_wake_ms = esp_timer_get_time() / 1000;" in source
+    assert "vibe_board_battery_voltage_mv(&battery_voltage_mv)" in source
+    assert "power status battery_raw=%d battery_display=%d battery_mv=%d charging=%d usb=%d" in source
+
+
 def test_state_polling_stops_while_screen_is_off() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 
@@ -165,7 +235,7 @@ def test_ota_check_blocks_sleep_without_waking_display() -> None:
     assert "deep_sleep_should_stay_awake() ||" in source
 
 
-def test_ota_check_runs_on_network_wake_without_periodic_polling() -> None:
+def test_ota_check_runs_on_network_wake_and_periodically() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     config = (ROOT / "firmware" / "sticks3" / "include" / "vibe_stick_config.h").read_text(
         encoding="utf-8"
@@ -174,8 +244,9 @@ def test_ota_check_runs_on_network_wake_without_periodic_polling() -> None:
     assert "queue_event(VIBE_STICK_EVENT_OTA_CHECK);" in source
     assert "case VIBE_STICK_EVENT_OTA_CHECK:" in source
     assert "start_ota_check_task();" in source
-    assert "s_last_ota_check_ms" not in source
-    assert "VIBE_STICK_OTA_CHECK_MS" not in source
+    assert "#define OTA_PERIODIC_CHECK_MS 300000" in source
+    assert "s_last_ota_check_ms" in source
+    assert "now_ms - s_last_ota_check_ms >= OTA_PERIODIC_CHECK_MS" in source
     assert "VIBE_STICK_OTA_CHECK_MS" not in config
 
 
@@ -208,10 +279,66 @@ def test_recording_mode_preference_survives_deep_sleep_restart() -> None:
 
     assert 'DEVICE_PREF_NAMESPACE "vibe_prefs"' in source
     assert 'DEVICE_PREF_RECORDING_MODE_KEY "rec_mode"' in source
-    assert "save_recording_mode_preference(s_recording_mode)" in source
+    assert 'DEVICE_PREF_RECORDING_TRIGGER_KEY "rec_trig"' in source
+    assert 'DEVICE_PREF_RECORDING_INTENT_KEY "rec_intent"' in source
+    assert "save_recording_mode_preference()" in source
     assert "restore_recording_mode_preference()" in source
+    assert "nvs_get_u8(handle, DEVICE_PREF_RECORDING_TRIGGER_KEY" in source
+    assert "nvs_get_u8(handle, DEVICE_PREF_RECORDING_INTENT_KEY" in source
     assert "nvs_get_u8(handle, DEVICE_PREF_RECORDING_MODE_KEY" in source
     assert "vibe_motion_recalibrate()" in source
+
+
+def test_recording_trigger_and_intent_toggle_are_independent() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
+    toggle = source.split("static void toggle_recording_mode(void)", 1)[1]
+    toggle = toggle.split("static void toggle_recording_intent(void)", 1)[0]
+    intent_toggle = source.split("static void toggle_recording_intent(void)", 1)[1]
+    intent_toggle = intent_toggle.split("static void lvgl_lock", 1)[0]
+    migration = source.split("static void migrate_legacy_recording_mode", 1)[1]
+    migration = migration.split("static esp_err_t restore_recording_mode_preference", 1)[0]
+
+    assert "VIBE_STICK_ANIM_PREVIEW 0" in source
+    assert "#define VIBE_BOARD_HAS_CYBER_INTENTS 0" in board_profile
+    assert "#define VIBE_BOARD_HAS_CYBER_INTENTS 1" in board_profile
+    assert "recording_intent_supported" in source
+    assert "sanitize_recording_intent();" in source
+    assert "cyber intents unavailable" in intent_toggle
+    assert "s_recording_trigger_mode = RECORDING_TRIGGER_LIFT_TO_TALK;" in source
+    assert "s_recording_trigger_mode = RECORDING_TRIGGER_PUSH_TO_TALK;" in source
+    assert "s_recording_intent = RECORDING_INTENT_CYBER_FORTUNE;" in intent_toggle
+    assert "s_recording_intent = RECORDING_INTENT_CYBER_ALMANAC;" in intent_toggle
+    assert "s_recording_intent = RECORDING_INTENT_DICTATION;" in intent_toggle
+    assert "RECORDING_INTENT_CYBER_FORTUNE" not in toggle
+    assert "case RECORDING_MODE_CYBER_FORTUNE:" in migration
+    assert "case RECORDING_MODE_CYBER_ALMANAC:" in migration
+    assert "VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE" in source
+    assert "side_button_double_click_cb" in source
+    assert "BUTTON_DOUBLE_CLICK, NULL,\n                                               side_button_double_click_cb" in source
+
+
+def test_side_mode_switches_show_large_main_screen_visual_feedback() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    toggle = source.split("static void toggle_recording_mode(void)", 1)[1]
+    toggle = toggle.split("static void toggle_recording_intent(void)", 1)[0]
+    intent_toggle = source.split("static void toggle_recording_intent(void)", 1)[1]
+    intent_toggle = intent_toggle.split("static void lvgl_lock", 1)[0]
+    update_pet = source.split("static void update_pet_visual(void)", 1)[1]
+    update_pet = update_pet.split("#if VIBE_STICK_ANIM_PREVIEW", 1)[0]
+
+    assert "VIBE_STICK_MODE_SWITCH_VISUAL_MS 1800" in source
+    assert "s_mode_switch_layer = lv_obj_create(screen);" in source
+    assert 'make_label(s_mode_switch_layer, "DICTATION",' in source
+    assert '"PUSH TO TALK"' in source
+    assert '"LIFT TO TALK"' in source
+    assert '"FORTUNE"' in source
+    assert '"ALMANAC"' in source
+    assert "show_trigger_mode_switch_visual();" in toggle
+    assert "show_recording_intent_switch_visual();" in intent_toggle
+    assert "mode_switch_visual_active(now_ms)" in update_pet
+    assert "set_pet_frame(s_mode_switch_frames[s_mode_switch_frame_index])" in update_pet
+    assert "finish_mode_switch_visual();" in update_pet
 
 
 def test_deep_sleep_button_wake_restores_ptt_hold() -> None:
@@ -258,3 +385,30 @@ def test_wifi_profiles_are_persisted_and_rotated() -> None:
     assert "wifi_profiles_merge_configured" in source
     assert "VIBE_STICK_WIFI_PROFILES" in source
     assert "s_wifi_profile_index = (s_wifi_profile_index + 1) % s_wifi_profile_count" in source
+
+
+def test_tts_playback_probe_reports_device_result() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert "tts_playback_request_id" in source
+    assert "VIBE_STICK_EVENT_TTS_PROBE" in source
+    assert "tts_probe_played" in source
+    assert "tts_probe_failed" in source
+    assert "post_recording_playback_event" in source
+
+
+def test_cyber_processing_keeps_overlay_until_tts_probe() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    finish_stop = source.split("static void finish_recording_stop", 1)[1]
+    finish_stop = finish_stop.split("static void recording_finalize_task", 1)[0]
+    tts_probe = source.split("case VIBE_STICK_EVENT_TTS_PROBE", 1)[1]
+    tts_probe = tts_probe.split("case VIBE_STICK_EVENT_OTA_CHECK", 1)[0]
+
+    assert "VIBE_STICK_CYBER_TTS_WAIT_TIMEOUT_MS" in source
+    assert "s_cyber_tts_waiting" in source
+    assert 'strcmp(recording_status, "cyber_processing") == 0' in finish_stop
+    assert "start_cyber_tts_wait();" in finish_stop
+    assert "if (!s_cyber_tts_waiting)" in finish_stop
+    assert 'show_recording_overlay("正在发送", "", true);' in source
+    assert "maybe_timeout_cyber_tts_wait(now_ms);" in source
+    assert "clear_cyber_tts_wait();" in tts_probe

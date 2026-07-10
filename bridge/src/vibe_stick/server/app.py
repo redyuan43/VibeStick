@@ -83,6 +83,8 @@ class BridgeStateStore:
         self._state.codex.quota_stale = quota.quota_stale
         self.recording = RecordingController(RECORDING_PATH)
         self._devices: dict[str, dict[str, Any]] = {}
+        self._events: list[dict[str, Any]] = []
+        self._tts_playback_request_id = ""
         hide_hud()
 
     def register_device_request(
@@ -127,6 +129,63 @@ class BridgeStateStore:
                 reverse=True,
             )
 
+    def recent_events(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(reversed(self._events[-25:]))
+
+    def tts_playback_request_id(self) -> str:
+        with self._lock:
+            return self._tts_playback_request_id
+
+    def request_tts_playback(self) -> dict[str, Any]:
+        with self._lock:
+            self._tts_playback_request_id = event_id("tts-probe")
+            self._append_event_locked(
+                "tts_probe_requested",
+                session_id=self.recording.session.session_id,
+                status=self.recording.session.status,
+            )
+            return {
+                "requested": True,
+                "tts_playback_request_id": self._tts_playback_request_id,
+                "recording": self.recording.session.to_jsonable(),
+            }
+
+    def _append_event_locked(self, event: str, **fields: Any) -> None:
+        now = time.time()
+        item = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "event": event,
+        }
+        for key, value in fields.items():
+            if value not in {None, ""}:
+                item[key] = value
+        self._events.append(item)
+        del self._events[:-80]
+
+    def debug_snapshot(self, *, include_sensitive: bool) -> dict[str, Any]:
+        with self._lock:
+            recording = self.recording.session.to_jsonable()
+            if not include_sensitive:
+                recording["transcript"] = _redacted_text(recording.get("transcript"))
+                recording["agent_text"] = _redacted_text(recording.get("agent_text"))
+                recording["tts_audio_file"] = _redacted_path(recording.get("tts_audio_file"))
+                recording["audio_file"] = _redacted_path(recording.get("audio_file"))
+            return {
+                "bridge": {
+                    "name": BRIDGE_NAME,
+                    "version": BRIDGE_VERSION,
+                    "token_required": bool(_bridge_token()),
+                    "asr_command_configured": bool(os.environ.get("VIBE_STICK_TRANSCRIBE_CMD", "").strip()),
+                    "cyber_agent_configured": bool(os.environ.get("VIBE_STICK_CYBER_AGENT_CMD", "").strip()),
+                    "agx_asr_url": os.environ.get("VIBE_STICK_AGX_ASR_URL", "").strip() or "",
+                },
+                "recording": recording,
+                "devices": self.devices(),
+                "events": self.recent_events(),
+                "sensitive": include_sensitive,
+            }
+
     def get_state(self) -> VibeStickState:
         with self._lock:
             self._refresh_providers_locked()
@@ -137,7 +196,16 @@ class BridgeStateStore:
     def update_from_event(self, event: dict[str, Any]) -> VibeStickState:
         with self._lock:
             event_name = str(event.get("event") or "")
-            requested_status = event.get("codex_status") or event.get("status")
+            self._append_event_locked(
+                event_name or "event",
+                source=str(event.get("source") or ""),
+                session_id=str(event.get("session_id") or ""),
+                status=str(event.get("status") or ""),
+                message=str(event.get("message") or ""),
+            )
+            requested_status = event.get("codex_status")
+            if not requested_status and _is_agent_status(event.get("status")):
+                requested_status = event.get("status")
             if requested_status:
                 self._set_codex_status(str(requested_status), str(event.get("message") or ""))
                 self._manual_status_until = time.monotonic() + MANUAL_STATUS_SECONDS
@@ -171,6 +239,14 @@ class BridgeStateStore:
     def start_recording(self, request: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self.recording.start(request)
         with self._lock:
+            self._append_event_locked(
+                "recording_start",
+                session_id=session.session_id,
+                intent=session.intent,
+                mode=session.mode,
+                source=session.audio_source,
+                status=session.status,
+            )
             self._state.alert = AlertState(
                 event_id="",
                 type=AlertType.NONE,
@@ -181,6 +257,17 @@ class BridgeStateStore:
 
     def stop_recording(self, request: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self.recording.stop(request)
+        with self._lock:
+            self._append_event_locked(
+                "recording_stop",
+                session_id=session.session_id,
+                intent=session.intent,
+                mode=session.mode,
+                status=session.status,
+                transcript_source=session.transcript_source,
+                transcript_chars=len(session.transcript),
+                tts_available=bool(session.tts_audio_file),
+            )
         return {"recording": session.to_jsonable(), "state": self.get_state().to_jsonable()}
 
     def upload_recording_audio(
@@ -201,7 +288,28 @@ class BridgeStateStore:
             bits_per_sample=bits_per_sample,
             append=append,
         )
+        with self._lock:
+            self._append_event_locked(
+                "recording_audio",
+                session_id=session.session_id,
+                status=session.status,
+                source=session.audio_source,
+                bytes=len(pcm),
+            )
         return {"recording": session.to_jsonable(), "state": self.get_state().to_jsonable()}
+
+    def tts_audio_path(self) -> Path | None:
+        path = Path(self.recording.session.tts_audio_file)
+        if not self.recording.session.tts_audio_file or not path.is_file():
+            return None
+        with self._lock:
+            self._append_event_locked(
+                "tts_download",
+                session_id=self.recording.session.session_id,
+                status=self.recording.session.status,
+                bytes=path.stat().st_size if path.exists() else 0,
+            )
+        return path
 
     def _refresh_providers_locked(self) -> None:
         codex_observation = observe_codex(self._project_root)
@@ -362,7 +470,11 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                 return
 
             if parsed.path == "/state":
-                self._send_json(_with_bridge_metadata(store.get_state().to_jsonable()))
+                payload = _with_bridge_metadata(store.get_state().to_jsonable())
+                request_id = store.tts_playback_request_id()
+                if request_id:
+                    payload["tts_playback_request_id"] = request_id
+                self._send_json(payload)
             elif parsed.path == "/health":
                 self._send_json(
                     {
@@ -373,8 +485,16 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                 )
             elif parsed.path == "/devices":
                 self._send_json({"devices": store.devices()})
+            elif parsed.path == "/debug/status":
+                self._send_json(store.debug_snapshot(include_sensitive=self._can_view_sensitive_debug()))
             elif parsed.path in {"/", "/dashboard"}:
-                self._send_html(_dashboard_html(store, self.server.server_address))
+                self._send_html(
+                    _dashboard_html(
+                        store,
+                        self.server.server_address,
+                        include_sensitive=self._can_view_sensitive_debug(),
+                    )
+                )
             elif parsed.path == "/ota/manifest":
                 board = _first(parse_qs(parsed.query), "board")
                 self._send_json(_ota_manifest_payload(store._project_root, board))
@@ -385,6 +505,12 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                     self._send_error(HTTPStatus.NOT_FOUND, "OTA image not found")
                     return
                 self._send_file(binary, "application/octet-stream")
+            elif parsed.path == "/recording/tts":
+                audio = store.tts_audio_path()
+                if audio is None:
+                    self._send_error(HTTPStatus.NOT_FOUND, "TTS audio not found")
+                    return
+                self._send_file(audio, _audio_content_type(audio))
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
 
@@ -407,9 +533,21 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
             elif parsed.path == "/quota/refresh":
                 state = store.refresh_quota()
                 self._send_json({"refreshed": True, "state": state.to_jsonable()})
+            elif parsed.path == "/debug/request-tts-playback":
+                self._send_json(store.request_tts_playback())
             elif parsed.path == "/recording/start":
                 body = self._read_json_body()
-                self._send_json(store.start_recording(body))
+                result = store.start_recording(body)
+                recording = result.get("recording", {})
+                print(
+                    "recording start "
+                    f"session={recording.get('session_id', '')} "
+                    f"intent={recording.get('intent', '')} "
+                    f"mode={recording.get('mode', '')} "
+                    f"source={recording.get('audio_source', '')}",
+                    flush=True,
+                )
+                self._send_json(result)
             elif parsed.path == "/recording/audio":
                 query = parse_qs(parsed.query)
                 content_length = self._content_length()
@@ -433,7 +571,22 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                 )
             elif parsed.path == "/recording/stop":
                 body = self._read_json_body()
-                self._send_json(store.stop_recording(body))
+                result = store.stop_recording(body)
+                recording = result.get("recording", {})
+                print(
+                    "recording stop "
+                    f"session={recording.get('session_id', '')} "
+                    f"status={recording.get('status', '')} "
+                    f"intent={recording.get('intent', '')} "
+                    f"mode={recording.get('mode', '')} "
+                    f"transcript_chars={len(str(recording.get('transcript', '')))} "
+                    f"pasted={recording.get('pasted', False)}",
+                    flush=True,
+                )
+                if _is_device_firmware_request(self.headers):
+                    self._send_json(_device_recording_result(result))
+                else:
+                    self._send_json(result)
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
 
@@ -476,6 +629,9 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                 return True
             supplied = self.headers.get("X-Vibe-Stick-Token", "")
             return hmac.compare_digest(supplied, expected)
+
+        def _can_view_sensitive_debug(self) -> bool:
+            return self._is_authorized() or _is_loopback_ip(self.client_address[0])
 
         def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -538,6 +694,7 @@ def _protected_paths() -> set[str]:
     return {
         "/event",
         "/quota/refresh",
+        "/debug/request-tts-playback",
         "/recording/start",
         "/recording/audio",
         "/recording/stop",
@@ -548,7 +705,17 @@ def _protected_get_paths() -> set[str]:
     return {
         "/ota/manifest",
         "/ota/bin",
+        "/recording/tts",
     }
+
+
+def _audio_content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".wav":
+        return "audio/wav"
+    if suffix == ".pcm":
+        return "application/octet-stream"
+    return "application/octet-stream"
 
 
 def _start_mdns_advertisement(host: str, port: int) -> Any | None:
@@ -756,12 +923,111 @@ def _with_bridge_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _dashboard_html(store: BridgeStateStore, server_address: tuple[Any, ...]) -> str:
+def _is_device_firmware_request(headers: Any) -> bool:
+    return bool(str(headers.get("X-Vibe-Stick-Firmware-Name") or "").strip())
+
+
+def _device_recording_result(result: dict[str, Any]) -> dict[str, Any]:
+    recording = result.get("recording")
+    state = result.get("state")
+    recording = recording if isinstance(recording, dict) else {}
+    state = state if isinstance(state, dict) else {}
+    alert = state.get("alert")
+    alert = alert if isinstance(alert, dict) else {}
+    return {
+        "recording": {
+            "session_id": str(recording.get("session_id") or ""),
+            "status": str(recording.get("status") or ""),
+            "message": str(recording.get("message") or ""),
+            "intent": str(recording.get("intent") or ""),
+            "mode": str(recording.get("mode") or ""),
+            "transcript_source": str(recording.get("transcript_source") or "none"),
+            "tts_available": bool(recording.get("tts_audio_file")),
+        },
+        "state": {
+            "time": str(state.get("time") or ""),
+            "wifi": bool(state.get("wifi", True)),
+            "ble": bool(state.get("ble", False)),
+            "active_provider": str(state.get("active_provider") or ""),
+            "alert": {
+                "event_id": str(alert.get("event_id") or ""),
+                "type": str(alert.get("type") or "NONE"),
+                "message": str(alert.get("message") or ""),
+            },
+        },
+    }
+
+
+def _redacted_text(value: object) -> str:
+    return "[redacted]" if str(value or "").strip() else ""
+
+
+def _redacted_path(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return f".../{Path(raw).name}"
+
+
+def _is_loopback_ip(raw: str) -> bool:
+    try:
+        return ipaddress.ip_address(raw).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_agent_status(value: object) -> bool:
+    try:
+        AgentStatus(str(value or "").upper())
+    except ValueError:
+        return False
+    return True
+
+
+def _dashboard_html(
+    store: BridgeStateStore,
+    server_address: tuple[Any, ...],
+    *,
+    include_sensitive: bool,
+) -> str:
     host, port = server_address[:2]
-    devices = store.devices()
+    snapshot = store.debug_snapshot(include_sensitive=include_sensitive)
+    devices = snapshot["devices"]
+    events = snapshot.get("events", [])
+    recording = snapshot["recording"]
+    bridge = snapshot["bridge"]
     rows = "\n".join(_device_row(device) for device in devices)
     if not rows:
         rows = "<tr><td colspan=\"8\" class=\"empty\">No VibeStick devices seen yet.</td></tr>"
+    event_rows = "\n".join(_event_row(event) for event in events)
+    if not event_rows:
+        event_rows = "<tr><td colspan=\"4\" class=\"empty\">No events yet.</td></tr>"
+    recording_rows = "\n".join(
+        _summary_row(label, value)
+        for label, value in [
+            ("Status", recording.get("status")),
+            ("Intent", recording.get("intent")),
+            ("Mode", recording.get("mode")),
+            ("Audio Source", recording.get("audio_source")),
+            ("Transcript Source", recording.get("transcript_source")),
+            ("Message", recording.get("message")),
+            ("Transcript", recording.get("transcript")),
+            ("Model Reply", recording.get("agent_text")),
+            ("TTS Source", recording.get("agent_source")),
+            ("Audio File", recording.get("audio_file")),
+            ("TTS File", recording.get("tts_audio_file")),
+        ]
+    )
+    bridge_rows = "\n".join(
+        _summary_row(label, value)
+        for label, value in [
+            ("Token Required", "yes" if bridge.get("token_required") else "no"),
+            ("ASR Command", "configured" if bridge.get("asr_command_configured") else "not configured"),
+            ("Cyber Agent", "configured" if bridge.get("cyber_agent_configured") else "not configured"),
+            ("AGX ASR URL", bridge.get("agx_asr_url") or "default"),
+            ("Detail View", "full" if snapshot.get("sensitive") else "redacted"),
+        ]
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -772,20 +1038,39 @@ def _dashboard_html(store: BridgeStateStore, server_address: tuple[Any, ...]) ->
 body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111827; color: #f9fafb; }}
 main {{ max-width: 1120px; margin: 0 auto; padding: 28px 20px; }}
 h1 {{ margin: 0 0 8px; font-size: 28px; font-weight: 700; }}
-.meta {{ color: #9ca3af; margin-bottom: 24px; }}
+.meta {{ color: #9ca3af; margin-bottom: 22px; }}
+.grid {{ display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); gap: 16px; margin-bottom: 18px; }}
+.panel {{ border: 1px solid #374151; background: #1f2937; }}
+.panel h2 {{ margin: 0; padding: 12px 14px; border-bottom: 1px solid #374151; font-size: 16px; }}
 table {{ width: 100%; border-collapse: collapse; background: #1f2937; border: 1px solid #374151; }}
+.panel table {{ border: 0; }}
 th, td {{ padding: 10px 12px; border-bottom: 1px solid #374151; text-align: left; font-size: 14px; }}
 th {{ color: #d1d5db; background: #111827; font-weight: 600; }}
+td:first-child {{ width: 150px; color: #9ca3af; }}
+.value {{ max-width: 680px; overflow-wrap: anywhere; white-space: pre-wrap; }}
 .empty {{ color: #9ca3af; text-align: center; padding: 24px; }}
 .muted {{ color: #9ca3af; }}
 .ok {{ color: #86efac; }}
 .bad {{ color: #fca5a5; }}
+@media (max-width: 820px) {{ .grid {{ grid-template-columns: 1fr; }} main {{ padding: 18px 12px; }} table {{ display: block; overflow-x: auto; }} }}
 </style>
 </head>
 <body>
 <main>
 <h1>VibeStick Bridge</h1>
 <div class="meta">Listening on {html.escape(str(host))}:{int(port)} &middot; mDNS: {MDNS_HOSTNAME.rstrip(".")}</div>
+<section class="grid">
+<div class="panel">
+<h2>Bridge</h2>
+<table><tbody>{bridge_rows}</tbody></table>
+</div>
+<div class="panel">
+<h2>Latest Recording</h2>
+<table><tbody>{recording_rows}</tbody></table>
+</div>
+</section>
+<div class="panel">
+<h2>Devices</h2>
 <table>
 <thead>
 <tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Last Path</th></tr>
@@ -794,10 +1079,37 @@ th {{ color: #d1d5db; background: #111827; font-weight: 600; }}
 {rows}
 </tbody>
 </table>
+</div>
+<div class="panel events">
+<h2>Recent Events</h2>
+<table>
+<thead>
+<tr><th>Time</th><th>Event</th><th>Status</th><th>Details</th></tr>
+</thead>
+<tbody>
+{event_rows}
+</tbody>
+</table>
+</div>
+<script>
+setTimeout(() => window.location.reload(), 2000);
+</script>
 </main>
 </body>
 </html>
 """
+
+
+def _summary_row(label: str, value: object) -> str:
+    text = str(value or "")
+    if not text:
+        text = "-"
+    return (
+        "<tr>"
+        f"<td>{html.escape(label)}</td>"
+        f"<td class=\"value\">{html.escape(text)}</td>"
+        "</tr>"
+    )
 
 
 def _device_row(device: dict[str, Any]) -> str:
@@ -819,6 +1131,23 @@ def _device_row(device: dict[str, Any]) -> str:
         f"<td class=\"{rssi_class}\">{rssi}</td>"
         f"<td>{html.escape(str(device.get('last_seen_text') or ''))}</td>"
         f"<td class=\"muted\">{html.escape(str(device.get('path') or ''))}</td>"
+        "</tr>"
+    )
+
+
+def _event_row(event: dict[str, Any]) -> str:
+    status = str(event.get("status") or "")
+    detail_parts = []
+    for key in ("source", "session_id", "intent", "mode", "transcript_source", "transcript_chars", "tts_available", "bytes", "message"):
+        value = event.get(key)
+        if value not in {None, ""}:
+            detail_parts.append(f"{key}={value}")
+    return (
+        "<tr>"
+        f"<td>{html.escape(str(event.get('time') or ''))}</td>"
+        f"<td>{html.escape(str(event.get('event') or ''))}</td>"
+        f"<td>{html.escape(status)}</td>"
+        f"<td class=\"value muted\">{html.escape(' '.join(detail_parts))}</td>"
         "</tr>"
     )
 

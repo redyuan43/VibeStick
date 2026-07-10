@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112">
+  <rect width="112" height="112" fill="#050608"/>
+  <g transform="translate(56 56)">
+    <g>
+      <animateTransform
+        attributeName="transform"
+        attributeType="XML"
+        type="rotate"
+        from="0"
+        to="360"
+        dur="1s"
+        repeatCount="indefinite"/>
+      <circle cx="0" cy="-32" r="10" fill="#5eead4"/>
+      <circle cx="22.63" cy="-22.63" r="8" fill="#38bdf8" opacity="0.82"/>
+      <circle cx="32" cy="0" r="6" fill="#818cf8" opacity="0.66"/>
+      <circle cx="22.63" cy="22.63" r="5" fill="#c084fc" opacity="0.50"/>
+      <circle cx="0" cy="32" r="4" fill="#f472b6" opacity="0.36"/>
+    </g>
+  </g>
+</svg>

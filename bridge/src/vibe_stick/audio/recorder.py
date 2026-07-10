@@ -46,6 +46,11 @@ class RecordingSession:
     pasted: bool = False
     audio_file: str = ""
     audio_source: str = "none"
+    intent: str = "dictation"
+    mode: str = ""
+    agent_text: str = ""
+    agent_source: str = ""
+    tts_audio_file: str = ""
 
     def to_jsonable(self) -> dict[str, Any]:
         return asdict(self)
@@ -82,6 +87,8 @@ class RecordingController:
             stopped_at="",
             status="recording",
             message="Recording session started",
+            intent=_recording_intent(request),
+            mode=_recording_mode(request),
         )
         use_mac_mic = not _is_device_pcm_source(requested_source)
         if not use_mac_mic:
@@ -209,6 +216,13 @@ class RecordingController:
                 self._save_stop_result()
                 return self.session
         should_paste = bool(request.get("paste", True))
+        if _recording_intent(request) != "dictation":
+            self.session.intent = _recording_intent(request)
+        if _recording_mode(request):
+            self.session.mode = _recording_mode(request)
+        is_cyber_intent = self.session.intent in {"cyber_fortune", "cyber_almanac"}
+        if is_cyber_intent:
+            should_paste = False
         press_enter = _env_bool("VIBE_STICK_AUTO_ENTER", default=False)
         show_hud("transcribing")
 
@@ -257,6 +271,11 @@ class RecordingController:
                     self._save_stop_result()
                     return self.session
 
+        if is_cyber_intent and _env_bool("VIBE_STICK_CYBER_AGENT_AUDIO_ONLY", default=False):
+            self.session.transcript_source = "skipped_audio_agent"
+            self._finish_cyber_intent()
+            return self.session
+
         transcript = self.transcriber.transcribe(
             self.session.to_jsonable(),
             explicit_text=explicit_text,
@@ -283,6 +302,9 @@ class RecordingController:
                 )
                 self._save_stop_result()
                 return self.session
+            if is_cyber_intent:
+                self._finish_cyber_intent()
+                return self.session
             if should_paste:
                 paste = self.paste_injector.paste(transcript.text, press_enter=press_enter)
                 self.session.pasted = paste.success
@@ -299,11 +321,41 @@ class RecordingController:
                 hide_hud(delay_seconds=0.5)
         else:
             self.session.pasted = False
+            if is_cyber_intent:
+                self.session.message = transcript.message
+                self.session.transcript_source = transcript.source
+                self._finish_cyber_intent(transcript_error=transcript.message)
+                return self.session
             self.session.status = "transcription_failed"
             self.session.message = transcript.message
             show_hud("failed", hold_seconds=1.8)
         self._save_stop_result()
         return self.session
+
+    def _finish_cyber_intent(self, transcript_error: str = "") -> None:
+        if transcript_error:
+            self.session.message = transcript_error
+        payload = self.session.to_jsonable()
+        if transcript_error:
+            payload["transcript_error"] = transcript_error
+        agent = _run_cyber_agent(payload, timeout=180)
+        self.session.pasted = False
+        if agent is None:
+            self.session.status = "cyber_unconfigured"
+            self.session.message = "Cyber agent command is not configured"
+            show_hud("failed", hold_seconds=1.8)
+        elif agent[0]:
+            self.session.status = "cyber_done"
+            self.session.agent_text = agent[1]
+            self.session.tts_audio_file = agent[2]
+            self.session.agent_source = agent[3] if len(agent) > 3 else ""
+            self.session.message = "Cyber agent completed"
+            hide_hud(delay_seconds=0.5)
+        else:
+            self.session.status = "cyber_failed"
+            self.session.message = agent[1] or "Cyber agent failed"
+            show_hud("failed", hold_seconds=1.8)
+        self._save_stop_result()
 
     def _finalize_device_pcm_upload(self) -> None:
         sid = _clean_session_id(self.session.session_id)
@@ -334,6 +386,11 @@ class RecordingController:
             pasted=bool(data.get("pasted", False)),
             audio_file=str(data.get("audio_file") or ""),
             audio_source=str(data.get("audio_source") or "none"),
+            intent=str(data.get("intent") or "dictation"),
+            mode=str(data.get("mode") or ""),
+            agent_text=str(data.get("agent_text") or ""),
+            agent_source=str(data.get("agent_source") or ""),
+            tts_audio_file=str(data.get("tts_audio_file") or ""),
         )
 
     def _save(self) -> None:
@@ -429,6 +486,19 @@ def _requested_session_id(request: dict[str, Any]) -> str:
     return _clean_session_id(str(request.get("session_id") or ""))
 
 
+def _recording_intent(request: dict[str, Any]) -> str:
+    value = str(request.get("intent") or "").strip().lower().replace("-", "_")
+    if value in {"cyber_fortune", "fortune"}:
+        return "cyber_fortune"
+    if value in {"cyber_almanac", "almanac", "huangli"}:
+        return "cyber_almanac"
+    return "dictation"
+
+
+def _recording_mode(request: dict[str, Any]) -> str:
+    return str(request.get("mode") or "").strip().upper()[:16]
+
+
 def _clean_session_id(raw: str) -> str:
     value = raw.strip()
     if not 8 <= len(value) <= 64:
@@ -481,18 +551,48 @@ def _run_command_hook(
     if not command:
         return None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
-            input=json.dumps(payload),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             shell=True,
-            check=False,
-            capture_output=True,
             text=True,
-            timeout=timeout,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        stdout, stderr = process.communicate(json.dumps(payload), timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        if "process" in locals():
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                process.kill()
+            stdout, stderr = process.communicate()
+        return (False, stdout if "stdout" in locals() else "", str(exc))
+    except OSError as exc:
         return (False, "", str(exc))
-    return (result.returncode == 0, result.stdout, result.stderr.strip())
+    return (process.returncode == 0, stdout, stderr.strip())
+
+
+def _run_cyber_agent(payload: dict[str, Any], timeout: int) -> tuple[bool, str, str, str] | None:
+    hook = _run_command_hook("VIBE_STICK_CYBER_AGENT_CMD", payload, timeout=timeout)
+    if hook is None:
+        return None
+    ok, stdout, stderr = hook
+    if not ok:
+        return (False, stderr or stdout.strip(), "", "")
+    text = stdout.strip()
+    audio_file = ""
+    source = ""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return (True, text, "", "")
+    if isinstance(data, dict):
+        text = str(data.get("text") or data.get("message") or "")
+        audio_file = str(data.get("tts_audio_file") or data.get("audio_file") or "")
+        source = str(data.get("tts_source") or data.get("agent_source") or data.get("source") or "")
+    return (True, text, audio_file, source)
 
 
 class MacMicRecorder:

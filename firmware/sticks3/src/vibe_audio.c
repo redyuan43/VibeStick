@@ -692,6 +692,63 @@ esp_err_t vibe_audio_play_sound(agent_sound_t sound)
 #endif
 }
 
+esp_err_t vibe_audio_play_pcm16_mono(const uint8_t *pcm, size_t len)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "not initialized");
+    ESP_RETURN_ON_FALSE(pcm != NULL && len > 0 && (len % 2) == 0,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid pcm");
+#if VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    ESP_RETURN_ON_FALSE(s_audio_mutex != NULL, ESP_ERR_INVALID_STATE, TAG, "audio mutex missing");
+    if (vibe_audio_is_recording()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (vibe_audio_is_recording() || s_tx_handle != NULL || s_rx_handle != NULL) {
+        xSemaphoreGive(s_audio_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = vibe_board_speaker_set_enabled(true);
+#if VIBE_BOARD_HAS_ES8311
+    if (err == ESP_OK) {
+        err = init_i2s_std(true, false);
+    }
+    if (err == ESP_OK) {
+        err = init_codec(ESP_CODEC_DEV_TYPE_OUT, ESP_CODEC_DEV_WORK_MODE_DAC);
+    }
+    if (err == ESP_OK) {
+        size_t offset = 0;
+        while (offset < len) {
+            size_t chunk = len - offset;
+            if (chunk > 2048) {
+                chunk = 2048;
+            }
+            if (esp_codec_dev_write(s_codec, (void *)(pcm + offset), (int)chunk) != ESP_CODEC_DEV_OK) {
+                err = ESP_FAIL;
+                break;
+            }
+            offset += chunk;
+        }
+    }
+    release_session_resources();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_speaker_set_enabled(false));
+#else
+    err = ESP_ERR_NOT_SUPPORTED;
+#endif
+    xSemaphoreGive(s_audio_mutex);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "pcm playback failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "pcm played bytes=%u", (unsigned)len);
+    }
+    return err;
+#endif
+}
+
 esp_err_t vibe_audio_read(uint8_t *buffer, size_t capacity, size_t *len, uint32_t timeout_ms)
 {
     ESP_RETURN_ON_FALSE(buffer != NULL && len != NULL, ESP_ERR_INVALID_ARG, TAG, "null read args");
