@@ -1,3 +1,5 @@
+#include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,6 +32,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "esp_rom_uart.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -44,6 +47,7 @@
 #include "nvs_flash.h"
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
+#include "lwip/sockets.h"
 
 #define LCD_HOST VIBE_BOARD_LCD_HOST
 #define LCD_H_RES VIBE_BOARD_LCD_H_RES
@@ -122,7 +126,9 @@
 #define BRIDGE_PROFILE_STORE_KEY "profiles"
 #define BRIDGE_PROFILE_STORE_MAGIC 0x56424250u
 #define BRIDGE_PROFILE_STORE_VERSION 1
-#define BRIDGE_DISCOVERY_TIMEOUT_MS 120
+#define BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS 250
+#define BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE 6
+#define BRIDGE_DISCOVERY_HEALTH_TIMEOUT_MS 900
 
 static const char *TAG = "vibe_stick";
 
@@ -386,6 +392,7 @@ static int s_mode_switch_frame_count;
 static int s_mode_switch_frame_index;
 static int64_t s_mode_switch_next_frame_ms;
 static int64_t s_mode_switch_until_ms;
+static bool s_mode_switch_persistent;
 #if VIBE_STICK_ANIM_PREVIEW
 static int s_anim_asset_index;
 static int s_anim_frame_index;
@@ -1587,7 +1594,7 @@ static void complete_pet_fast_resume(void)
 
 static bool mode_switch_visual_active(int64_t now_ms)
 {
-    return s_mode_switch_until_ms > now_ms &&
+    return (s_mode_switch_persistent || s_mode_switch_until_ms > now_ms) &&
            s_mode_switch_frames != NULL &&
            s_mode_switch_frame_count > 0;
 }
@@ -1602,13 +1609,15 @@ static void finish_mode_switch_visual(void)
     s_mode_switch_frame_count = 0;
     s_mode_switch_frame_index = 0;
     s_mode_switch_next_frame_ms = 0;
+    s_mode_switch_persistent = false;
     s_pet_sequence_key = -1;
     s_pet_next_frame_ms = 0;
 }
 
-static void show_mode_switch_visual(const char *title, const char *hint,
-                                    const vibe_stick_pet_frame_id_t *frames,
-                                    int frame_count, lv_color_t accent)
+static void show_mode_switch_visual_internal(const char *title, const char *hint,
+                                             const vibe_stick_pet_frame_id_t *frames,
+                                             int frame_count, lv_color_t accent,
+                                             bool persistent)
 {
     if (!s_ui_ready || !s_mode_switch_layer || !title || !hint || !frames || frame_count <= 0) {
         return;
@@ -1619,13 +1628,31 @@ static void show_mode_switch_visual(const char *title, const char *hint,
     s_mode_switch_frame_count = frame_count;
     s_mode_switch_frame_index = 0;
     s_mode_switch_next_frame_ms = 0;
-    s_mode_switch_until_ms = now_ms + VIBE_STICK_MODE_SWITCH_VISUAL_MS;
+    s_mode_switch_persistent = persistent;
+    s_mode_switch_until_ms =
+        persistent ? 0 : now_ms + VIBE_STICK_MODE_SWITCH_VISUAL_MS;
     lv_label_set_text(s_mode_switch_title, title);
     lv_label_set_text(s_mode_switch_hint, hint);
     lv_obj_set_style_text_color(s_mode_switch_title, accent, 0);
     lv_obj_clear_flag(s_mode_switch_layer, LV_OBJ_FLAG_HIDDEN);
     update_pet_visual();
     lvgl_unlock();
+    ESP_LOGI(TAG, "mode visual title=%s hint=%s persistent=%d",
+             title, hint, persistent);
+}
+
+static void show_mode_switch_visual(const char *title, const char *hint,
+                                    const vibe_stick_pet_frame_id_t *frames,
+                                    int frame_count, lv_color_t accent)
+{
+    show_mode_switch_visual_internal(title, hint, frames, frame_count, accent, false);
+}
+
+static void show_persistent_mode_switch_visual(const char *title, const char *hint,
+                                               const vibe_stick_pet_frame_id_t *frames,
+                                               int frame_count, lv_color_t accent)
+{
+    show_mode_switch_visual_internal(title, hint, frames, frame_count, accent, true);
 }
 
 static void show_trigger_mode_switch_visual(void)
@@ -2272,28 +2299,35 @@ static esp_err_t bridge_profiles_load_nvs(const char *current_ssid)
     if (err != ESP_OK) {
         return err;
     }
-    bridge_profile_store_t store = {0};
-    size_t required_size = sizeof(store);
-    err = nvs_get_blob(handle, BRIDGE_PROFILE_STORE_KEY, &store, &required_size);
+    bridge_profile_store_t *store = calloc(1, sizeof(*store));
+    if (!store) {
+        nvs_close(handle);
+        return ESP_ERR_NO_MEM;
+    }
+    size_t required_size = sizeof(*store);
+    err = nvs_get_blob(handle, BRIDGE_PROFILE_STORE_KEY, store, &required_size);
     nvs_close(handle);
     if (err != ESP_OK) {
+        free(store);
         return err;
     }
-    if (required_size != sizeof(store) ||
-        store.magic != BRIDGE_PROFILE_STORE_MAGIC ||
-        store.version != BRIDGE_PROFILE_STORE_VERSION ||
-        store.count == 0 ||
-        store.count > VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT ||
-        strcmp(store.ssid, current_ssid) != 0) {
+    if (required_size != sizeof(*store) ||
+        store->magic != BRIDGE_PROFILE_STORE_MAGIC ||
+        store->version != BRIDGE_PROFILE_STORE_VERSION ||
+        store->count == 0 ||
+        store->count > VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT ||
+        strcmp(store->ssid, current_ssid) != 0) {
+        free(store);
         return ESP_ERR_INVALID_VERSION;
     }
 
-    memcpy(s_discovered_bridge_profiles, store.profiles,
-           store.count * sizeof(store.profiles[0]));
-    s_discovered_bridge_profile_count = store.count;
+    memcpy(s_discovered_bridge_profiles, store->profiles,
+           store->count * sizeof(store->profiles[0]));
+    s_discovered_bridge_profile_count = store->count;
+    free(store);
     bridge_profile_views_rebuild();
     ESP_LOGI(TAG, "bridge profiles restored ssid=%s count=%u",
-             current_ssid, (unsigned int)store.count);
+             current_ssid, (unsigned int)s_discovered_bridge_profile_count);
     return ESP_OK;
 }
 
@@ -2308,23 +2342,30 @@ static esp_err_t bridge_profiles_save_nvs(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    bridge_profile_store_t store = {
-        .magic = BRIDGE_PROFILE_STORE_MAGIC,
-        .version = BRIDGE_PROFILE_STORE_VERSION,
-        .count = (uint16_t)s_discovered_bridge_profile_count,
-    };
-    strlcpy(store.ssid, current_ssid, sizeof(store.ssid));
-    memcpy(store.profiles, s_discovered_bridge_profiles,
-           s_discovered_bridge_profile_count * sizeof(store.profiles[0]));
+    bridge_profile_store_t *store = calloc(1, sizeof(*store));
+    if (!store) {
+        return ESP_ERR_NO_MEM;
+    }
+    store->magic = BRIDGE_PROFILE_STORE_MAGIC;
+    store->version = BRIDGE_PROFILE_STORE_VERSION;
+    store->count = (uint16_t)s_discovered_bridge_profile_count;
+    strlcpy(store->ssid, current_ssid, sizeof(store->ssid));
+    memcpy(store->profiles, s_discovered_bridge_profiles,
+           s_discovered_bridge_profile_count * sizeof(store->profiles[0]));
 
     nvs_handle_t handle;
     esp_err_t err = nvs_open(BRIDGE_TARGET_NAMESPACE, NVS_READWRITE, &handle);
-    ESP_RETURN_ON_ERROR(err, TAG, "open bridge profile NVS for write");
-    err = nvs_set_blob(handle, BRIDGE_PROFILE_STORE_KEY, &store, sizeof(store));
+    if (err != ESP_OK) {
+        free(store);
+        ESP_LOGE(TAG, "open bridge profile NVS for write: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = nvs_set_blob(handle, BRIDGE_PROFILE_STORE_KEY, store, sizeof(*store));
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
+    free(store);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "bridge profiles saved ssid=%s count=%u",
                  current_ssid, (unsigned int)s_discovered_bridge_profile_count);
@@ -2617,11 +2658,9 @@ static bool bridge_probe_discovered(const char *host, int port,
     char response[256] = {0};
     esp_err_t anonymous_err =
         http_request_target("GET", host, port, "", "/health", NULL, response,
-                            sizeof(response), BRIDGE_DISCOVERY_TIMEOUT_MS);
-    if (anonymous_err != ESP_OK) {
-        return false;
-    }
-    if (bridge_parse_discovered_health(response, host, port, "", profile)) {
+                            sizeof(response), BRIDGE_DISCOVERY_HEALTH_TIMEOUT_MS);
+    if (anonymous_err == ESP_OK &&
+        bridge_parse_discovered_health(response, host, port, "", profile)) {
         return true;
     }
 
@@ -2645,7 +2684,7 @@ static bool bridge_probe_discovered(const char *host, int port,
         }
         response[0] = '\0';
         if (http_request_target("GET", host, port, token, "/health", NULL, response,
-                                sizeof(response), BRIDGE_DISCOVERY_TIMEOUT_MS) == ESP_OK &&
+                                sizeof(response), BRIDGE_DISCOVERY_HEALTH_TIMEOUT_MS) == ESP_OK &&
             bridge_parse_discovered_health(response, host, port, token, profile)) {
             return true;
         }
@@ -2713,22 +2752,89 @@ static size_t bridge_discover_subnet_profiles(void)
     s_bridge_scan_profile_count = 0;
     ESP_LOGI(TAG, "bridge discovery start prefix=%u.%u.%u.0/24 port=%d",
              a, b, c, VIBE_STICK_BRIDGE_PORT);
-    for (int host_id = 254;
-         host_id >= 1 &&
-         s_bridge_scan_profile_count < VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT;
-         host_id--) {
-        if ((unsigned int)host_id == self) {
-            continue;
+    int next_host_id = 254;
+    while (next_host_id >= 1 &&
+           s_bridge_scan_profile_count < VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT) {
+        int sockets[BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE];
+        int host_ids[BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE];
+        bool connected[BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE] = {0};
+        size_t socket_count = 0;
+        int max_socket = -1;
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+
+        while (next_host_id >= 1 &&
+               socket_count < BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE) {
+            int host_id = next_host_id--;
+            if ((unsigned int)host_id == self) {
+                continue;
+            }
+            int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+            if (sock < 0) {
+                continue;
+            }
+            int flags = fcntl(sock, F_GETFL, 0);
+            if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+                close(sock);
+                continue;
+            }
+            struct sockaddr_in address = {
+                .sin_family = AF_INET,
+                .sin_port = htons((uint16_t)VIBE_STICK_BRIDGE_PORT),
+            };
+            char host[BRIDGE_TARGET_HOST_LEN] = {0};
+            snprintf(host, sizeof(host), "%u.%u.%u.%d", a, b, c, host_id);
+            if (inet_pton(AF_INET, host, &address.sin_addr) != 1) {
+                close(sock);
+                continue;
+            }
+            int result = connect(sock, (struct sockaddr *)&address, sizeof(address));
+            if (result < 0 && errno != EINPROGRESS) {
+                close(sock);
+                continue;
+            }
+            sockets[socket_count] = sock;
+            host_ids[socket_count] = host_id;
+            connected[socket_count] = result == 0;
+            FD_SET(sock, &write_fds);
+            if (sock > max_socket) {
+                max_socket = sock;
+            }
+            socket_count++;
         }
-        char host[BRIDGE_TARGET_HOST_LEN] = {0};
-        snprintf(host, sizeof(host), "%u.%u.%u.%d", a, b, c, host_id);
-        bridge_discovered_profile_t profile = {0};
-        if (!bridge_probe_discovered(host, VIBE_STICK_BRIDGE_PORT, &profile)) {
-            continue;
-        }
-        if (bridge_scan_add(&profile)) {
-            ESP_LOGI(TAG, "bridge discovered id=%s label=%s host=%s port=%ld",
-                     profile.id, profile.label, profile.host, (long)profile.port);
+
+        struct timeval timeout = {
+            .tv_sec = BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS / 1000,
+            .tv_usec = (BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS % 1000) * 1000,
+        };
+        int ready = socket_count > 0
+                        ? select(max_socket + 1, NULL, &write_fds, NULL, &timeout)
+                        : 0;
+        for (size_t index = 0; index < socket_count; index++) {
+            bool port_open = connected[index];
+            if (!port_open && ready > 0 && FD_ISSET(sockets[index], &write_fds)) {
+                int socket_error = 0;
+                socklen_t error_len = sizeof(socket_error);
+                port_open =
+                    getsockopt(sockets[index], SOL_SOCKET, SO_ERROR,
+                               &socket_error, &error_len) == 0 &&
+                    socket_error == 0;
+            }
+            close(sockets[index]);
+            if (!port_open) {
+                continue;
+            }
+            char host[BRIDGE_TARGET_HOST_LEN] = {0};
+            snprintf(host, sizeof(host), "%u.%u.%u.%d",
+                     a, b, c, host_ids[index]);
+            bridge_discovered_profile_t profile = {0};
+            if (!bridge_probe_discovered(host, VIBE_STICK_BRIDGE_PORT, &profile)) {
+                continue;
+            }
+            if (bridge_scan_add(&profile)) {
+                ESP_LOGI(TAG, "bridge discovered id=%s label=%s host=%s port=%ld",
+                         profile.id, profile.label, profile.host, (long)profile.port);
+            }
         }
     }
     if (s_bridge_scan_profile_count == 0) {
@@ -2779,12 +2885,12 @@ static void cycle_bridge_profile(void)
     bridge_ensure_target();
     bridge_target_t current;
     bridge_target_copy(&current);
-    show_mode_switch_visual("SEARCHING",
-                            "LAN BRIDGES",
-                            s_mode_switch_dict_frames,
-                            sizeof(s_mode_switch_dict_frames) /
-                                sizeof(s_mode_switch_dict_frames[0]),
-                            lv_color_hex(0x93c5fd));
+    show_persistent_mode_switch_visual("SEARCHING",
+                                       "LAN BRIDGES",
+                                       s_mode_switch_dict_frames,
+                                       sizeof(s_mode_switch_dict_frames) /
+                                           sizeof(s_mode_switch_dict_frames[0]),
+                                       lv_color_hex(0x93c5fd));
     if (bridge_discover_subnet_profiles() == 0) {
         show_mode_switch_visual("NO BRIDGE",
                                 "SIDE 1X RETRY",
@@ -4834,6 +4940,22 @@ static void app_task(void *arg)
     }
 }
 
+static void serial_debug_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        uint8_t input = 0;
+        if (esp_rom_output_rx_one_char(&input) == 0) {
+            if (input == 's' || input == 'S') {
+                ESP_LOGI(TAG, "serial debug command: side button single click");
+                register_activity();
+                (void)queue_event(VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 void app_main(void)
 {
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
@@ -4860,6 +4982,7 @@ void app_main(void)
     s_event_queue = xQueueCreate(16, sizeof(agent_event_t));
     s_lvgl_lock = xSemaphoreCreateMutex();
     s_bridge_target_lock = xSemaphoreCreateMutex();
+    xTaskCreate(serial_debug_task, "serial_debug", 2048, NULL, 2, NULL);
     ESP_ERROR_CHECK(init_wifi());
     ESP_ERROR_CHECK(init_display());
     register_activity();

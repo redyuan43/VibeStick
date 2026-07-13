@@ -62,6 +62,11 @@ tokens for authenticated discovery. Once a scan succeeds, future IP additions
 or changes do not require another firmware build; press the side button to
 refresh the NVS-backed list.
 
+Discovery first performs a short TCP port probe across the subnet, then sends
+`GET /health` only to hosts that accept the bridge port. The search animation
+stays visible until the scan finishes. During this bounded scan, recording and
+other bridge operations wait so the selected target cannot change mid-session.
+
 ## State Endpoint
 
 The firmware polls:

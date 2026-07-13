@@ -111,9 +111,12 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     assert 'http_request_target("GET", host, port, "", "/health"' in bridge_probe
     assert "k_configured_bridge_profiles[index].token" in bridge_probe
     assert "bridge_parse_discovered_health" in bridge_probe
-    assert "for (int host_id = 254;" in discovery
+    assert "BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE" in discovery
+    assert "select(max_socket + 1, NULL, &write_fds" in discovery
+    assert "next_host_id = 254" in discovery
     assert "bridge_profiles_save_nvs()" in discovery
     assert '"SEARCHING"' in cycle
+    assert "show_persistent_mode_switch_visual" in cycle
     assert "bridge_discover_subnet_profiles()" in cycle
     assert "BRIDGE_PROFILE_STORE_KEY" in source
     assert "nvs_get_blob(handle, BRIDGE_PROFILE_STORE_KEY" in source
@@ -133,6 +136,16 @@ def test_discovery_supports_legacy_and_generic_bridge_identity() -> None:
     assert '"capswriter-m5-voice-bridge"' in parser
     assert "bridge_discovery_fallback_id(host" in parser
     assert 'strncmp(profile->id, "lan-", 4) == 0' in profile_probe
+
+
+def test_serial_debug_command_uses_the_side_button_event_path() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    serial_task = source.split("static void serial_debug_task", 1)[1]
+    serial_task = serial_task.split("void app_main", 1)[0]
+
+    assert "esp_rom_output_rx_one_char(&input)" in serial_task
+    assert "serial debug command: side button single click" in serial_task
+    assert "queue_event(VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT)" in serial_task
 
 
 def test_recording_start_uses_descending_chirp_and_stop_uses_legacy_beep() -> None:
