@@ -129,8 +129,12 @@
 #define BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS 250
 #define BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE 6
 #define BRIDGE_DISCOVERY_HEALTH_TIMEOUT_MS 900
-#define BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS 180
 #define BRIDGE_DISCOVERY_PAUSE_POLL_MS 250
+#define BRIDGE_SELECTION_ENTRY_WINDOW_MS 5000
+#define BRIDGE_SELECTION_CONFIRM_HOLD_MS 1500
+#define BRIDGE_SELECTION_CONFIRM_ANIM_MS 1200
+#define BRIDGE_SELECTION_CONFIRMED_MS 1000
+#define BRIDGE_SELECTION_CLICK_SUPPRESS_MS 400
 
 static const char *TAG = "vibe_stick";
 
@@ -191,12 +195,6 @@ typedef struct {
 } bridge_profile_snapshot_t;
 
 typedef struct {
-    bridge_profile_snapshot_t profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
-    size_t source_indices[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
-    size_t reachable[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
-} bridge_profile_cycle_work_t;
-
-typedef struct {
     uint32_t magic;
     uint16_t version;
     uint16_t count;
@@ -219,12 +217,17 @@ typedef enum {
     VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE,
     VIBE_STICK_EVENT_TTS_PROBE,
     VIBE_STICK_EVENT_OTA_CHECK,
-    VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT,
+    VIBE_STICK_EVENT_BRIDGE_SCAN_FULL,
 } agent_event_type_t;
 
 typedef struct {
     agent_event_type_t type;
 } agent_event_t;
+
+typedef enum {
+    BRIDGE_CONTROL_NEXT,
+    BRIDGE_CONTROL_CONFIRM,
+} bridge_control_command_t;
 
 typedef enum {
     PROVIDER_CODEX = 0,
@@ -326,6 +329,13 @@ typedef enum {
     DISPLAY_POWER_OFF,
 } display_power_state_t;
 
+typedef enum {
+    BRIDGE_SELECTION_UI_IDLE,
+    BRIDGE_SELECTION_UI_SELECTING,
+    BRIDGE_SELECTION_UI_CONFIRMING,
+    BRIDGE_SELECTION_UI_CONFIRMED,
+} bridge_selection_ui_phase_t;
+
 typedef struct {
     size_t upload_posts;
     size_t uploaded_bytes;
@@ -341,6 +351,7 @@ typedef struct {
 } recording_upload_stats_t;
 
 static QueueHandle_t s_event_queue;
+static QueueHandle_t s_bridge_control_queue;
 static SemaphoreHandle_t s_lvgl_lock;
 static atomic_bool s_wifi_connected;
 static wifi_profile_t s_wifi_profiles[WIFI_PROFILE_MAX_COUNT];
@@ -361,6 +372,12 @@ static size_t s_bridge_scan_profile_count;
 static char s_bridge_profiles_loaded_ssid[WIFI_PROFILE_SSID_LEN];
 static TaskHandle_t s_bridge_discovery_task;
 static atomic_bool s_bridge_discovery_active;
+static atomic_bool s_bridge_selection_active;
+static atomic_bool s_bridge_selection_confirming;
+static atomic_bool s_front_bridge_gesture_active;
+static atomic_bool s_front_bridge_gesture_confirmed;
+static atomic_int_fast64_t s_bridge_selection_entry_deadline_ms;
+static atomic_int_fast64_t s_front_bridge_click_suppress_until_ms;
 static bridge_target_t s_bridge_target = {
     .host = VIBE_STICK_BRIDGE_HOST,
     .port = VIBE_STICK_BRIDGE_PORT,
@@ -415,6 +432,8 @@ static int s_mode_switch_frame_index;
 static int64_t s_mode_switch_next_frame_ms;
 static int64_t s_mode_switch_until_ms;
 static bool s_mode_switch_persistent;
+static bridge_selection_ui_phase_t s_bridge_selection_ui_phase;
+static int64_t s_bridge_selection_ui_deadline_ms;
 #if VIBE_STICK_ANIM_PREVIEW
 static int s_anim_asset_index;
 static int s_anim_frame_index;
@@ -609,13 +628,11 @@ static void render_state(void);
 static void copy_json_string(cJSON *root, const char *key, char *target, size_t target_len);
 static void register_activity(void);
 static void cycle_bridge_profile(void);
-static bool start_bridge_discovery_task(bool select_first_if_unavailable,
-                                        bool show_searching);
+static bool start_bridge_discovery_task(bool show_searching);
 static void bridge_target_copy(bridge_target_t *target);
 static bool bridge_target_profile_snapshot(const bridge_target_t *target,
                                            bridge_profile_snapshot_t *snapshot);
-static bool bridge_profiles_merge_profile(const bridge_discovered_profile_t *profile,
-                                          const char *scan_ssid);
+static bool bridge_profiles_merge_scan_results(const char *scan_ssid);
 static bool front_button_is_pressed(void);
 static void poll_front_button_fallback(int64_t now_ms);
 static void update_power_saving(int64_t now_ms);
@@ -630,6 +647,12 @@ static bool queue_event(agent_event_type_t type)
     }
     agent_event_t event = {.type = type};
     return xQueueSend(s_event_queue, &event, 0) == pdTRUE;
+}
+
+static bool queue_bridge_control(bridge_control_command_t command)
+{
+    return s_bridge_control_queue &&
+           xQueueSend(s_bridge_control_queue, &command, 0) == pdTRUE;
 }
 
 static const agent_provider_config_t *provider_config(agent_provider_t provider)
@@ -1693,6 +1716,60 @@ static void show_persistent_mode_switch_visual(const char *title, const char *hi
     show_mode_switch_visual_internal(title, hint, frames, frame_count, accent, true);
 }
 
+static void bridge_selection_title(char *title, size_t title_len)
+{
+    bridge_target_t target;
+    bridge_profile_snapshot_t profile;
+    bridge_target_copy(&target);
+    if (bridge_target_profile_snapshot(&target, &profile)) {
+        strlcpy(title, profile.label[0] != '\0' ? profile.label : profile.id,
+                title_len);
+        return;
+    }
+    strlcpy(title, "NO SAVED BRIDGE", title_len);
+}
+
+static void show_bridge_selection_visual(const char *status, lv_color_t accent)
+{
+    char title[BRIDGE_TARGET_LABEL_LEN] = {0};
+    bridge_selection_title(title, sizeof(title));
+    show_persistent_mode_switch_visual(
+        title, status,
+        s_mode_switch_dict_frames,
+        sizeof(s_mode_switch_dict_frames) / sizeof(s_mode_switch_dict_frames[0]),
+        accent);
+    s_bridge_selection_ui_phase = BRIDGE_SELECTION_UI_SELECTING;
+    s_bridge_selection_ui_deadline_ms = 0;
+}
+
+static void refresh_bridge_selection_visual(void)
+{
+    if (!atomic_load(&s_bridge_selection_active) ||
+        atomic_load(&s_bridge_selection_confirming) ||
+        s_bridge_selection_ui_phase != BRIDGE_SELECTION_UI_SELECTING) {
+        return;
+    }
+    bridge_target_t target;
+    bridge_target_copy(&target);
+    show_bridge_selection_visual(target.available ? "在线" : "离线",
+                                 target.available ? lv_color_hex(0x86efac)
+                                                  : lv_color_hex(0xfca5a5));
+}
+
+static void begin_bridge_selection_confirmation(void)
+{
+    char title[BRIDGE_TARGET_LABEL_LEN] = {0};
+    bridge_selection_title(title, sizeof(title));
+    show_persistent_mode_switch_visual(
+        title, "确认中",
+        s_pet_approval_frames,
+        sizeof(s_pet_approval_frames) / sizeof(s_pet_approval_frames[0]),
+        lv_color_hex(0x93c5fd));
+    s_bridge_selection_ui_phase = BRIDGE_SELECTION_UI_CONFIRMING;
+    s_bridge_selection_ui_deadline_ms =
+        esp_timer_get_time() / 1000 + BRIDGE_SELECTION_CONFIRM_ANIM_MS;
+}
+
 static void show_trigger_mode_switch_visual(void)
 {
     const bool lift = s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK;
@@ -1746,6 +1823,29 @@ static void update_pet_visual(void)
     }
 
     const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (s_bridge_selection_ui_phase == BRIDGE_SELECTION_UI_CONFIRMING &&
+        now_ms >= s_bridge_selection_ui_deadline_ms) {
+        s_bridge_selection_ui_phase = BRIDGE_SELECTION_UI_CONFIRMED;
+        s_bridge_selection_ui_deadline_ms =
+            now_ms + BRIDGE_SELECTION_CONFIRMED_MS;
+        s_mode_switch_frames = s_pet_done_frames;
+        s_mode_switch_frame_count =
+            sizeof(s_pet_done_frames) / sizeof(s_pet_done_frames[0]);
+        s_mode_switch_frame_index = 0;
+        s_mode_switch_next_frame_ms = 0;
+        lv_label_set_text(s_mode_switch_hint, "已确认");
+        lv_obj_set_style_text_color(s_mode_switch_title,
+                                    lv_color_hex(0x86efac), 0);
+    } else if (s_bridge_selection_ui_phase == BRIDGE_SELECTION_UI_CONFIRMED &&
+               now_ms >= s_bridge_selection_ui_deadline_ms) {
+        s_bridge_selection_ui_phase = BRIDGE_SELECTION_UI_IDLE;
+        s_bridge_selection_ui_deadline_ms = 0;
+        atomic_store(&s_bridge_selection_active, false);
+        atomic_store(&s_bridge_selection_confirming, false);
+        atomic_store(&s_front_bridge_gesture_active, false);
+        atomic_store(&s_front_bridge_gesture_confirmed, false);
+        finish_mode_switch_visual();
+    }
     if (mode_switch_visual_active(now_ms)) {
         if (now_ms >= s_mode_switch_next_frame_ms) {
             set_pet_frame(s_mode_switch_frames[s_mode_switch_frame_index]);
@@ -2368,6 +2468,31 @@ static size_t bridge_profile_count(void)
     return sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]);
 }
 
+static size_t bridge_saved_profile_count(void)
+{
+    bridge_profiles_lock();
+    size_t count = s_discovered_bridge_profile_count;
+    bridge_profiles_unlock();
+    return count;
+}
+
+static bool bridge_saved_profile_snapshot_at(size_t index,
+                                             bridge_profile_snapshot_t *snapshot)
+{
+    if (!snapshot) {
+        return false;
+    }
+    bridge_profiles_lock();
+    if (index >= s_discovered_bridge_profile_count) {
+        bridge_profiles_unlock();
+        return false;
+    }
+    bridge_profile_snapshot_from_discovered(&s_discovered_bridge_profiles[index],
+                                            snapshot);
+    bridge_profiles_unlock();
+    return true;
+}
+
 static bool bridge_profile_snapshot_at(size_t index, bridge_profile_snapshot_t *snapshot)
 {
     if (!snapshot) {
@@ -2588,10 +2713,20 @@ static bool bridge_target_set_profile(size_t profile_index, const char *source, 
     return true;
 }
 
-static void bridge_target_note_result(esp_err_t err)
+static void bridge_target_note_result(const char *expected_profile_id,
+                                      esp_err_t err)
 {
     if (s_bridge_target_lock) {
         xSemaphoreTake(s_bridge_target_lock, portMAX_DELAY);
+    }
+    if (expected_profile_id && expected_profile_id[0] != '\0' &&
+        strcmp(s_bridge_target.profile_id, expected_profile_id) != 0) {
+        if (s_bridge_target_lock) {
+            xSemaphoreGive(s_bridge_target_lock);
+        }
+        ESP_LOGI(TAG, "bridge result ignored for stale profile id=%s",
+                 expected_profile_id);
+        return;
     }
     if (err == ESP_OK) {
         s_bridge_target.failure_count = 0;
@@ -3053,7 +3188,6 @@ static size_t bridge_discover_subnet_profiles(void)
             if (bridge_scan_add(&profile)) {
                 ESP_LOGI(TAG, "bridge discovered id=%s label=%s host=%s port=%ld",
                          profile.id, profile.label, profile.host, (long)profile.port);
-                (void)bridge_profiles_merge_profile(&profile, scan_ssid);
             }
         }
         bridge_probe_unlock();
@@ -3096,33 +3230,40 @@ static int bridge_discovered_profile_find_locked(const bridge_discovered_profile
     return -1;
 }
 
-static bool bridge_profiles_merge_profile(const bridge_discovered_profile_t *profile,
-                                          const char *scan_ssid)
+static bool bridge_profiles_merge_scan_results(const char *scan_ssid)
 {
     char current_ssid[WIFI_PROFILE_SSID_LEN] = {0};
     current_wifi_ssid(current_ssid, sizeof(current_ssid));
-    if (!profile || profile->id[0] == '\0' ||
-        !scan_ssid || scan_ssid[0] == '\0' ||
+    if (!scan_ssid || scan_ssid[0] == '\0' ||
         strcmp(current_ssid, scan_ssid) != 0) {
         return false;
     }
+
     bool changed = false;
     bridge_profiles_lock();
-    int existing = bridge_discovered_profile_find_locked(profile);
-    if (existing >= 0) {
-        bridge_discovered_profile_t *stored =
-            &s_discovered_bridge_profiles[(size_t)existing];
-        if (!bridge_discovered_profile_equal(stored, profile)) {
-            *stored = *profile;
-            changed = true;
-        }
-    } else {
-        if (s_discovered_bridge_profile_count >= VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT) {
-            ESP_LOGW(TAG, "bridge profile store full; skipping id=%s host=%s",
-                     profile->id, profile->host);
+    for (size_t scan_index = 0;
+         scan_index < s_bridge_scan_profile_count;
+         scan_index++) {
+        const bridge_discovered_profile_t *profile =
+            &s_bridge_scan_profiles[scan_index];
+        int existing = bridge_discovered_profile_find_locked(profile);
+        if (existing >= 0) {
+            bridge_discovered_profile_t *stored =
+                &s_discovered_bridge_profiles[(size_t)existing];
+            if (!bridge_discovered_profile_equal(stored, profile)) {
+                *stored = *profile;
+                changed = true;
+            }
         } else {
-            s_discovered_bridge_profiles[s_discovered_bridge_profile_count++] = *profile;
-            changed = true;
+            if (s_discovered_bridge_profile_count >=
+                VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT) {
+                ESP_LOGW(TAG, "bridge profile store full; skipping id=%s host=%s",
+                         profile->id, profile->host);
+            } else {
+                s_discovered_bridge_profiles[s_discovered_bridge_profile_count++] =
+                    *profile;
+                changed = true;
+            }
         }
     }
     if (changed) {
@@ -3143,39 +3284,25 @@ static bool bridge_profiles_merge_profile(const bridge_discovered_profile_t *pro
 
 static void bridge_discovery_task(void *arg)
 {
-    const bool select_first_if_unavailable = (uintptr_t)arg != 0;
+    (void)arg;
+    char scan_ssid[WIFI_PROFILE_SSID_LEN] = {0};
+    current_wifi_ssid(scan_ssid, sizeof(scan_ssid));
     size_t count = bridge_discover_subnet_profiles();
     if (count > 0) {
+        (void)bridge_profiles_merge_scan_results(scan_ssid);
         render_state();
-        if (select_first_if_unavailable) {
-            bridge_target_t current;
-            bridge_target_copy(&current);
-            if (!current.available &&
-                s_bridge_scan_profiles[0].id[0] != '\0') {
-                int profile_index =
-                    bridge_profile_index_by_id(s_bridge_scan_profiles[0].id);
-                if (profile_index >= 0 &&
-                    bridge_target_set_profile((size_t)profile_index,
-                                              "manual-search", true)) {
-                    (void)bridge_target_save_nvs();
-                    ESP_LOGI(TAG, "bridge profile selected from manual search id=%s host=%s",
-                             s_bridge_scan_profiles[0].id,
-                             s_bridge_scan_profiles[0].host);
-                    render_state();
-                    show_mode_switch_visual(s_bridge_scan_profiles[0].label[0] != '\0'
-                                                ? s_bridge_scan_profiles[0].label
-                                                : s_bridge_scan_profiles[0].id,
-                                            "BRIDGE READY",
-                                            s_mode_switch_dict_frames,
-                                            sizeof(s_mode_switch_dict_frames) /
-                                                sizeof(s_mode_switch_dict_frames[0]),
-                                            lv_color_hex(0x86efac));
-                }
-            }
+        if (!atomic_load(&s_bridge_selection_active)) {
+            char summary[24];
+            snprintf(summary, sizeof(summary), "%u BRIDGES",
+                     (unsigned int)count);
+            show_mode_switch_visual("SCAN COMPLETE", summary,
+                                    s_pet_done_frames,
+                                    sizeof(s_pet_done_frames) /
+                                        sizeof(s_pet_done_frames[0]),
+                                    lv_color_hex(0x86efac));
         }
-    } else if (select_first_if_unavailable) {
-        show_mode_switch_visual("NO BRIDGE",
-                                "SIDE 1X RETRY",
+    } else if (!atomic_load(&s_bridge_selection_active)) {
+        show_mode_switch_visual("NO BRIDGE", "离线",
                                 s_mode_switch_dict_frames,
                                 sizeof(s_mode_switch_dict_frames) /
                                     sizeof(s_mode_switch_dict_frames[0]),
@@ -3186,8 +3313,7 @@ static void bridge_discovery_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static bool start_bridge_discovery_task(bool select_first_if_unavailable,
-                                        bool show_searching)
+static bool start_bridge_discovery_task(bool show_searching)
 {
     if (!wifi_connected()) {
         return false;
@@ -3196,9 +3322,17 @@ static bool start_bridge_discovery_task(bool select_first_if_unavailable,
     if (!atomic_compare_exchange_strong(&s_bridge_discovery_active,
                                         &expected, true)) {
         ESP_LOGI(TAG, "bridge discovery already running");
+        if (show_searching && !atomic_load(&s_bridge_selection_active)) {
+            show_persistent_mode_switch_visual(
+                "SEARCHING", "LAN BRIDGES",
+                s_mode_switch_dict_frames,
+                sizeof(s_mode_switch_dict_frames) /
+                    sizeof(s_mode_switch_dict_frames[0]),
+                lv_color_hex(0x93c5fd));
+        }
         return false;
     }
-    if (show_searching) {
+    if (show_searching && !atomic_load(&s_bridge_selection_active)) {
         show_persistent_mode_switch_visual("SEARCHING",
                                            "LAN BRIDGES",
                                            s_mode_switch_dict_frames,
@@ -3208,8 +3342,7 @@ static bool start_bridge_discovery_task(bool select_first_if_unavailable,
     }
     BaseType_t ok =
         xTaskCreatePinnedToCore(bridge_discovery_task, "bridge_scan", 8192,
-                                (void *)(uintptr_t)(select_first_if_unavailable ? 1 : 0),
-                                3, &s_bridge_discovery_task,
+                                NULL, 3, &s_bridge_discovery_task,
                                 VIBE_STICK_NETWORK_CORE);
     if (ok != pdPASS) {
         atomic_store(&s_bridge_discovery_active, false);
@@ -3242,80 +3375,6 @@ static void bridge_ensure_target(void)
     }
 }
 
-static bool bridge_profile_tcp_connect_start(const bridge_profile_snapshot_t *profile,
-                                             int *sock_out)
-{
-    *sock_out = -1;
-    if (!profile || profile->host[0] == '\0' || profile->port <= 0) {
-        return false;
-    }
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (sock < 0) {
-        return false;
-    }
-    int flags = fcntl(sock, F_GETFL, 0);
-    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
-        close(sock);
-        return false;
-    }
-    struct sockaddr_in address = {
-        .sin_family = AF_INET,
-        .sin_port = htons((uint16_t)profile->port),
-    };
-    if (inet_pton(AF_INET, profile->host, &address.sin_addr) != 1) {
-        close(sock);
-        return false;
-    }
-    int result = connect(sock, (struct sockaddr *)&address, sizeof(address));
-    if (result < 0 && errno != EINPROGRESS) {
-        close(sock);
-        return false;
-    }
-    *sock_out = sock;
-    return result == 0;
-}
-
-static size_t bridge_profiles_reachable_ordered(
-    const bridge_profile_snapshot_t *profiles,
-    size_t count,
-    int current_index,
-    size_t *reachable,
-    size_t reachable_cap)
-{
-    int sockets[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
-    size_t profile_indices[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
-    bool connected[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT] = {0};
-    size_t socket_count = 0;
-
-    for (size_t offset = 1; offset <= count; offset++) {
-        size_t index = (size_t)((current_index + (int)offset) % (int)count);
-        int sock = -1;
-        bool immediately_connected =
-            bridge_profile_tcp_connect_start(&profiles[index], &sock);
-        if (sock < 0) {
-            continue;
-        }
-        sockets[socket_count] = sock;
-        profile_indices[socket_count] = index;
-        connected[socket_count] = immediately_connected;
-        socket_count++;
-    }
-
-    bridge_wait_for_socket_connections(
-        sockets, connected, socket_count, BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS);
-    size_t reachable_count = 0;
-    for (size_t socket_index = 0; socket_index < socket_count; socket_index++) {
-        bool port_open = connected[socket_index];
-        close(sockets[socket_index]);
-        if (port_open && reachable_count < reachable_cap) {
-            reachable[reachable_count++] = profile_indices[socket_index];
-        }
-    }
-    ESP_LOGI(TAG, "bridge quick tcp reachable=%u/%u",
-             (unsigned)reachable_count, (unsigned)count);
-    return reachable_count;
-}
-
 static void cycle_bridge_profile(void)
 {
     if (recording_network_busy()) {
@@ -3325,84 +3384,42 @@ static void cycle_bridge_profile(void)
     bridge_ensure_target();
     bridge_target_t current;
     bridge_target_copy(&current);
-
-    bridge_profile_cycle_work_t *work = calloc(1, sizeof(*work));
-    if (!work) {
-        ESP_LOGW(TAG, "bridge quick switch workspace allocation failed");
-        (void)start_bridge_discovery_task(!current.available, !current.available);
+    size_t count = bridge_saved_profile_count();
+    if (count == 0) {
+        ESP_LOGW(TAG, "bridge selection has no saved profiles");
+        show_bridge_selection_visual("离线", lv_color_hex(0xfca5a5));
         return;
     }
-    size_t count = bridge_profile_count();
-    size_t snapshot_count = 0;
+
     int current_index = -1;
     for (size_t index = 0; index < count; index++) {
-        if (!bridge_profile_snapshot_at(index, &work->profiles[snapshot_count])) {
+        bridge_profile_snapshot_t profile;
+        if (!bridge_saved_profile_snapshot_at(index, &profile)) {
             continue;
         }
-        work->source_indices[snapshot_count] = index;
-        if (strcmp(work->profiles[snapshot_count].id, current.profile_id) == 0 ||
-            strcmp(work->profiles[snapshot_count].host, current.host) == 0) {
-            current_index = (int)snapshot_count;
+        if (strcmp(profile.id, current.profile_id) == 0 ||
+            strcmp(profile.host, current.host) == 0) {
+            current_index = (int)index;
+            break;
         }
-        snapshot_count++;
     }
-    if (snapshot_count == 0) {
-        count = 0;
-    } else {
-        count = snapshot_count;
-    }
-    size_t reachable_count =
-        0;
-    bridge_probe_lock();
-    reachable_count = bridge_profiles_reachable_ordered(
-        work->profiles, count, current_index, work->reachable,
-        sizeof(work->reachable) / sizeof(work->reachable[0]));
-    for (size_t offset = 0; offset < reachable_count; offset++) {
-        size_t index = work->reachable[offset];
-        bridge_probe_unlock();
-        if (!bridge_target_set_profile(work->source_indices[index], "manual", true)) {
-            bridge_probe_lock();
-            continue;
-        }
-        (void)bridge_target_save_nvs();
-        ESP_LOGI(TAG, "bridge profile selected id=%s host=%s port=%d",
-                 work->profiles[index].id, work->profiles[index].host,
-                 work->profiles[index].port);
-        render_state();
-        show_mode_switch_visual(work->profiles[index].label[0] != '\0'
-                                    ? work->profiles[index].label
-                                    : work->profiles[index].id,
-                                "BRIDGE READY",
-                                s_mode_switch_dict_frames,
-                                sizeof(s_mode_switch_dict_frames) /
-                                    sizeof(s_mode_switch_dict_frames[0]),
-                                lv_color_hex(0x86efac));
-        free(work);
-        (void)start_bridge_discovery_task(false, false);
+
+    size_t next_index =
+        current_index >= 0 ? ((size_t)current_index + 1) % count : 0;
+    bridge_profile_snapshot_t next;
+    if (!bridge_saved_profile_snapshot_at(next_index, &next) ||
+        !bridge_target_set_profile(next_index, "manual", false)) {
+        ESP_LOGW(TAG, "bridge selection failed index=%u",
+                 (unsigned int)next_index);
+        show_bridge_selection_visual("离线", lv_color_hex(0xfca5a5));
         return;
     }
-    bridge_probe_unlock();
-    free(work);
-    const bool select_from_search = !current.available;
-    const bool background_started = start_bridge_discovery_task(select_from_search,
-                                                                select_from_search);
-    ESP_LOGW(TAG, "no known bridge profile is reachable scan_started=%d",
-             background_started ? 1 : 0);
-    if (!select_from_search) {
-        show_mode_switch_visual(background_started ? "SCAN STARTED" : "NO BRIDGE",
-                                background_started ? "KNOWN UNCHANGED" : "SIDE 1X RETRY",
-                                s_mode_switch_dict_frames,
-                                sizeof(s_mode_switch_dict_frames) /
-                                    sizeof(s_mode_switch_dict_frames[0]),
-                                lv_color_hex(background_started ? 0x93c5fd : 0xfca5a5));
-    } else if (!background_started) {
-        show_mode_switch_visual("SEARCHING",
-                                "ALREADY RUNNING",
-                                s_mode_switch_dict_frames,
-                                sizeof(s_mode_switch_dict_frames) /
-                                    sizeof(s_mode_switch_dict_frames[0]),
-                                lv_color_hex(0x93c5fd));
-    }
+    (void)bridge_target_save_nvs();
+    ESP_LOGI(TAG, "bridge profile selected id=%s host=%s port=%d",
+             next.id, next.host, next.port);
+    render_state();
+    show_bridge_selection_visual("连接中", lv_color_hex(0x93c5fd));
+    (void)queue_event(VIBE_STICK_EVENT_POLL_STATE);
 }
 
 static esp_err_t bridge_prepare_active_target(bridge_target_t *target)
@@ -3418,7 +3435,7 @@ static esp_err_t bridge_prepare_active_target(bridge_target_t *target)
     bridge_profile_snapshot_view(&profile, &profile_view);
     if (!current.available) {
         if (!bridge_probe_profile(&profile_view, 1200)) {
-            bridge_target_note_result(ESP_FAIL);
+            bridge_target_note_result(current.profile_id, ESP_FAIL);
             return ESP_ERR_NOT_FOUND;
         }
         int refreshed_index = bridge_profile_index_by_id(profile.id);
@@ -3433,7 +3450,7 @@ static esp_err_t bridge_prepare_active_target(bridge_target_t *target)
             ESP_LOGI(TAG, "bridge target refreshed id=%s host=%s port=%d",
                      profile.id, profile.host, profile.port);
         } else {
-            bridge_target_note_result(ESP_OK);
+            bridge_target_note_result(current.profile_id, ESP_OK);
         }
         bridge_target_copy(&current);
     }
@@ -3454,7 +3471,7 @@ static esp_err_t http_request_timeout(const char *method, const char *path, cons
                             : VIBE_STICK_BRIDGE_TOKEN;
     esp_err_t err = http_request_target(method, target.host, target.port, token, path, body,
                                         response, response_len, timeout_ms);
-    bridge_target_note_result(err);
+    bridge_target_note_result(target.profile_id, err);
     return err;
 }
 
@@ -3506,7 +3523,7 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
         ESP_LOGW(TAG, "http POST %s status=%d empty response", path, status_code);
     }
     esp_http_client_cleanup(client);
-    bridge_target_note_result(err);
+    bridge_target_note_result(target.profile_id, err);
     return err;
 }
 
@@ -3641,7 +3658,7 @@ static esp_err_t download_tts_audio(uint8_t **audio, size_t *audio_len)
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    bridge_target_note_result(err);
+    bridge_target_note_result(target.profile_id, err);
     if (err != ESP_OK) {
         heap_caps_free(buffer);
         return err;
@@ -4278,10 +4295,12 @@ static void poll_state(void)
         strlcpy(display_state->status, "OFFLINE", sizeof(display_state->status));
         s_state.wifi = wifi_connected();
         render_state();
+        refresh_bridge_selection_visual();
         return;
     }
     complete_pet_fast_resume();
     render_state();
+    refresh_bridge_selection_visual();
     maybe_handle_alert();
 }
 
@@ -5088,7 +5107,27 @@ static void button_press_down_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
-    s_front_button_iot_down_ms = esp_timer_get_time() / 1000;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    s_front_button_iot_down_ms = now_ms;
+    const int64_t entry_deadline =
+        atomic_load(&s_bridge_selection_entry_deadline_ms);
+    const bool entry_open =
+        entry_deadline > 0 && now_ms <= entry_deadline &&
+        !recording_network_busy();
+    if (atomic_load(&s_bridge_selection_active) || entry_open) {
+        if (!atomic_load(&s_bridge_selection_active)) {
+            atomic_store(&s_bridge_selection_active, true);
+            atomic_store(&s_bridge_selection_confirming, false);
+            atomic_store(&s_bridge_selection_entry_deadline_ms, 0);
+            s_bridge_selection_ui_phase = BRIDGE_SELECTION_UI_SELECTING;
+            ESP_LOGI(TAG, "bridge selection mode entered");
+        }
+        atomic_store(&s_front_bridge_gesture_active, true);
+        atomic_store(&s_front_bridge_gesture_confirmed, false);
+        clear_ptt_followup_enter_window();
+        ESP_LOGI(TAG, "front button reserved for bridge selection");
+        return;
+    }
     ESP_LOGI(TAG, "front button down mode=%s", recording_mode_label());
 #if VIBE_STICK_ANIM_PREVIEW
     if (recording_animation_preview_active()) {
@@ -5103,7 +5142,14 @@ static void button_single_click_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
-    s_front_button_iot_single_ms = esp_timer_get_time() / 1000;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    s_front_button_iot_single_ms = now_ms;
+    if (atomic_load(&s_bridge_selection_active) ||
+        atomic_load(&s_front_bridge_gesture_active) ||
+        now_ms <= atomic_load(&s_front_bridge_click_suppress_until_ms)) {
+        ESP_LOGI(TAG, "front single click consumed by bridge selection");
+        return;
+    }
     ESP_LOGI(TAG, "front single click mode=%s", recording_mode_label());
 #if VIBE_STICK_ANIM_PREVIEW
     if (recording_animation_preview_active()) {
@@ -5131,6 +5177,13 @@ static void button_double_click_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (atomic_load(&s_bridge_selection_active) ||
+        atomic_load(&s_front_bridge_gesture_active) ||
+        now_ms <= atomic_load(&s_front_bridge_click_suppress_until_ms)) {
+        ESP_LOGI(TAG, "front double click consumed by bridge selection");
+        return;
+    }
 #if VIBE_STICK_ANIM_PREVIEW
     if (recording_animation_preview_active()) {
         return;
@@ -5163,8 +5216,14 @@ static void side_button_up_cb(void *button_handle, void *usr_data)
         s_side_button_long_press_active = false;
         return;
     }
-    ESP_LOGI(TAG, "side button release: bridge profile next");
-    queue_event(VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT);
+    const bool can_arm = !recording_network_busy();
+    atomic_store(&s_bridge_selection_entry_deadline_ms,
+                 can_arm ? esp_timer_get_time() / 1000 +
+                               BRIDGE_SELECTION_ENTRY_WINDOW_MS
+                         : 0);
+    ESP_LOGI(TAG, "side button release: full bridge scan entry_window=%d",
+             can_arm ? 1 : 0);
+    queue_event(VIBE_STICK_EVENT_BRIDGE_SCAN_FULL);
 }
 
 static void button_long_start_cb(void *button_handle, void *usr_data)
@@ -5172,6 +5231,11 @@ static void button_long_start_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
+    if (atomic_load(&s_bridge_selection_active) ||
+        atomic_load(&s_front_bridge_gesture_active)) {
+        ESP_LOGI(TAG, "front PTT long press consumed by bridge selection");
+        return;
+    }
 #if VIBE_STICK_ANIM_PREVIEW
     if (recording_animation_preview_active()) {
         return;
@@ -5189,12 +5253,41 @@ static void button_long_start_cb(void *button_handle, void *usr_data)
     queue_event(VIBE_STICK_EVENT_LONG_START);
 }
 
+static void bridge_selection_confirm_long_cb(void *button_handle, void *usr_data)
+{
+    (void)button_handle;
+    (void)usr_data;
+    register_activity();
+    if (!atomic_load(&s_bridge_selection_active) ||
+        !atomic_load(&s_front_bridge_gesture_active) ||
+        atomic_exchange(&s_bridge_selection_confirming, true)) {
+        return;
+    }
+    atomic_store(&s_front_bridge_gesture_confirmed, true);
+    ESP_LOGI(TAG, "bridge selection confirm hold");
+    queue_bridge_control(BRIDGE_CONTROL_CONFIRM);
+}
+
 static void button_up_cb(void *button_handle, void *usr_data)
 {
     (void)button_handle;
     (void)usr_data;
     register_activity();
-    s_front_button_iot_up_ms = esp_timer_get_time() / 1000;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    s_front_button_iot_up_ms = now_ms;
+    if (atomic_load(&s_front_bridge_gesture_active)) {
+        if (!atomic_load(&s_front_bridge_gesture_confirmed) &&
+            !atomic_load(&s_bridge_selection_confirming)) {
+            queue_bridge_control(BRIDGE_CONTROL_NEXT);
+        }
+        atomic_store(&s_front_bridge_click_suppress_until_ms,
+                     now_ms + BRIDGE_SELECTION_CLICK_SUPPRESS_MS);
+        atomic_store(&s_front_bridge_gesture_active, false);
+        s_long_press_active = false;
+        s_wake_front_button_pending = false;
+        ESP_LOGI(TAG, "front button release consumed by bridge selection");
+        return;
+    }
 #if VIBE_STICK_ANIM_PREVIEW
     if (recording_animation_preview_active()) {
         s_long_press_active = false;
@@ -5233,6 +5326,16 @@ static esp_err_t init_button(void)
     };
     ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_LONG_PRESS_START, &front_long_press_args, button_long_start_cb, NULL),
                         TAG, "button long");
+    button_event_args_t bridge_confirm_args = {
+        .long_press = {
+            .press_time = BRIDGE_SELECTION_CONFIRM_HOLD_MS,
+        },
+    };
+    ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_LONG_PRESS_START,
+                                               &bridge_confirm_args,
+                                               bridge_selection_confirm_long_cb,
+                                               NULL),
+                        TAG, "button bridge confirm");
     ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_PRESS_UP, NULL, button_up_cb, NULL),
                         TAG, "button up");
 
@@ -5296,6 +5399,27 @@ static void handle_deep_sleep_front_button_intent(void)
     register_activity();
     ESP_LOGI(TAG, "restoring front long press after deep sleep wake");
     queue_event(VIBE_STICK_EVENT_LONG_START);
+}
+
+static void bridge_control_task(void *arg)
+{
+    (void)arg;
+    bridge_control_command_t command;
+    while (true) {
+        if (xQueueReceive(s_bridge_control_queue, &command, portMAX_DELAY) !=
+            pdTRUE) {
+            continue;
+        }
+        if (command == BRIDGE_CONTROL_NEXT) {
+            if (atomic_load(&s_bridge_selection_active) &&
+                !atomic_load(&s_bridge_selection_confirming)) {
+                cycle_bridge_profile();
+            }
+        } else if (command == BRIDGE_CONTROL_CONFIRM &&
+                   atomic_load(&s_bridge_selection_active)) {
+            begin_bridge_selection_confirmation();
+        }
+    }
 }
 
 static void app_task(void *arg)
@@ -5387,8 +5511,8 @@ static void app_task(void *arg)
         case VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE:
             toggle_recording_intent();
             break;
-        case VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT:
-            cycle_bridge_profile();
+        case VIBE_STICK_EVENT_BRIDGE_SCAN_FULL:
+            (void)start_bridge_discovery_task(true);
             break;
         case VIBE_STICK_EVENT_MOTION_START:
             if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
@@ -5440,9 +5564,14 @@ static void serial_debug_task(void *arg)
         uint8_t input = 0;
         if (esp_rom_output_rx_one_char(&input) == 0) {
             if (input == 's' || input == 'S') {
-                ESP_LOGI(TAG, "serial debug command: side button single click");
+                ESP_LOGI(TAG, "serial debug command: side button full scan");
                 register_activity();
-                (void)queue_event(VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT);
+                if (!recording_network_busy()) {
+                    atomic_store(&s_bridge_selection_entry_deadline_ms,
+                                 esp_timer_get_time() / 1000 +
+                                     BRIDGE_SELECTION_ENTRY_WINDOW_MS);
+                }
+                (void)queue_event(VIBE_STICK_EVENT_BRIDGE_SCAN_FULL);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -5473,6 +5602,10 @@ void app_main(void)
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_init_power());
     s_event_queue = xQueueCreate(16, sizeof(agent_event_t));
+    s_bridge_control_queue =
+        xQueueCreate(8, sizeof(bridge_control_command_t));
+    ESP_ERROR_CHECK(s_event_queue ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(s_bridge_control_queue ? ESP_OK : ESP_ERR_NO_MEM);
     s_lvgl_lock = xSemaphoreCreateMutex();
     s_bridge_target_lock = xSemaphoreCreateMutex();
     s_bridge_profiles_lock = xSemaphoreCreateMutex();
@@ -5492,6 +5625,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(restore_recording_mode_preference());
     render_state();
+    BaseType_t bridge_control_ok =
+        xTaskCreatePinnedToCore(bridge_control_task, "bridge_control", 4096,
+                                NULL, 5, NULL, VIBE_STICK_APP_CORE);
+    ESP_ERROR_CHECK(bridge_control_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(init_button());
     capture_deep_sleep_front_button_intent();
     ESP_ERROR_CHECK(vibe_audio_init());

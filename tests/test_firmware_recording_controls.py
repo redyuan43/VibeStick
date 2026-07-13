@@ -37,7 +37,7 @@ def test_cyber_front_gpio_fallback_does_not_duplicate_iot_button_events() -> Non
     assert "front_button_iot_handled_press(now_ms)" in fallback
     assert "now_ms - s_front_button_iot_single_ms < 250" in fallback
     assert "now_ms - s_front_button_iot_up_ms < 250" in fallback
-    assert "s_front_button_iot_up_ms = esp_timer_get_time() / 1000;" in button_up
+    assert "s_front_button_iot_up_ms = now_ms;" in button_up
 
 
 def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> None:
@@ -105,14 +105,12 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     socket_wait = socket_wait.split("static size_t bridge_discover_subnet_profiles", 1)[0]
     discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
     discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
-    merge = source.split("static bool bridge_profiles_merge_profile", 1)[1]
+    merge = source.split("static bool bridge_profiles_merge_scan_results", 1)[1]
     merge = merge.split("static void bridge_discovery_task", 1)[0]
     task = source.split("static void bridge_discovery_task", 1)[1]
     task = task.split("static bool start_bridge_discovery_task", 1)[0]
     start_task = source.split("static bool start_bridge_discovery_task", 1)[1]
     start_task = start_task.split("static void bridge_ensure_target", 1)[0]
-    cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
-    cycle = cycle.split("static esp_err_t bridge_prepare_active_target", 1)[0]
     bridge_load = source.split("static esp_err_t bridge_target_load_nvs", 1)[1]
     bridge_load = bridge_load.split("static esp_err_t bridge_target_save_nvs", 1)[0]
 
@@ -127,27 +125,27 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     assert "settled[index] = true" in socket_wait
     assert "next_host_id = 254" in discovery
     assert "recording_network_busy()" in discovery
-    assert "bridge_profiles_save_nvs()" not in discovery
-    assert "bridge_profiles_merge_profile(&profile, scan_ssid)" in discovery
+    assert "bridge_profiles_merge_scan_results" not in discovery
+    assert "bridge_profiles_save_nvs" not in discovery
+    assert "s_bridge_scan_profiles[s_bridge_scan_profile_count++] = *profile" in source
+    assert "for (size_t scan_index = 0;" in merge
     assert "bridge_profiles_save_nvs(scan_ssid)" in merge
     assert "changed" in merge
-    assert "bridge_profiles_merge_scan_results" not in source
-    assert "bridge_target_set_profile" in task
-    assert '"manual-search"' in task
+    assert task.count("bridge_profiles_merge_scan_results(scan_ssid)") == 1
     assert "bridge_discover_subnet_profiles()" in task
-    assert '"SEARCHING"' in cycle
+    assert "bridge_target_set_profile" not in task
+    assert '"manual-search"' not in task
     assert "show_persistent_mode_switch_visual" in start_task
-    assert "select_from_search" in cycle
-    assert "start_bridge_discovery_task" in cycle
-    assert "bridge_discover_subnet_profiles()" not in cycle
     assert "BRIDGE_PROFILE_STORE_KEY" in source
     assert "nvs_get_blob(handle, BRIDGE_PROFILE_STORE_KEY" in source
     assert "nvs_set_blob(handle, BRIDGE_PROFILE_STORE_KEY" in source
     assert "bridge_profile_index_by_id(profile_id)" in bridge_load
 
 
-def test_side_button_fast_switch_uses_known_list_and_single_background_scan() -> None:
+def test_side_button_only_starts_full_scan_and_arms_selection_window() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    side_up = source.split("static void side_button_up_cb", 1)[1]
+    side_up = side_up.split("static void button_long_start_cb", 1)[0]
     start_task = source.split("static bool start_bridge_discovery_task", 1)[1]
     start_task = start_task.split("static void bridge_ensure_target", 1)[0]
     cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
@@ -158,36 +156,48 @@ def test_side_button_fast_switch_uses_known_list_and_single_background_scan() ->
     assert "atomic_compare_exchange_strong(&s_bridge_discovery_active" in start_task
     assert "bridge discovery already running" in start_task
     assert "xTaskCreatePinnedToCore(bridge_discovery_task" in start_task
-    assert "BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS" in source
-    assert "bridge_profiles_reachable_ordered(" in cycle
-    assert "work->profiles, count, current_index, work->reachable" in cycle
-    assert "const bool background_started = start_bridge_discovery_task" in cycle
+    assert "#define BRIDGE_SELECTION_ENTRY_WINDOW_MS 5000" in source
+    assert "VIBE_STICK_EVENT_BRIDGE_SCAN_FULL" in side_up
+    assert "BRIDGE_SELECTION_ENTRY_WINDOW_MS" in side_up
+    assert "VIBE_STICK_EVENT_BRIDGE_SELECTION_NEXT" not in side_up
+    assert "start_bridge_discovery_task" not in cycle
+    assert "bridge_saved_profile_count()" in cycle
+    assert "bridge_target_set_profile(next_index, \"manual\", false)" in cycle
+    assert 'show_bridge_selection_visual("连接中"' in cycle
+    assert "queue_event(VIBE_STICK_EVENT_POLL_STATE)" in cycle
+    assert "bridge_profiles_reachable_ordered" not in cycle
     assert "bridge_probe_profile(" not in cycle
-    assert cycle.index("bridge_profiles_reachable_ordered") < cycle.index(
-        "bridge_target_set_profile"
-    )
 
 
-def test_side_button_starts_bridge_switch_on_release_without_double_click_delay() -> None:
+def test_front_button_enters_persistent_bridge_selection_and_confirms_on_hold() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
-    side_up = source.split("static void side_button_up_cb", 1)[1]
-    side_up = side_up.split("static void button_long_start_cb", 1)[0]
+    button_down = source.split("static void button_press_down_cb", 1)[1]
+    button_down = button_down.split("static void button_single_click_cb", 1)[0]
+    button_up = source.split("static void button_up_cb", 1)[1]
+    button_up = button_up.split("static esp_err_t init_button", 1)[0]
+    confirm = source.split("static void bridge_selection_confirm_long_cb", 1)[1]
+    confirm = confirm.split("static void button_up_cb", 1)[0]
     init_button = source.split("static esp_err_t init_button", 1)[1]
     init_button = init_button.split("static void restore_wake_button_intent", 1)[0]
-    side_setup = init_button.split(
-        "iot_button_new_gpio_device(&button_config, &side_gpio_config", 1
-    )[1]
 
-    assert "static volatile bool s_side_button_long_press_active;" in source
-    assert "s_side_button_long_press_active = true;" in source
-    assert "s_side_button_long_press_active = false;" in side_up
-    assert "BUTTON_PRESS_UP" in side_setup
-    assert "side_button_up_cb" in side_setup
-    assert "BUTTON_SINGLE_CLICK" not in side_setup
-    assert "queue_event(VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT);" in side_up
+    assert "static atomic_bool s_bridge_selection_active;" in source
+    assert "static atomic_int_fast64_t s_bridge_selection_entry_deadline_ms;" in source
+    assert "entry_deadline > 0 && now_ms <= entry_deadline" in button_down
+    assert "bridge selection mode entered" in button_down
+    assert "queue_bridge_control(BRIDGE_CONTROL_NEXT)" in button_up
+    assert "BRIDGE_SELECTION_CLICK_SUPPRESS_MS" in button_up
+    assert "atomic_exchange(&s_bridge_selection_confirming, true)" in confirm
+    assert "queue_bridge_control(BRIDGE_CONTROL_CONFIRM)" in confirm
+    assert "static void bridge_control_task" in source
+    assert 'xTaskCreatePinnedToCore(bridge_control_task, "bridge_control"' in source
+    assert "#define BRIDGE_SELECTION_CONFIRM_HOLD_MS 1500" in source
+    assert ".press_time = BRIDGE_SELECTION_CONFIRM_HOLD_MS" in init_button
+    assert "bridge_selection_confirm_long_cb" in init_button
+    assert '"确认中"' in source
+    assert '"已确认"' in source
 
 
-def test_quick_switch_and_background_scan_serialize_socket_probes() -> None:
+def test_full_scan_uses_probe_lock_but_saved_bridge_switch_does_not() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
     discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
@@ -206,18 +216,18 @@ def test_quick_switch_and_background_scan_serialize_socket_probes() -> None:
     assert discovery.index("bridge_wait_for_socket_connections(") < discovery.index(
         "bridge_probe_unlock();"
     )
-    assert "bridge_probe_lock();" in cycle
-    assert "bridge_probe_unlock();" in cycle
-    assert cycle.index("bridge_probe_lock();") < cycle.index(
-        "bridge_profiles_reachable_ordered("
-    )
+    assert "bridge_probe_lock();" not in cycle
+    assert "bridge_probe_unlock();" not in cycle
+    assert "socket(" not in cycle
 
 
 def test_bridge_profile_store_access_uses_lock_and_snapshots() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     snapshot_at = source.split("static bool bridge_profile_snapshot_at", 1)[1]
     snapshot_at = snapshot_at.split("static bool bridge_target_profile_snapshot", 1)[0]
-    merge = source.split("static bool bridge_profiles_merge_profile", 1)[1]
+    saved_snapshot = source.split("static bool bridge_saved_profile_snapshot_at", 1)[1]
+    saved_snapshot = saved_snapshot.split("static bool bridge_profile_snapshot_at", 1)[0]
+    merge = source.split("static bool bridge_profiles_merge_scan_results", 1)[1]
     merge = merge.split("static void bridge_discovery_task", 1)[0]
     cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
     cycle = cycle.split("static esp_err_t bridge_prepare_active_target", 1)[0]
@@ -235,9 +245,10 @@ def test_bridge_profile_store_access_uses_lock_and_snapshots() -> None:
     assert merge.index("bridge_profiles_unlock();") < merge.index(
         "bridge_profiles_save_nvs(scan_ssid)"
     )
-    assert "bridge_profile_cycle_work_t *work = calloc(1, sizeof(*work));" in cycle
-    assert "bridge_profile_snapshot_at(index, &work->profiles[snapshot_count])" in cycle
-    assert "free(work);" in cycle
+    assert "bridge_profiles_lock();" in saved_snapshot
+    assert "bridge_profile_snapshot_from_discovered" in saved_snapshot
+    assert "bridge_saved_profile_snapshot_at(index, &profile)" in cycle
+    assert "bridge_saved_profile_snapshot_at(next_index, &next)" in cycle
 
 
 def test_background_merge_keeps_active_target_and_wifi_identity_stable() -> None:
@@ -246,14 +257,17 @@ def test_background_merge_keeps_active_target_and_wifi_identity_stable() -> None
     target_lookup = target_lookup.split("static void bridge_profile_views_rebuild", 1)[0]
     discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
     discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
-    merge = source.split("static bool bridge_profiles_merge_profile", 1)[1]
+    merge = source.split("static bool bridge_profiles_merge_scan_results", 1)[1]
     merge = merge.split("static void bridge_discovery_task", 1)[0]
+    task = source.split("static void bridge_discovery_task", 1)[1]
+    task = task.split("static bool start_bridge_discovery_task", 1)[0]
 
     assert "strcmp(profile->id, target->profile_id) == 0" in target_lookup
     assert "k_configured_bridge_profiles" in target_lookup
     assert "target->profile_index" not in target_lookup
     assert "current_wifi_ssid(scan_ssid" in discovery
-    assert "bridge_profiles_merge_profile(&profile, scan_ssid)" in discovery
+    assert "bridge_profiles_merge_scan_results" not in discovery
+    assert "bridge_profiles_merge_scan_results(scan_ssid)" in task
     assert "strcmp(current_ssid, scan_ssid) != 0" in merge
     assert "bridge_profiles_save_nvs(scan_ssid)" in merge
 
@@ -269,6 +283,19 @@ def test_rediscovered_bridge_address_refreshes_active_target() -> None:
     assert '"rediscovered", true' in prepare
     assert "bridge_target_save_nvs()" in prepare
     assert "bridge target refreshed id=%s host=%s port=%d" in prepare
+
+
+def test_concurrent_bridge_switch_ignores_stale_network_results() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    note_result = source.split("static void bridge_target_note_result", 1)[1]
+    note_result = note_result.split("static bool bridge_target_needs_selection", 1)[0]
+    request = source.split("static esp_err_t http_request_timeout", 1)[1]
+    request = request.split("static esp_err_t http_request(", 1)[0]
+
+    assert "expected_profile_id" in note_result
+    assert "strcmp(s_bridge_target.profile_id, expected_profile_id) != 0" in note_result
+    assert "bridge result ignored for stale profile id=%s" in note_result
+    assert "bridge_target_note_result(target.profile_id, err);" in request
 
 
 def test_background_scan_uses_atomic_recording_lifecycle_flags() -> None:
@@ -299,11 +326,10 @@ def test_bridge_background_scan_pauses_for_recording_and_does_not_auto_switch_cu
 
     assert "while (recording_network_busy())" in discovery
     assert "bridge discovery paused while recording network is busy" in discovery
-    assert "const bool select_first_if_unavailable = (uintptr_t)arg != 0;" in task
-    assert "if (select_first_if_unavailable)" in task
-    assert "if (!current.available &&" in task
-    assert '"manual-search"' in task
-    assert '"scan"' not in task.split('if (select_first_if_unavailable)', 1)[0]
+    assert "bridge_target_set_profile" not in task
+    assert '"manual-search"' not in task
+    assert "bridge_profiles_merge_scan_results(scan_ssid)" in task
+    assert "atomic_load(&s_bridge_selection_active)" in task
 
 
 def test_discovery_supports_legacy_and_generic_bridge_identity() -> None:
@@ -326,8 +352,9 @@ def test_serial_debug_command_uses_the_side_button_event_path() -> None:
     serial_task = serial_task.split("void app_main", 1)[0]
 
     assert "esp_rom_output_rx_one_char(&input)" in serial_task
-    assert "serial debug command: side button single click" in serial_task
-    assert "queue_event(VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT)" in serial_task
+    assert "serial debug command: side button full scan" in serial_task
+    assert "BRIDGE_SELECTION_ENTRY_WINDOW_MS" in serial_task
+    assert "queue_event(VIBE_STICK_EVENT_BRIDGE_SCAN_FULL)" in serial_task
 
 
 def test_recording_start_uses_descending_chirp_and_stop_uses_legacy_beep() -> None:
