@@ -50,9 +50,10 @@ M5_VOICE_BRIDGE_TOKEN=<desk-token>
 ```
 
 `GET /health` should return the configured `bridge_id` and requires the token
-when one is configured. A side-button single click scans the current `/24`
-subnet for bridge health endpoints, stores the discovered profiles in ESP NVS,
-and switches to the next reachable profile. Legacy bridges without
+when one is configured. A side-button single click first checks the NVS-backed
+known bridge list with a short health timeout and switches to the next reachable
+profile. It also starts one background `/24` discovery pass when a scan is not
+already running. Legacy bridges without
 `bridge_id`, and bridges still using the generic default ID, receive an
 IP-derived local identity so multiple instances remain distinguishable.
 Recording stays bound to the selected profile for the entire session.
@@ -63,9 +64,17 @@ or changes do not require another firmware build; press the side button to
 refresh the NVS-backed list.
 
 Discovery first performs a short TCP port probe across the subnet, then sends
-`GET /health` only to hosts that accept the bridge port. The search animation
-stays visible until the scan finishes. During this bounded scan, recording and
-other bridge operations wait so the selected target cannot change mid-session.
+`GET /health` only to hosts that accept the bridge port. Background discovery
+merges each newly found or changed profile into NVS as it is found, so another
+side-button click during the same scan can use the growing known list. Discovery
+does not automatically move away from the active target. If no target is
+currently available and the user explicitly starts discovery with the side
+button, the first discovered bridge can become the selected target. While
+recording or upload/finalization is active, side-button switching is ignored and
+any background discovery waits until recording network activity is done. When a
+known target is already available, the UI keeps using the quick switch feedback
+instead of a full-screen blocking search; persistent `SEARCHING` is reserved for
+the no-available-target case.
 
 ## State Endpoint
 

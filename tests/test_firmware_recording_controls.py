@@ -102,8 +102,14 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     bridge_probe = source.split("static bool bridge_probe_discovered", 1)[1]
     bridge_probe = bridge_probe.split("static bool bridge_probe_profile", 1)[0]
     discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
-    discovery = discovery.split("static void bridge_ensure_target", 1)[0]
-    cycle = source.split("static void cycle_bridge_profile", 1)[1]
+    discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
+    merge = source.split("static bool bridge_profiles_merge_profile", 1)[1]
+    merge = merge.split("static void bridge_discovery_task", 1)[0]
+    task = source.split("static void bridge_discovery_task", 1)[1]
+    task = task.split("static bool start_bridge_discovery_task", 1)[0]
+    start_task = source.split("static bool start_bridge_discovery_task", 1)[1]
+    start_task = start_task.split("static void bridge_ensure_target", 1)[0]
+    cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
     cycle = cycle.split("static esp_err_t bridge_prepare_active_target", 1)[0]
     bridge_load = source.split("static esp_err_t bridge_target_load_nvs", 1)[1]
     bridge_load = bridge_load.split("static esp_err_t bridge_target_save_nvs", 1)[0]
@@ -114,14 +120,143 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     assert "BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE" in discovery
     assert "select(max_socket + 1, NULL, &write_fds" in discovery
     assert "next_host_id = 254" in discovery
-    assert "bridge_profiles_save_nvs()" in discovery
+    assert "recording_network_busy()" in discovery
+    assert "bridge_profiles_save_nvs()" not in discovery
+    assert "bridge_profiles_merge_profile(&profile, scan_ssid)" in discovery
+    assert "bridge_profiles_save_nvs(scan_ssid)" in merge
+    assert "changed" in merge
+    assert "bridge_profiles_merge_scan_results" not in source
+    assert "bridge_target_set_profile" in task
+    assert '"manual-search"' in task
+    assert "bridge_discover_subnet_profiles()" in task
     assert '"SEARCHING"' in cycle
-    assert "show_persistent_mode_switch_visual" in cycle
-    assert "bridge_discover_subnet_profiles()" in cycle
+    assert "show_persistent_mode_switch_visual" in start_task
+    assert "select_from_search" in cycle
+    assert "start_bridge_discovery_task" in cycle
+    assert "bridge_discover_subnet_profiles()" not in cycle
     assert "BRIDGE_PROFILE_STORE_KEY" in source
     assert "nvs_get_blob(handle, BRIDGE_PROFILE_STORE_KEY" in source
     assert "nvs_set_blob(handle, BRIDGE_PROFILE_STORE_KEY" in source
     assert "bridge_profile_index_by_id(profile_id)" in bridge_load
+
+
+def test_side_button_fast_switch_uses_known_list_and_single_background_scan() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    start_task = source.split("static bool start_bridge_discovery_task", 1)[1]
+    start_task = start_task.split("static void bridge_ensure_target", 1)[0]
+    cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
+    cycle = cycle.split("static esp_err_t bridge_prepare_active_target", 1)[0]
+
+    assert "static atomic_bool s_bridge_discovery_active;" in source
+    assert "static TaskHandle_t s_bridge_discovery_task;" in source
+    assert "atomic_compare_exchange_strong(&s_bridge_discovery_active" in start_task
+    assert "bridge discovery already running" in start_task
+    assert "xTaskCreatePinnedToCore(bridge_discovery_task" in start_task
+    assert "BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS" in cycle
+    assert "BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS" in source
+    assert "bridge_profiles_reachable_ordered(" in cycle
+    assert "work->profiles, count, current_index, work->reachable" in cycle
+    assert "bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)" in cycle
+    assert "const bool background_started = start_bridge_discovery_task" in cycle
+    assert cycle.index("bridge_profiles_reachable_ordered") < cycle.index(
+        "bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)"
+    )
+    assert cycle.index(
+        "bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)"
+    ) < cycle.index("(void)start_bridge_discovery_task(false, false)")
+
+
+def test_bridge_profile_store_access_uses_lock_and_snapshots() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    snapshot_at = source.split("static bool bridge_profile_snapshot_at", 1)[1]
+    snapshot_at = snapshot_at.split("static bool bridge_target_profile_snapshot", 1)[0]
+    merge = source.split("static bool bridge_profiles_merge_profile", 1)[1]
+    merge = merge.split("static void bridge_discovery_task", 1)[0]
+    cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
+    cycle = cycle.split("static esp_err_t bridge_prepare_active_target", 1)[0]
+
+    assert "static SemaphoreHandle_t s_bridge_profiles_lock;" in source
+    assert "s_bridge_profiles_lock = xSemaphoreCreateMutex();" in source
+    assert "static void bridge_profiles_lock(void)" in source
+    assert "static void bridge_profiles_unlock(void)" in source
+    assert "bridge_profiles_lock();" in snapshot_at
+    assert "bridge_profiles_unlock();" in snapshot_at
+    assert "bridge_profile_snapshot_from_discovered" in snapshot_at
+    assert "bridge_profiles_lock();" in merge
+    assert "bridge_profile_views_rebuild();" in merge
+    assert "bridge_profiles_unlock();" in merge
+    assert merge.index("bridge_profiles_unlock();") < merge.index(
+        "bridge_profiles_save_nvs(scan_ssid)"
+    )
+    assert "bridge_profile_cycle_work_t *work = calloc(1, sizeof(*work));" in cycle
+    assert "bridge_profile_snapshot_at(index, &work->profiles[snapshot_count])" in cycle
+    assert "free(work);" in cycle
+
+
+def test_background_merge_keeps_active_target_and_wifi_identity_stable() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    target_lookup = source.split("static bool bridge_target_profile_snapshot", 1)[1]
+    target_lookup = target_lookup.split("static void bridge_profile_views_rebuild", 1)[0]
+    discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
+    discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
+    merge = source.split("static bool bridge_profiles_merge_profile", 1)[1]
+    merge = merge.split("static void bridge_discovery_task", 1)[0]
+
+    assert "strcmp(profile->id, target->profile_id) == 0" in target_lookup
+    assert "k_configured_bridge_profiles" in target_lookup
+    assert "target->profile_index" not in target_lookup
+    assert "current_wifi_ssid(scan_ssid" in discovery
+    assert "bridge_profiles_merge_profile(&profile, scan_ssid)" in discovery
+    assert "strcmp(current_ssid, scan_ssid) != 0" in merge
+    assert "bridge_profiles_save_nvs(scan_ssid)" in merge
+
+
+def test_rediscovered_bridge_address_refreshes_active_target() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    prepare = source.split("static esp_err_t bridge_prepare_active_target", 1)[1]
+    prepare = prepare.split("static esp_err_t http_request_timeout", 1)[0]
+
+    assert "bridge_profile_index_by_id(profile.id)" in prepare
+    assert "strcmp(current.host, profile.host) != 0" in prepare
+    assert "current.port != profile.port" in prepare
+    assert '"rediscovered", true' in prepare
+    assert "bridge_target_save_nvs()" in prepare
+    assert "bridge target refreshed id=%s host=%s port=%d" in prepare
+
+
+def test_background_scan_uses_atomic_recording_lifecycle_flags() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    busy = source.split("static bool recording_network_busy", 1)[1]
+    busy = busy.split("static agent_state_t", 1)[0]
+
+    assert "static atomic_bool s_recording_session_active;" in source
+    assert "static atomic_bool s_recording_upload_active;" in source
+    assert "atomic_load(&s_recording_session_active)" in busy
+    assert "atomic_load(&s_recording_upload_active)" in busy
+    assert "s_recording_session_id[0]" not in busy
+    assert "s_recording_upload_task" not in busy
+    assert "set_recording_session_active(true);" in source
+    assert "set_recording_session_active(false);" in source
+    assert "set_recording_upload_active(true);" in source
+    assert "set_recording_upload_active(false);" in source
+    assert "bridge_profile_at(" not in source
+    assert "bridge_target_profile(&" not in source
+
+
+def test_bridge_background_scan_pauses_for_recording_and_does_not_auto_switch_current_target() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
+    discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
+    task = source.split("static void bridge_discovery_task", 1)[1]
+    task = task.split("static bool start_bridge_discovery_task", 1)[0]
+
+    assert "while (recording_network_busy())" in discovery
+    assert "bridge discovery paused while recording network is busy" in discovery
+    assert "const bool select_first_if_unavailable = (uintptr_t)arg != 0;" in task
+    assert "if (select_first_if_unavailable)" in task
+    assert "if (!current.available &&" in task
+    assert '"manual-search"' in task
+    assert '"scan"' not in task.split('if (select_first_if_unavailable)', 1)[0]
 
 
 def test_discovery_supports_legacy_and_generic_bridge_identity() -> None:

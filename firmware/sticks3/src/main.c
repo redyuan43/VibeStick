@@ -129,6 +129,9 @@
 #define BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS 250
 #define BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE 6
 #define BRIDGE_DISCOVERY_HEALTH_TIMEOUT_MS 900
+#define BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS 450
+#define BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS 180
+#define BRIDGE_DISCOVERY_PAUSE_POLL_MS 250
 
 static const char *TAG = "vibe_stick";
 
@@ -179,6 +182,20 @@ typedef struct {
     int32_t port;
     char token[BRIDGE_TARGET_TOKEN_LEN];
 } bridge_discovered_profile_t;
+
+typedef struct {
+    char id[BRIDGE_TARGET_PROFILE_LEN];
+    char label[BRIDGE_TARGET_LABEL_LEN];
+    char host[BRIDGE_TARGET_HOST_LEN];
+    int port;
+    char token[BRIDGE_TARGET_TOKEN_LEN];
+} bridge_profile_snapshot_t;
+
+typedef struct {
+    bridge_profile_snapshot_t profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
+    size_t source_indices[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
+    size_t reachable[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
+} bridge_profile_cycle_work_t;
 
 typedef struct {
     uint32_t magic;
@@ -332,6 +349,7 @@ static size_t s_wifi_profile_count;
 static size_t s_wifi_profile_index;
 static int s_wifi_profile_retry_count;
 static SemaphoreHandle_t s_bridge_target_lock;
+static SemaphoreHandle_t s_bridge_profiles_lock;
 static bridge_discovered_profile_t
     s_discovered_bridge_profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
 static bridge_profile_config_t
@@ -341,6 +359,8 @@ static bridge_discovered_profile_t
 static size_t s_discovered_bridge_profile_count;
 static size_t s_bridge_scan_profile_count;
 static char s_bridge_profiles_loaded_ssid[WIFI_PROFILE_SSID_LEN];
+static TaskHandle_t s_bridge_discovery_task;
+static atomic_bool s_bridge_discovery_active;
 static bridge_target_t s_bridge_target = {
     .host = VIBE_STICK_BRIDGE_HOST,
     .port = VIBE_STICK_BRIDGE_PORT,
@@ -362,7 +382,9 @@ static char s_last_alert_event_id[56];
 static char s_last_alert_type[24];
 static bool s_alert_sound_baseline_ready;
 static char s_recording_session_id[40];
+static atomic_bool s_recording_session_active;
 static TaskHandle_t s_recording_upload_task;
+static atomic_bool s_recording_upload_active;
 static atomic_bool s_recording_upload_failed;
 static TaskHandle_t s_recording_finalize_task;
 static atomic_bool s_recording_finalize_active;
@@ -483,11 +505,21 @@ static void set_recording_finalize_active(bool active)
     atomic_store(&s_recording_finalize_active, active);
 }
 
+static void set_recording_session_active(bool active)
+{
+    atomic_store(&s_recording_session_active, active);
+}
+
+static void set_recording_upload_active(bool active)
+{
+    atomic_store(&s_recording_upload_active, active);
+}
+
 static bool recording_network_busy(void)
 {
     return vibe_audio_is_recording() ||
-           s_recording_session_id[0] != '\0' ||
-           s_recording_upload_task != NULL ||
+           atomic_load(&s_recording_session_active) ||
+           atomic_load(&s_recording_upload_active) ||
            recording_finalize_active();
 }
 
@@ -576,8 +608,13 @@ static void render_state(void);
 static void copy_json_string(cJSON *root, const char *key, char *target, size_t target_len);
 static void register_activity(void);
 static void cycle_bridge_profile(void);
+static bool start_bridge_discovery_task(bool select_first_if_unavailable,
+                                        bool show_searching);
 static void bridge_target_copy(bridge_target_t *target);
-static const bridge_profile_config_t *bridge_target_profile(const bridge_target_t *target);
+static bool bridge_target_profile_snapshot(const bridge_target_t *target,
+                                           bridge_profile_snapshot_t *snapshot);
+static bool bridge_profiles_merge_profile(const bridge_discovered_profile_t *profile,
+                                          const char *scan_ssid);
 static bool front_button_is_pressed(void);
 static void poll_front_button_fallback(int64_t now_ms);
 static void update_power_saving(int64_t now_ms);
@@ -2024,10 +2061,13 @@ static void render_state(void)
                                 0);
     bridge_target_t target;
     bridge_target_copy(&target);
-    const bridge_profile_config_t *bridge_profile = bridge_target_profile(&target);
+    bridge_profile_snapshot_t bridge_profile;
+    bool bridge_profile_valid = bridge_target_profile_snapshot(&target, &bridge_profile);
     char bridge_text[40];
-    snprintf(bridge_text, sizeof(bridge_text), "B %s",
-             bridge_profile && bridge_profile->label ? bridge_profile->label : "Unassigned");
+    snprintf(bridge_text, sizeof(bridge_text), "B %.37s",
+             bridge_profile_valid && bridge_profile.label[0] != '\0'
+                 ? bridge_profile.label
+                 : "Unassigned");
     lv_label_set_text(s_bridge_label, bridge_text);
     lv_obj_set_style_text_color(s_bridge_label,
                                 target.available ? lv_color_hex(0x8a9099) : lv_color_hex(0xc98484),
@@ -2248,22 +2288,128 @@ static void bridge_target_copy(bridge_target_t *target)
     }
 }
 
+static void bridge_profiles_lock(void)
+{
+    if (s_bridge_profiles_lock) {
+        xSemaphoreTake(s_bridge_profiles_lock, portMAX_DELAY);
+    }
+}
+
+static void bridge_profiles_unlock(void)
+{
+    if (s_bridge_profiles_lock) {
+        xSemaphoreGive(s_bridge_profiles_lock);
+    }
+}
+
+static void bridge_profile_snapshot_from_config(const bridge_profile_config_t *profile,
+                                                bridge_profile_snapshot_t *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (!profile) {
+        return;
+    }
+    strlcpy(snapshot->id, profile->id ? profile->id : "", sizeof(snapshot->id));
+    strlcpy(snapshot->label, profile->label ? profile->label : "", sizeof(snapshot->label));
+    strlcpy(snapshot->host, profile->host ? profile->host : "", sizeof(snapshot->host));
+    snapshot->port = profile->port;
+    strlcpy(snapshot->token, profile->token ? profile->token : "", sizeof(snapshot->token));
+}
+
+static void bridge_profile_snapshot_from_discovered(const bridge_discovered_profile_t *profile,
+                                                    bridge_profile_snapshot_t *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (!profile) {
+        return;
+    }
+    strlcpy(snapshot->id, profile->id, sizeof(snapshot->id));
+    strlcpy(snapshot->label, profile->label, sizeof(snapshot->label));
+    strlcpy(snapshot->host, profile->host, sizeof(snapshot->host));
+    snapshot->port = (int)profile->port;
+    strlcpy(snapshot->token, profile->token, sizeof(snapshot->token));
+}
+
+static void bridge_profile_snapshot_view(const bridge_profile_snapshot_t *snapshot,
+                                         bridge_profile_config_t *view)
+{
+    *view = (bridge_profile_config_t){
+        .id = snapshot->id,
+        .label = snapshot->label,
+        .host = snapshot->host,
+        .port = snapshot->port,
+        .token = snapshot->token,
+    };
+}
+
 static size_t bridge_profile_count(void)
 {
-    if (s_discovered_bridge_profile_count > 0) {
-        return s_discovered_bridge_profile_count;
+    bridge_profiles_lock();
+    size_t count = s_discovered_bridge_profile_count;
+    bridge_profiles_unlock();
+    if (count > 0) {
+        return count;
     }
     return sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]);
 }
 
-static const bridge_profile_config_t *bridge_profile_at(size_t index)
+static bool bridge_profile_snapshot_at(size_t index, bridge_profile_snapshot_t *snapshot)
 {
-    if (s_discovered_bridge_profile_count > 0) {
-        return index < s_discovered_bridge_profile_count
-                   ? &s_discovered_bridge_profile_views[index]
-                   : NULL;
+    if (!snapshot) {
+        return false;
     }
-    return index < bridge_profile_count() ? &k_configured_bridge_profiles[index] : NULL;
+    bridge_profiles_lock();
+    size_t discovered_count = s_discovered_bridge_profile_count;
+    if (discovered_count > 0) {
+        if (index >= discovered_count) {
+            bridge_profiles_unlock();
+            return false;
+        }
+        bridge_profile_snapshot_from_discovered(&s_discovered_bridge_profiles[index],
+                                                snapshot);
+        bridge_profiles_unlock();
+        return true;
+    }
+    bridge_profiles_unlock();
+
+    size_t configured_count =
+        sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]);
+    if (index >= configured_count) {
+        return false;
+    }
+    bridge_profile_snapshot_from_config(&k_configured_bridge_profiles[index], snapshot);
+    return true;
+}
+
+static bool bridge_target_profile_snapshot(const bridge_target_t *target,
+                                           bridge_profile_snapshot_t *snapshot)
+{
+    if (!target || !snapshot || target->profile_id[0] == '\0') {
+        return false;
+    }
+
+    bridge_profiles_lock();
+    for (size_t index = 0; index < s_discovered_bridge_profile_count; index++) {
+        const bridge_discovered_profile_t *profile =
+            &s_discovered_bridge_profiles[index];
+        if (strcmp(profile->id, target->profile_id) == 0) {
+            bridge_profile_snapshot_from_discovered(profile, snapshot);
+            bridge_profiles_unlock();
+            return true;
+        }
+    }
+    bridge_profiles_unlock();
+
+    size_t configured_count =
+        sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]);
+    for (size_t index = 0; index < configured_count; index++) {
+        const bridge_profile_config_t *profile = &k_configured_bridge_profiles[index];
+        if (profile->id && strcmp(profile->id, target->profile_id) == 0) {
+            bridge_profile_snapshot_from_config(profile, snapshot);
+            return true;
+        }
+    }
+    return false;
 }
 
 static void bridge_profile_views_rebuild(void)
@@ -2282,9 +2428,11 @@ static void bridge_profile_views_rebuild(void)
 
 static void bridge_profiles_clear(void)
 {
+    bridge_profiles_lock();
     memset(s_discovered_bridge_profiles, 0, sizeof(s_discovered_bridge_profiles));
     memset(s_discovered_bridge_profile_views, 0, sizeof(s_discovered_bridge_profile_views));
     s_discovered_bridge_profile_count = 0;
+    bridge_profiles_unlock();
 }
 
 static esp_err_t bridge_profiles_load_nvs(const char *current_ssid)
@@ -2321,24 +2469,25 @@ static esp_err_t bridge_profiles_load_nvs(const char *current_ssid)
         return ESP_ERR_INVALID_VERSION;
     }
 
+    uint16_t restored_count = store->count;
+    bridge_profiles_lock();
     memcpy(s_discovered_bridge_profiles, store->profiles,
            store->count * sizeof(store->profiles[0]));
     s_discovered_bridge_profile_count = store->count;
-    free(store);
     bridge_profile_views_rebuild();
+    bridge_profiles_unlock();
+    free(store);
     ESP_LOGI(TAG, "bridge profiles restored ssid=%s count=%u",
-             current_ssid, (unsigned int)s_discovered_bridge_profile_count);
+             current_ssid, (unsigned int)restored_count);
     return ESP_OK;
 }
 
-static esp_err_t bridge_profiles_save_nvs(void)
+static esp_err_t bridge_profiles_save_nvs(const char *expected_ssid)
 {
-    if (s_discovered_bridge_profile_count == 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
     char current_ssid[WIFI_PROFILE_SSID_LEN] = {0};
     current_wifi_ssid(current_ssid, sizeof(current_ssid));
-    if (current_ssid[0] == '\0') {
+    if (current_ssid[0] == '\0' ||
+        !expected_ssid || strcmp(current_ssid, expected_ssid) != 0) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2348,10 +2497,17 @@ static esp_err_t bridge_profiles_save_nvs(void)
     }
     store->magic = BRIDGE_PROFILE_STORE_MAGIC;
     store->version = BRIDGE_PROFILE_STORE_VERSION;
+    bridge_profiles_lock();
+    if (s_discovered_bridge_profile_count == 0) {
+        bridge_profiles_unlock();
+        free(store);
+        return ESP_ERR_INVALID_STATE;
+    }
     store->count = (uint16_t)s_discovered_bridge_profile_count;
     strlcpy(store->ssid, current_ssid, sizeof(store->ssid));
     memcpy(store->profiles, s_discovered_bridge_profiles,
            s_discovered_bridge_profile_count * sizeof(store->profiles[0]));
+    bridge_profiles_unlock();
 
     nvs_handle_t handle;
     esp_err_t err = nvs_open(BRIDGE_TARGET_NAMESPACE, NVS_READWRITE, &handle);
@@ -2364,11 +2520,12 @@ static esp_err_t bridge_profiles_save_nvs(void)
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
+    uint16_t saved_count = store->count;
     nvs_close(handle);
     free(store);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "bridge profiles saved ssid=%s count=%u",
-                 current_ssid, (unsigned int)s_discovered_bridge_profile_count);
+                 current_ssid, (unsigned int)saved_count);
     }
     return err;
 }
@@ -2378,32 +2535,22 @@ static int bridge_profile_index_by_id(const char *id)
     if (!id || id[0] == '\0') {
         return -1;
     }
-    for (size_t index = 0; index < bridge_profile_count(); index++) {
-        const bridge_profile_config_t *profile = bridge_profile_at(index);
-        if (profile && profile->id && strcmp(profile->id, id) == 0) {
+    size_t count = bridge_profile_count();
+    for (size_t index = 0; index < count; index++) {
+        bridge_profile_snapshot_t profile;
+        if (bridge_profile_snapshot_at(index, &profile) &&
+            strcmp(profile.id, id) == 0) {
             return (int)index;
         }
     }
     return -1;
 }
 
-static const bridge_profile_config_t *bridge_target_profile(const bridge_target_t *target)
-{
-    if (!target) {
-        return NULL;
-    }
-    const bridge_profile_config_t *profile = bridge_profile_at(target->profile_index);
-    if (!profile || !profile->id || strcmp(profile->id, target->profile_id) != 0) {
-        return NULL;
-    }
-    return profile;
-}
-
 static bool bridge_target_set_profile(size_t profile_index, const char *source, bool available)
 {
-    const bridge_profile_config_t *profile = bridge_profile_at(profile_index);
-    if (!profile || !profile->id || !profile->host || profile->id[0] == '\0' ||
-        profile->host[0] == '\0' || profile->port <= 0) {
+    bridge_profile_snapshot_t profile;
+    if (!bridge_profile_snapshot_at(profile_index, &profile) ||
+        profile.id[0] == '\0' || profile.host[0] == '\0' || profile.port <= 0) {
         return false;
     }
     char ssid[WIFI_PROFILE_SSID_LEN] = {0};
@@ -2411,10 +2558,10 @@ static bool bridge_target_set_profile(size_t profile_index, const char *source, 
     if (s_bridge_target_lock) {
         xSemaphoreTake(s_bridge_target_lock, portMAX_DELAY);
     }
-    strlcpy(s_bridge_target.host, profile->host, sizeof(s_bridge_target.host));
-    s_bridge_target.port = profile->port;
+    strlcpy(s_bridge_target.host, profile.host, sizeof(s_bridge_target.host));
+    s_bridge_target.port = profile.port;
     s_bridge_target.profile_index = profile_index;
-    strlcpy(s_bridge_target.profile_id, profile->id, sizeof(s_bridge_target.profile_id));
+    strlcpy(s_bridge_target.profile_id, profile.id, sizeof(s_bridge_target.profile_id));
     strlcpy(s_bridge_target.source, source ? source : "runtime",
             sizeof(s_bridge_target.source));
     strlcpy(s_bridge_target.ssid, ssid, sizeof(s_bridge_target.ssid));
@@ -2446,9 +2593,10 @@ static void bridge_target_note_result(esp_err_t err)
 static bool bridge_target_needs_selection(void)
 {
     bridge_target_t target;
+    bridge_profile_snapshot_t profile;
     bridge_target_copy(&target);
     return target.host[0] == '\0' || target.port <= 0 ||
-           bridge_target_profile(&target) == NULL;
+           !bridge_target_profile_snapshot(&target, &profile);
 }
 
 static esp_err_t bridge_target_load_nvs(void)
@@ -2739,6 +2887,11 @@ static bool bridge_scan_add(const bridge_discovered_profile_t *profile)
 
 static size_t bridge_discover_subnet_profiles(void)
 {
+    char scan_ssid[WIFI_PROFILE_SSID_LEN] = {0};
+    current_wifi_ssid(scan_ssid, sizeof(scan_ssid));
+    if (scan_ssid[0] == '\0') {
+        return 0;
+    }
     unsigned int a = 0;
     unsigned int b = 0;
     unsigned int c = 0;
@@ -2755,6 +2908,14 @@ static size_t bridge_discover_subnet_profiles(void)
     int next_host_id = 254;
     while (next_host_id >= 1 &&
            s_bridge_scan_profile_count < VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT) {
+        bool logged_pause = false;
+        while (recording_network_busy()) {
+            if (!logged_pause) {
+                ESP_LOGI(TAG, "bridge discovery paused while recording network is busy");
+                logged_pause = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(BRIDGE_DISCOVERY_PAUSE_POLL_MS));
+        }
         int sockets[BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE];
         int host_ids[BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE];
         bool connected[BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE] = {0};
@@ -2827,6 +2988,13 @@ static size_t bridge_discover_subnet_profiles(void)
             char host[BRIDGE_TARGET_HOST_LEN] = {0};
             snprintf(host, sizeof(host), "%u.%u.%u.%d",
                      a, b, c, host_ids[index]);
+            while (recording_network_busy()) {
+                if (!logged_pause) {
+                    ESP_LOGI(TAG, "bridge discovery paused while recording network is busy");
+                    logged_pause = true;
+                }
+                vTaskDelay(pdMS_TO_TICKS(BRIDGE_DISCOVERY_PAUSE_POLL_MS));
+            }
             bridge_discovered_profile_t profile = {0};
             if (!bridge_probe_discovered(host, VIBE_STICK_BRIDGE_PORT, &profile)) {
                 continue;
@@ -2834,6 +3002,7 @@ static size_t bridge_discover_subnet_profiles(void)
             if (bridge_scan_add(&profile)) {
                 ESP_LOGI(TAG, "bridge discovered id=%s label=%s host=%s port=%ld",
                          profile.id, profile.label, profile.host, (long)profile.port);
+                (void)bridge_profiles_merge_profile(&profile, scan_ssid);
             }
         }
     }
@@ -2843,15 +3012,160 @@ static size_t bridge_discover_subnet_profiles(void)
         return 0;
     }
 
-    bridge_profiles_clear();
-    memcpy(s_discovered_bridge_profiles, s_bridge_scan_profiles,
-           s_bridge_scan_profile_count * sizeof(s_bridge_scan_profiles[0]));
-    s_discovered_bridge_profile_count = s_bridge_scan_profile_count;
-    bridge_profile_views_rebuild();
-    (void)bridge_profiles_save_nvs();
     ESP_LOGI(TAG, "bridge discovery complete count=%u",
-             (unsigned int)s_discovered_bridge_profile_count);
-    return s_discovered_bridge_profile_count;
+             (unsigned int)s_bridge_scan_profile_count);
+    return s_bridge_scan_profile_count;
+}
+
+static bool bridge_discovered_profile_equal(const bridge_discovered_profile_t *a,
+                                            const bridge_discovered_profile_t *b)
+{
+    return a && b &&
+           strcmp(a->id, b->id) == 0 &&
+           strcmp(a->label, b->label) == 0 &&
+           strcmp(a->host, b->host) == 0 &&
+           a->port == b->port &&
+           strcmp(a->token, b->token) == 0;
+}
+
+static int bridge_discovered_profile_find_locked(const bridge_discovered_profile_t *profile)
+{
+    if (!profile || profile->id[0] == '\0') {
+        return -1;
+    }
+    for (size_t index = 0; index < s_discovered_bridge_profile_count; index++) {
+        bridge_discovered_profile_t *stored = &s_discovered_bridge_profiles[index];
+        if ((stored->id[0] != '\0' && strcmp(stored->id, profile->id) == 0) ||
+            (strcmp(stored->host, profile->host) == 0 &&
+             stored->port == profile->port)) {
+            return (int)index;
+        }
+    }
+    return -1;
+}
+
+static bool bridge_profiles_merge_profile(const bridge_discovered_profile_t *profile,
+                                          const char *scan_ssid)
+{
+    char current_ssid[WIFI_PROFILE_SSID_LEN] = {0};
+    current_wifi_ssid(current_ssid, sizeof(current_ssid));
+    if (!profile || profile->id[0] == '\0' ||
+        !scan_ssid || scan_ssid[0] == '\0' ||
+        strcmp(current_ssid, scan_ssid) != 0) {
+        return false;
+    }
+    bool changed = false;
+    bridge_profiles_lock();
+    int existing = bridge_discovered_profile_find_locked(profile);
+    if (existing >= 0) {
+        bridge_discovered_profile_t *stored =
+            &s_discovered_bridge_profiles[(size_t)existing];
+        if (!bridge_discovered_profile_equal(stored, profile)) {
+            *stored = *profile;
+            changed = true;
+        }
+    } else {
+        if (s_discovered_bridge_profile_count >= VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT) {
+            ESP_LOGW(TAG, "bridge profile store full; skipping id=%s host=%s",
+                     profile->id, profile->host);
+        } else {
+            s_discovered_bridge_profiles[s_discovered_bridge_profile_count++] = *profile;
+            changed = true;
+        }
+    }
+    if (changed) {
+        bridge_profile_views_rebuild();
+    }
+    bridge_profiles_unlock();
+
+    if (!changed) {
+        return false;
+    }
+    esp_err_t err = bridge_profiles_save_nvs(scan_ssid);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "bridge profile NVS save skipped/failed: %s",
+                 esp_err_to_name(err));
+    }
+    return true;
+}
+
+static void bridge_discovery_task(void *arg)
+{
+    const bool select_first_if_unavailable = (uintptr_t)arg != 0;
+    size_t count = bridge_discover_subnet_profiles();
+    if (count > 0) {
+        render_state();
+        if (select_first_if_unavailable) {
+            bridge_target_t current;
+            bridge_target_copy(&current);
+            if (!current.available &&
+                s_bridge_scan_profiles[0].id[0] != '\0') {
+                int profile_index =
+                    bridge_profile_index_by_id(s_bridge_scan_profiles[0].id);
+                if (profile_index >= 0 &&
+                    bridge_target_set_profile((size_t)profile_index,
+                                              "manual-search", true)) {
+                    (void)bridge_target_save_nvs();
+                    ESP_LOGI(TAG, "bridge profile selected from manual search id=%s host=%s",
+                             s_bridge_scan_profiles[0].id,
+                             s_bridge_scan_profiles[0].host);
+                    render_state();
+                    show_mode_switch_visual(s_bridge_scan_profiles[0].label[0] != '\0'
+                                                ? s_bridge_scan_profiles[0].label
+                                                : s_bridge_scan_profiles[0].id,
+                                            "BRIDGE READY",
+                                            s_mode_switch_dict_frames,
+                                            sizeof(s_mode_switch_dict_frames) /
+                                                sizeof(s_mode_switch_dict_frames[0]),
+                                            lv_color_hex(0x86efac));
+                }
+            }
+        }
+    } else if (select_first_if_unavailable) {
+        show_mode_switch_visual("NO BRIDGE",
+                                "SIDE 1X RETRY",
+                                s_mode_switch_dict_frames,
+                                sizeof(s_mode_switch_dict_frames) /
+                                    sizeof(s_mode_switch_dict_frames[0]),
+                                lv_color_hex(0xfca5a5));
+    }
+    atomic_store(&s_bridge_discovery_active, false);
+    s_bridge_discovery_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static bool start_bridge_discovery_task(bool select_first_if_unavailable,
+                                        bool show_searching)
+{
+    if (!wifi_connected()) {
+        return false;
+    }
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_bridge_discovery_active,
+                                        &expected, true)) {
+        ESP_LOGI(TAG, "bridge discovery already running");
+        return false;
+    }
+    if (show_searching) {
+        show_persistent_mode_switch_visual("SEARCHING",
+                                           "LAN BRIDGES",
+                                           s_mode_switch_dict_frames,
+                                           sizeof(s_mode_switch_dict_frames) /
+                                               sizeof(s_mode_switch_dict_frames[0]),
+                                           lv_color_hex(0x93c5fd));
+    }
+    BaseType_t ok =
+        xTaskCreatePinnedToCore(bridge_discovery_task, "bridge_scan", 8192,
+                                (void *)(uintptr_t)(select_first_if_unavailable ? 1 : 0),
+                                3, &s_bridge_discovery_task,
+                                VIBE_STICK_NETWORK_CORE);
+    if (ok != pdPASS) {
+        atomic_store(&s_bridge_discovery_active, false);
+        s_bridge_discovery_task = NULL;
+        ESP_LOGW(TAG, "bridge discovery task create failed");
+        return false;
+    }
+    return true;
 }
 
 static void bridge_ensure_target(void)
@@ -2876,6 +3190,100 @@ static void bridge_ensure_target(void)
     }
 }
 
+static bool bridge_profile_tcp_connect_start(const bridge_profile_snapshot_t *profile,
+                                             int *sock_out)
+{
+    *sock_out = -1;
+    if (!profile || profile->host[0] == '\0' || profile->port <= 0) {
+        return false;
+    }
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (sock < 0) {
+        return false;
+    }
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(sock);
+        return false;
+    }
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons((uint16_t)profile->port),
+    };
+    if (inet_pton(AF_INET, profile->host, &address.sin_addr) != 1) {
+        close(sock);
+        return false;
+    }
+    int result = connect(sock, (struct sockaddr *)&address, sizeof(address));
+    if (result < 0 && errno != EINPROGRESS) {
+        close(sock);
+        return false;
+    }
+    *sock_out = sock;
+    return result == 0;
+}
+
+static size_t bridge_profiles_reachable_ordered(
+    const bridge_profile_snapshot_t *profiles,
+    size_t count,
+    int current_index,
+    size_t *reachable,
+    size_t reachable_cap)
+{
+    int sockets[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
+    size_t profile_indices[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
+    bool connected[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT] = {0};
+    size_t socket_count = 0;
+    int max_socket = -1;
+    fd_set write_fds;
+    FD_ZERO(&write_fds);
+
+    for (size_t offset = 1; offset <= count; offset++) {
+        size_t index = (size_t)((current_index + (int)offset) % (int)count);
+        int sock = -1;
+        bool immediately_connected =
+            bridge_profile_tcp_connect_start(&profiles[index], &sock);
+        if (sock < 0) {
+            continue;
+        }
+        sockets[socket_count] = sock;
+        profile_indices[socket_count] = index;
+        connected[socket_count] = immediately_connected;
+        FD_SET(sock, &write_fds);
+        if (sock > max_socket) {
+            max_socket = sock;
+        }
+        socket_count++;
+    }
+
+    struct timeval timeout = {
+        .tv_sec = BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS / 1000,
+        .tv_usec = (BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS % 1000) * 1000,
+    };
+    int ready = socket_count > 0
+                    ? select(max_socket + 1, NULL, &write_fds, NULL, &timeout)
+                    : 0;
+    size_t reachable_count = 0;
+    for (size_t socket_index = 0; socket_index < socket_count; socket_index++) {
+        bool port_open = connected[socket_index];
+        if (!port_open && ready > 0 && FD_ISSET(sockets[socket_index], &write_fds)) {
+            int socket_error = 0;
+            socklen_t error_len = sizeof(socket_error);
+            port_open =
+                getsockopt(sockets[socket_index], SOL_SOCKET, SO_ERROR,
+                           &socket_error, &error_len) == 0 &&
+                socket_error == 0;
+        }
+        close(sockets[socket_index]);
+        if (port_open && reachable_count < reachable_cap) {
+            reachable[reachable_count++] = profile_indices[socket_index];
+        }
+    }
+    ESP_LOGI(TAG, "bridge quick tcp reachable=%u/%u",
+             (unsigned)reachable_count, (unsigned)count);
+    return reachable_count;
+}
+
 static void cycle_bridge_profile(void)
 {
     if (recording_network_busy()) {
@@ -2885,61 +3293,84 @@ static void cycle_bridge_profile(void)
     bridge_ensure_target();
     bridge_target_t current;
     bridge_target_copy(&current);
-    show_persistent_mode_switch_visual("SEARCHING",
-                                       "LAN BRIDGES",
-                                       s_mode_switch_dict_frames,
-                                       sizeof(s_mode_switch_dict_frames) /
-                                           sizeof(s_mode_switch_dict_frames[0]),
-                                       lv_color_hex(0x93c5fd));
-    if (bridge_discover_subnet_profiles() == 0) {
-        show_mode_switch_visual("NO BRIDGE",
-                                "SIDE 1X RETRY",
-                                s_mode_switch_dict_frames,
-                                sizeof(s_mode_switch_dict_frames) /
-                                    sizeof(s_mode_switch_dict_frames[0]),
-                                lv_color_hex(0xfca5a5));
+
+    bridge_profile_cycle_work_t *work = calloc(1, sizeof(*work));
+    if (!work) {
+        ESP_LOGW(TAG, "bridge quick switch workspace allocation failed");
+        (void)start_bridge_discovery_task(!current.available, !current.available);
         return;
     }
-
     size_t count = bridge_profile_count();
+    size_t snapshot_count = 0;
     int current_index = -1;
     for (size_t index = 0; index < count; index++) {
-        const bridge_profile_config_t *profile = bridge_profile_at(index);
-        if (profile &&
-            (strcmp(profile->id, current.profile_id) == 0 ||
-             strcmp(profile->host, current.host) == 0)) {
-            current_index = (int)index;
-            break;
-        }
-    }
-    for (size_t offset = 1; offset <= count; offset++) {
-        size_t index = (size_t)((current_index + (int)offset) % (int)count);
-        const bridge_profile_config_t *profile = bridge_profile_at(index);
-        if (!bridge_probe_profile(profile, 1200)) {
+        if (!bridge_profile_snapshot_at(index, &work->profiles[snapshot_count])) {
             continue;
         }
-        if (!bridge_target_set_profile(index, "manual", true)) {
+        work->source_indices[snapshot_count] = index;
+        if (strcmp(work->profiles[snapshot_count].id, current.profile_id) == 0 ||
+            strcmp(work->profiles[snapshot_count].host, current.host) == 0) {
+            current_index = (int)snapshot_count;
+        }
+        snapshot_count++;
+    }
+    if (snapshot_count == 0) {
+        count = 0;
+    } else {
+        count = snapshot_count;
+    }
+    size_t reachable_count =
+        bridge_profiles_reachable_ordered(
+            work->profiles, count, current_index, work->reachable,
+            sizeof(work->reachable) / sizeof(work->reachable[0]));
+    for (size_t offset = 0; offset < reachable_count; offset++) {
+        size_t index = work->reachable[offset];
+        bridge_profile_config_t profile_view;
+        bridge_profile_snapshot_view(&work->profiles[index], &profile_view);
+        if (!bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)) {
+            continue;
+        }
+        if (!bridge_target_set_profile(work->source_indices[index], "manual", true)) {
             continue;
         }
         (void)bridge_target_save_nvs();
         ESP_LOGI(TAG, "bridge profile selected id=%s host=%s port=%d",
-                 profile->id, profile->host, profile->port);
+                 work->profiles[index].id, work->profiles[index].host,
+                 work->profiles[index].port);
         render_state();
-        show_mode_switch_visual(profile->label ? profile->label : profile->id,
+        show_mode_switch_visual(work->profiles[index].label[0] != '\0'
+                                    ? work->profiles[index].label
+                                    : work->profiles[index].id,
                                 "BRIDGE READY",
                                 s_mode_switch_dict_frames,
                                 sizeof(s_mode_switch_dict_frames) /
                                     sizeof(s_mode_switch_dict_frames[0]),
                                 lv_color_hex(0x86efac));
+        free(work);
+        (void)start_bridge_discovery_task(false, false);
         return;
     }
-    ESP_LOGW(TAG, "no configured bridge profile is reachable");
-    show_mode_switch_visual("NO BRIDGE",
-                            "SIDE 1X RETRY",
-                            s_mode_switch_dict_frames,
-                            sizeof(s_mode_switch_dict_frames) /
-                                sizeof(s_mode_switch_dict_frames[0]),
-                            lv_color_hex(0xfca5a5));
+    free(work);
+    const bool select_from_search = !current.available;
+    const bool background_started = start_bridge_discovery_task(select_from_search,
+                                                                select_from_search);
+    ESP_LOGW(TAG, "no known bridge profile is reachable scan_started=%d",
+             background_started ? 1 : 0);
+    if (!select_from_search) {
+        show_mode_switch_visual(background_started ? "SCAN STARTED" : "NO BRIDGE",
+                                background_started ? "KNOWN UNCHANGED" : "SIDE 1X RETRY",
+                                s_mode_switch_dict_frames,
+                                sizeof(s_mode_switch_dict_frames) /
+                                    sizeof(s_mode_switch_dict_frames[0]),
+                                lv_color_hex(background_started ? 0x93c5fd : 0xfca5a5));
+    } else if (!background_started) {
+        show_mode_switch_visual("SEARCHING",
+                                "ALREADY RUNNING",
+                                s_mode_switch_dict_frames,
+                                sizeof(s_mode_switch_dict_frames) /
+                                    sizeof(s_mode_switch_dict_frames[0]),
+                                lv_color_hex(0x93c5fd));
+    }
 }
 
 static esp_err_t bridge_prepare_active_target(bridge_target_t *target)
@@ -2947,16 +3378,31 @@ static esp_err_t bridge_prepare_active_target(bridge_target_t *target)
     bridge_ensure_target();
     bridge_target_t current;
     bridge_target_copy(&current);
-    const bridge_profile_config_t *profile = bridge_target_profile(&current);
-    if (!profile) {
+    bridge_profile_snapshot_t profile;
+    bridge_profile_config_t profile_view;
+    if (!bridge_target_profile_snapshot(&current, &profile)) {
         return ESP_ERR_NOT_FOUND;
     }
+    bridge_profile_snapshot_view(&profile, &profile_view);
     if (!current.available) {
-        if (!bridge_probe_profile(profile, 1200)) {
+        if (!bridge_probe_profile(&profile_view, 1200)) {
             bridge_target_note_result(ESP_FAIL);
             return ESP_ERR_NOT_FOUND;
         }
-        bridge_target_note_result(ESP_OK);
+        int refreshed_index = bridge_profile_index_by_id(profile.id);
+        if (refreshed_index >= 0 &&
+            (strcmp(current.host, profile.host) != 0 ||
+             current.port != profile.port)) {
+            if (!bridge_target_set_profile((size_t)refreshed_index,
+                                           "rediscovered", true)) {
+                return ESP_ERR_NOT_FOUND;
+            }
+            (void)bridge_target_save_nvs();
+            ESP_LOGI(TAG, "bridge target refreshed id=%s host=%s port=%d",
+                     profile.id, profile.host, profile.port);
+        } else {
+            bridge_target_note_result(ESP_OK);
+        }
         bridge_target_copy(&current);
     }
     if (target) {
@@ -2970,8 +3416,10 @@ static esp_err_t http_request_timeout(const char *method, const char *path, cons
 {
     bridge_target_t target;
     ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG, "prepare bridge target");
-    const bridge_profile_config_t *profile = bridge_target_profile(&target);
-    const char *token = profile ? profile->token : VIBE_STICK_BRIDGE_TOKEN;
+    bridge_profile_snapshot_t profile;
+    const char *token = bridge_target_profile_snapshot(&target, &profile)
+                            ? profile.token
+                            : VIBE_STICK_BRIDGE_TOKEN;
     esp_err_t err = http_request_target(method, target.host, target.port, token, path, body,
                                         response, response_len, timeout_ms);
     bridge_target_note_result(err);
@@ -3010,8 +3458,11 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "http init");
     esp_http_client_set_method(client, HTTP_METHOD_POST);
-    const bridge_profile_config_t *profile = bridge_target_profile(&target);
-    set_common_http_headers(client, profile ? profile->token : VIBE_STICK_BRIDGE_TOKEN);
+    bridge_profile_snapshot_t profile;
+    set_common_http_headers(client,
+                            bridge_target_profile_snapshot(&target, &profile)
+                                ? profile.token
+                                : VIBE_STICK_BRIDGE_TOKEN);
     esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
     esp_http_client_set_header(client, "X-Vibe-Stick-Sample-Rate", "16000");
     esp_http_client_set_header(client, "X-Vibe-Stick-Channels", "1");
@@ -3104,8 +3555,11 @@ static esp_err_t download_tts_audio(uint8_t **audio, size_t *audio_len)
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "tts http init");
-    const bridge_profile_config_t *profile = bridge_target_profile(&target);
-    set_common_http_headers(client, profile ? profile->token : VIBE_STICK_BRIDGE_TOKEN);
+    bridge_profile_snapshot_t profile;
+    set_common_http_headers(client,
+                            bridge_target_profile_snapshot(&target, &profile)
+                                ? profile.token
+                                : VIBE_STICK_BRIDGE_TOKEN);
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
@@ -3324,8 +3778,11 @@ static esp_err_t perform_ota_update(const ota_manifest_t *manifest)
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "OTA http init");
-    const bridge_profile_config_t *profile = bridge_target_profile(&target);
-    set_common_http_headers(client, profile ? profile->token : VIBE_STICK_BRIDGE_TOKEN);
+    bridge_profile_snapshot_t profile;
+    set_common_http_headers(client,
+                            bridge_target_profile_snapshot(&target, &profile)
+                                ? profile.token
+                                : VIBE_STICK_BRIDGE_TOKEN);
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
@@ -4060,6 +4517,7 @@ static void recording_upload_task(void *arg)
     if (!buffer) {
         ESP_LOGW(TAG, "recording upload buffer allocation failed");
         set_recording_upload_failed(true);
+        set_recording_upload_active(false);
         s_recording_upload_task = NULL;
         vTaskDelete(NULL);
         return;
@@ -4102,6 +4560,7 @@ static void recording_upload_task(void *arg)
              (unsigned)s_recording_upload_stats.uploaded_bytes,
              (unsigned)s_recording_upload_stats.upload_failures,
              recording_upload_failed());
+    set_recording_upload_active(false);
     s_recording_upload_task = NULL;
     vTaskDelete(NULL);
 }
@@ -4109,6 +4568,7 @@ static void recording_upload_task(void *arg)
 static bool start_recording_upload_task(void)
 {
     set_recording_upload_failed(false);
+    set_recording_upload_active(true);
     reset_recording_upload_stats();
     s_recording_upload_task = NULL;
     BaseType_t ok = xTaskCreatePinnedToCore(recording_upload_task, "recording_upload", 6144,
@@ -4116,6 +4576,7 @@ static bool start_recording_upload_task(void)
                                             VIBE_STICK_NETWORK_CORE);
     if (ok != pdPASS) {
         set_recording_upload_failed(true);
+        set_recording_upload_active(false);
         s_recording_upload_task = NULL;
         ESP_LOGW(TAG, "recording upload task create failed");
         return false;
@@ -4149,6 +4610,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
         ESP_LOGW(TAG, "recording start failed: no session id");
         return false;
     }
+    set_recording_session_active(true);
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_NONE));
     show_recording_overlay("正在连接", "", true);
@@ -4190,6 +4652,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
         s_recording_session_id[0] = '\0';
+        set_recording_session_active(false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
         return false;
     }
@@ -4206,6 +4669,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
         s_recording_session_id[0] = '\0';
+        set_recording_session_active(false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
         return false;
     }
@@ -4216,6 +4680,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
         s_recording_session_id[0] = '\0';
+        set_recording_session_active(false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
         return false;
     }
@@ -4288,6 +4753,7 @@ static void finish_recording_stop(const char *event_name)
         start_cyber_tts_wait();
     }
     s_recording_session_id[0] = '\0';
+    set_recording_session_active(false);
     s_tap_recording_active = false;
     s_motion_recording_active = false;
     poll_state();
@@ -4982,6 +5448,7 @@ void app_main(void)
     s_event_queue = xQueueCreate(16, sizeof(agent_event_t));
     s_lvgl_lock = xSemaphoreCreateMutex();
     s_bridge_target_lock = xSemaphoreCreateMutex();
+    s_bridge_profiles_lock = xSemaphoreCreateMutex();
     xTaskCreate(serial_debug_task, "serial_debug", 2048, NULL, 2, NULL);
     ESP_ERROR_CHECK(init_wifi());
     ESP_ERROR_CHECK(init_display());
