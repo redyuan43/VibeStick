@@ -46,7 +46,7 @@ def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> Non
     button_single_click = source.split("static void button_single_click_cb", 1)[1]
     button_single_click = button_single_click.split("static void button_double_click_cb", 1)[0]
 
-    assert "#define PTT_ENTER_GRACE_MS 3000" in source
+    assert "#define PTT_ENTER_GRACE_MS 5000" in source
     assert "#define PTT_FOLLOWUP_REQUEST_TIMEOUT_MS 1000" in source
     assert '\\"event\\":\\"%s\\"' in source
     assert '"button_followup_enter"' in source
@@ -57,6 +57,9 @@ def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> Non
     assert "VIBE_STICK_FOLLOWUP_PRIORITY 6" in source
     assert "PTT_FOLLOWUP_REQUEST_TIMEOUT_MS" in source
     assert "free(dispatch);" in source
+    assert "ptt_followup_enter_window_present()" in button_single_click
+    assert "recording_finalize_active()" in button_single_click
+    assert "front single click ignored after dictation stop" in button_single_click
     assert "recording_intent_is_cyber()" in button_single_click
     assert button_single_click.index("recording_intent_is_cyber()") < button_single_click.index(
         "consume_ptt_followup_enter_window()"
@@ -67,7 +70,7 @@ def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> Non
     assert "queue_event(VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER)" not in button_single_click
 
 
-def test_ptt_release_followup_double_click_sends_escape_before_double_click_action() -> None:
+def test_ptt_release_followup_double_click_requests_current_dictation_cancellation() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     button_double_click = source.split("static void button_double_click_cb", 1)[1]
     button_double_click = button_double_click.split("static void side_button_long_start_cb", 1)[0]
@@ -77,7 +80,28 @@ def test_ptt_release_followup_double_click_sends_escape_before_double_click_acti
     assert button_double_click.index("consume_ptt_followup_enter_window()") < button_double_click.index(
         "start_ptt_followup_key_dispatch"
     )
+    assert "ptt_followup_enter_window_present()" in button_double_click
+    assert "recording_finalize_active()" in button_double_click
+    assert "front double click ignored after dictation stop" in button_double_click
     assert "queue_event(VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE)" not in button_double_click
+
+
+def test_ptt_followup_accepts_a_deliberate_press_without_starting_another_recording() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    button_long = source.split("static void button_long_start_cb", 1)[1]
+    button_long = button_long.split("static void bridge_selection_confirm_long_cb", 1)[0]
+    init_button = source.split("static esp_err_t init_button", 1)[1]
+    init_button = init_button.split("static void restore_wake_button_intent", 1)[0]
+
+    assert "#define FRONT_PTT_LONG_PRESS_MS 400" in source
+    assert ".press_time = FRONT_PTT_LONG_PRESS_MS" in init_button
+    assert "ptt_followup_enter_window_present()" in button_long
+    assert "consume_ptt_followup_enter_window()" in button_long
+    assert '"button_followup_enter"' in button_long
+    assert "front long press accepted as dictation confirmation" in button_long
+    assert button_long.index("consume_ptt_followup_enter_window()") < button_long.index(
+        "s_tap_recording_active"
+    )
 
 
 def test_ptt_followup_enter_arms_after_long_press_or_tap_stop() -> None:
@@ -92,6 +116,9 @@ def test_ptt_followup_enter_arms_after_long_press_or_tap_stop() -> None:
     assert "!recording_intent_is_cyber()" in handle_stop
     assert "arm_ptt_followup_enter_window();" in handle_stop
     assert "clear_ptt_followup_enter_window();" in handle_stop
+    assert "clear_ptt_followup_enter_window();" in source.split(
+        "static void finish_recording_stop", 1
+    )[1].split("static void recording_finalize_task", 1)[0]
     assert 'handle_recording_stop("button_tap_stop")' in handle_toggle
     assert 'handle_recording_start("button_tap_start", "TAP TO SEND")' in handle_toggle
 

@@ -73,8 +73,9 @@
 #define RECORDING_UPLOAD_WAIT_MS 10000
 #define RECORDING_START_TIMEOUT_MS 1200
 #define RECORDING_STOP_TIMEOUT_MS 210000
-#define PTT_ENTER_GRACE_MS 3000
+#define PTT_ENTER_GRACE_MS 5000
 #define PTT_FOLLOWUP_REQUEST_TIMEOUT_MS 1000
+#define FRONT_PTT_LONG_PRESS_MS 400
 #define OTA_READ_BUFFER_BYTES 4096
 #define OTA_PERIODIC_CHECK_MS 300000
 #define HTTP_CLIENT_BUFFER_SIZE 2048
@@ -4360,6 +4361,12 @@ static bool consume_ptt_followup_enter_window(void)
     return true;
 }
 
+static bool ptt_followup_enter_window_present(void)
+{
+    return s_ptt_followup_session_id[0] != '\0' &&
+           s_ptt_followup_enter_deadline_ms > 0;
+}
+
 typedef struct {
     char session_id[40];
     const char *event_name;
@@ -4372,11 +4379,6 @@ static bool post_ptt_followup_key_event(const ptt_followup_key_dispatch_t *dispa
         return false;
     }
 
-    esp_err_t sound_err = vibe_audio_play_sound(dispatch->sound);
-    if (sound_err != ESP_OK) {
-        ESP_LOGW(TAG, "follow-up key sound failed: %s", esp_err_to_name(sound_err));
-    }
-
     char body[160];
     snprintf(body, sizeof(body),
              "{\"event\":\"%s\",\"source\":\"%s\",\"session_id\":\"%s\"}",
@@ -4387,20 +4389,33 @@ static bool post_ptt_followup_key_event(const ptt_followup_key_dispatch_t *dispa
     esp_err_t err = http_request_timeout("POST", VIBE_STICK_EVENT_PATH, body, response,
                                          sizeof(response),
                                          PTT_FOLLOWUP_REQUEST_TIMEOUT_MS);
-    if (err == ESP_OK && response[0] != '\0' && parse_state_json(response)) {
+    bool accepted = false;
+    if (err == ESP_OK && response[0] != '\0') {
+        cJSON *root = cJSON_Parse(response);
+        cJSON *success = root ? cJSON_GetObjectItemCaseSensitive(root, "success") : NULL;
+        accepted = cJSON_IsTrue(success);
+        cJSON_Delete(root);
+    }
+    if (accepted) {
+        (void)parse_state_json(response);
         complete_pet_fast_resume();
         render_state();
-        return true;
-    } else if (err != ESP_OK) {
-        ESP_LOGW(TAG, "PTT follow-up key event failed: %s", esp_err_to_name(err));
-        (void)vibe_audio_play_sound(VIBE_STICK_SOUND_ERROR);
-        show_recording_overlay("CONFIRM FAILED", "", true);
-        vTaskDelay(pdMS_TO_TICKS(700));
-        if (recording_finalize_active() || atomic_load(&s_recording_session_active)) {
-            show_recording_overlay("TRANSCRIBING", "", true);
-        } else {
-            show_recording_overlay(NULL, NULL, false);
+        esp_err_t sound_err = vibe_audio_play_sound(dispatch->sound);
+        if (sound_err != ESP_OK) {
+            ESP_LOGW(TAG, "follow-up key sound failed: %s", esp_err_to_name(sound_err));
         }
+        return true;
+    }
+
+    ESP_LOGW(TAG, "PTT follow-up key event rejected err=%s",
+             esp_err_to_name(err));
+    (void)vibe_audio_play_sound(VIBE_STICK_SOUND_ERROR);
+    show_recording_overlay("CONFIRM FAILED", "", true);
+    vTaskDelay(pdMS_TO_TICKS(700));
+    if (recording_finalize_active() || atomic_load(&s_recording_session_active)) {
+        show_recording_overlay("TRANSCRIBING", "", true);
+    } else {
+        show_recording_overlay(NULL, NULL, false);
     }
     return false;
 }
@@ -4816,6 +4831,7 @@ static void finish_recording_stop(const char *event_name)
     char response[1024] = {0};
     esp_err_t err = http_request_timeout("POST", VIBE_STICK_RECORDING_STOP_PATH, body, response,
                                          sizeof(response), RECORDING_STOP_TIMEOUT_MS);
+    clear_ptt_followup_enter_window();
     bool recording_failed = false;
     char recording_status[32] = {0};
     if (err == ESP_OK && response[0] != '\0') {
@@ -5203,6 +5219,7 @@ static void button_single_click_cb(void *button_handle, void *usr_data)
         return;
     }
 #endif
+    const bool followup_window_present = ptt_followup_enter_window_present();
     if (recording_intent_is_cyber()) {
         clear_ptt_followup_enter_window();
     } else if (consume_ptt_followup_enter_window()) {
@@ -5210,6 +5227,9 @@ static void button_single_click_cb(void *button_handle, void *usr_data)
                                              VIBE_STICK_SOUND_FOLLOWUP_ENTER)) {
             clear_ptt_followup_enter_window();
         }
+        return;
+    } else if (followup_window_present || recording_finalize_active()) {
+        ESP_LOGI(TAG, "front single click ignored after dictation stop");
         return;
     }
     queue_event(VIBE_STICK_EVENT_RECORDING_TOGGLE);
@@ -5232,11 +5252,15 @@ static void button_double_click_cb(void *button_handle, void *usr_data)
         return;
     }
 #endif
+    const bool followup_window_present = ptt_followup_enter_window_present();
     if (consume_ptt_followup_enter_window()) {
         if (!start_ptt_followup_key_dispatch("button_followup_escape",
                                              VIBE_STICK_SOUND_FOLLOWUP_ESCAPE)) {
             clear_ptt_followup_enter_window();
         }
+        return;
+    } else if (followup_window_present || recording_finalize_active()) {
+        ESP_LOGI(TAG, "front double click ignored after dictation stop");
         return;
     }
     queue_event(VIBE_STICK_EVENT_DOUBLE_CLICK);
@@ -5285,6 +5309,20 @@ static void button_long_start_cb(void *button_handle, void *usr_data)
         return;
     }
 #endif
+    const bool followup_window_present = ptt_followup_enter_window_present();
+    if (consume_ptt_followup_enter_window()) {
+        s_long_press_active = false;
+        if (!start_ptt_followup_key_dispatch("button_followup_enter",
+                                             VIBE_STICK_SOUND_FOLLOWUP_ENTER)) {
+            clear_ptt_followup_enter_window();
+        }
+        ESP_LOGI(TAG, "front long press accepted as dictation confirmation");
+        return;
+    } else if (followup_window_present || recording_finalize_active()) {
+        s_long_press_active = false;
+        ESP_LOGI(TAG, "front long press ignored after dictation stop");
+        return;
+    }
     if (s_recording_trigger_mode != RECORDING_TRIGGER_PUSH_TO_TALK) {
         ESP_LOGI(TAG, "front long press ignored in %s mode", recording_mode_label());
         return;
@@ -5365,7 +5403,7 @@ static esp_err_t init_button(void)
                         TAG, "button double");
     button_event_args_t front_long_press_args = {
         .long_press = {
-            .press_time = 220,
+            .press_time = FRONT_PTT_LONG_PRESS_MS,
         },
     };
     ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_LONG_PRESS_START, &front_long_press_args, button_long_start_cb, NULL),
@@ -5636,10 +5674,11 @@ static void serial_debug_task(void *arg)
         } else if (input == 'h' || input == 'H') {
             ESP_LOGI(TAG, "serial debug command: front button 1.5s hold");
             button_press_down_cb(NULL, NULL);
-            vTaskDelay(pdMS_TO_TICKS(220));
+            vTaskDelay(pdMS_TO_TICKS(FRONT_PTT_LONG_PRESS_MS));
             button_long_start_cb(NULL, NULL);
             vTaskDelay(pdMS_TO_TICKS(
-                BRIDGE_SELECTION_CONFIRM_HOLD_MS - 220));
+                BRIDGE_SELECTION_CONFIRM_HOLD_MS -
+                FRONT_PTT_LONG_PRESS_MS));
             bridge_selection_confirm_long_cb(NULL, NULL);
             button_up_cb(NULL, NULL);
         }
