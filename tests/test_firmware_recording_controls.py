@@ -97,18 +97,42 @@ def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
     assert '\\"session_id\\":\\"%s\\",\\"intent\\":\\"%s\\",\\"mode\\":\\"%s\\"' in source
 
 
-def test_bridge_health_probe_accepts_vibestick_and_capswriter_identity() -> None:
+def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
-    bridge_probe = source.split("static bool bridge_probe_target_timeout", 1)[1]
-    bridge_probe = bridge_probe.split("static bool bridge_probe_target", 1)[0]
+    bridge_probe = source.split("static bool bridge_probe_discovered", 1)[1]
+    bridge_probe = bridge_probe.split("static bool bridge_probe_profile", 1)[0]
+    discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
+    discovery = discovery.split("static void bridge_ensure_target", 1)[0]
+    cycle = source.split("static void cycle_bridge_profile", 1)[1]
+    cycle = cycle.split("static esp_err_t bridge_prepare_active_target", 1)[0]
     bridge_load = source.split("static esp_err_t bridge_target_load_nvs", 1)[1]
     bridge_load = bridge_load.split("static esp_err_t bridge_target_save_nvs", 1)[0]
 
-    assert 'cJSON_GetObjectItemCaseSensitive(root, "bridge_name")' in bridge_probe
-    assert "cJSON_IsString(bridge_name)" in bridge_probe
-    assert 'strcmp(bridge_name->valuestring, "vibestick-bridge") == 0' in bridge_probe
-    assert 'strcmp(bridge_name->valuestring, "capswriter-m5-voice-bridge") == 0' in bridge_probe
-    assert "port != VIBE_STICK_BRIDGE_PORT" in bridge_load
+    assert 'http_request_target("GET", host, port, "", "/health"' in bridge_probe
+    assert "k_configured_bridge_profiles[index].token" in bridge_probe
+    assert "bridge_parse_discovered_health" in bridge_probe
+    assert "for (int host_id = 254;" in discovery
+    assert "bridge_profiles_save_nvs()" in discovery
+    assert '"SEARCHING"' in cycle
+    assert "bridge_discover_subnet_profiles()" in cycle
+    assert "BRIDGE_PROFILE_STORE_KEY" in source
+    assert "nvs_get_blob(handle, BRIDGE_PROFILE_STORE_KEY" in source
+    assert "nvs_set_blob(handle, BRIDGE_PROFILE_STORE_KEY" in source
+    assert "bridge_profile_index_by_id(profile_id)" in bridge_load
+
+
+def test_discovery_supports_legacy_and_generic_bridge_identity() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    parser = source.split("static bool bridge_parse_discovered_health", 1)[1]
+    parser = parser.split("static bool bridge_probe_discovered", 1)[0]
+    profile_probe = source.split("static bool bridge_probe_profile", 1)[1]
+    profile_probe = profile_probe.split("static bool bridge_scan_add", 1)[0]
+
+    assert 'cJSON_GetObjectItemCaseSensitive(root, "bridge_name")' in parser
+    assert 'cJSON_GetObjectItemCaseSensitive(root, "bridge_id")' in parser
+    assert '"capswriter-m5-voice-bridge"' in parser
+    assert "bridge_discovery_fallback_id(host" in parser
+    assert 'strncmp(profile->id, "lan-", 4) == 0' in profile_probe
 
 
 def test_recording_start_uses_descending_chirp_and_stop_uses_legacy_beep() -> None:

@@ -116,7 +116,13 @@
 #define BRIDGE_TARGET_PROFILE_KEY "profile"
 #define BRIDGE_TARGET_HOST_LEN 64
 #define BRIDGE_TARGET_PROFILE_LEN 65
+#define BRIDGE_TARGET_LABEL_LEN 65
+#define BRIDGE_TARGET_TOKEN_LEN 65
 #define BRIDGE_TARGET_SOURCE_LEN 12
+#define BRIDGE_PROFILE_STORE_KEY "profiles"
+#define BRIDGE_PROFILE_STORE_MAGIC 0x56424250u
+#define BRIDGE_PROFILE_STORE_VERSION 1
+#define BRIDGE_DISCOVERY_TIMEOUT_MS 120
 
 static const char *TAG = "vibe_stick";
 
@@ -159,6 +165,22 @@ _Static_assert(sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge
 _Static_assert(sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]) <=
                    VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT,
                "too many bridge profiles");
+
+typedef struct {
+    char id[BRIDGE_TARGET_PROFILE_LEN];
+    char label[BRIDGE_TARGET_LABEL_LEN];
+    char host[BRIDGE_TARGET_HOST_LEN];
+    int32_t port;
+    char token[BRIDGE_TARGET_TOKEN_LEN];
+} bridge_discovered_profile_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t count;
+    char ssid[WIFI_PROFILE_SSID_LEN];
+    bridge_discovered_profile_t profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
+} bridge_profile_store_t;
 
 typedef enum {
     VIBE_STICK_EVENT_POLL_STATE,
@@ -304,6 +326,15 @@ static size_t s_wifi_profile_count;
 static size_t s_wifi_profile_index;
 static int s_wifi_profile_retry_count;
 static SemaphoreHandle_t s_bridge_target_lock;
+static bridge_discovered_profile_t
+    s_discovered_bridge_profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
+static bridge_profile_config_t
+    s_discovered_bridge_profile_views[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
+static bridge_discovered_profile_t
+    s_bridge_scan_profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
+static size_t s_discovered_bridge_profile_count;
+static size_t s_bridge_scan_profile_count;
+static char s_bridge_profiles_loaded_ssid[WIFI_PROFILE_SSID_LEN];
 static bridge_target_t s_bridge_target = {
     .host = VIBE_STICK_BRIDGE_HOST,
     .port = VIBE_STICK_BRIDGE_PORT,
@@ -2192,12 +2223,113 @@ static void bridge_target_copy(bridge_target_t *target)
 
 static size_t bridge_profile_count(void)
 {
+    if (s_discovered_bridge_profile_count > 0) {
+        return s_discovered_bridge_profile_count;
+    }
     return sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]);
 }
 
 static const bridge_profile_config_t *bridge_profile_at(size_t index)
 {
+    if (s_discovered_bridge_profile_count > 0) {
+        return index < s_discovered_bridge_profile_count
+                   ? &s_discovered_bridge_profile_views[index]
+                   : NULL;
+    }
     return index < bridge_profile_count() ? &k_configured_bridge_profiles[index] : NULL;
+}
+
+static void bridge_profile_views_rebuild(void)
+{
+    for (size_t index = 0; index < s_discovered_bridge_profile_count; index++) {
+        bridge_discovered_profile_t *stored = &s_discovered_bridge_profiles[index];
+        s_discovered_bridge_profile_views[index] = (bridge_profile_config_t){
+            .id = stored->id,
+            .label = stored->label,
+            .host = stored->host,
+            .port = (int)stored->port,
+            .token = stored->token,
+        };
+    }
+}
+
+static void bridge_profiles_clear(void)
+{
+    memset(s_discovered_bridge_profiles, 0, sizeof(s_discovered_bridge_profiles));
+    memset(s_discovered_bridge_profile_views, 0, sizeof(s_discovered_bridge_profile_views));
+    s_discovered_bridge_profile_count = 0;
+}
+
+static esp_err_t bridge_profiles_load_nvs(const char *current_ssid)
+{
+    bridge_profiles_clear();
+    if (!current_ssid || current_ssid[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(BRIDGE_TARGET_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    bridge_profile_store_t store = {0};
+    size_t required_size = sizeof(store);
+    err = nvs_get_blob(handle, BRIDGE_PROFILE_STORE_KEY, &store, &required_size);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (required_size != sizeof(store) ||
+        store.magic != BRIDGE_PROFILE_STORE_MAGIC ||
+        store.version != BRIDGE_PROFILE_STORE_VERSION ||
+        store.count == 0 ||
+        store.count > VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT ||
+        strcmp(store.ssid, current_ssid) != 0) {
+        return ESP_ERR_INVALID_VERSION;
+    }
+
+    memcpy(s_discovered_bridge_profiles, store.profiles,
+           store.count * sizeof(store.profiles[0]));
+    s_discovered_bridge_profile_count = store.count;
+    bridge_profile_views_rebuild();
+    ESP_LOGI(TAG, "bridge profiles restored ssid=%s count=%u",
+             current_ssid, (unsigned int)store.count);
+    return ESP_OK;
+}
+
+static esp_err_t bridge_profiles_save_nvs(void)
+{
+    if (s_discovered_bridge_profile_count == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    char current_ssid[WIFI_PROFILE_SSID_LEN] = {0};
+    current_wifi_ssid(current_ssid, sizeof(current_ssid));
+    if (current_ssid[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bridge_profile_store_t store = {
+        .magic = BRIDGE_PROFILE_STORE_MAGIC,
+        .version = BRIDGE_PROFILE_STORE_VERSION,
+        .count = (uint16_t)s_discovered_bridge_profile_count,
+    };
+    strlcpy(store.ssid, current_ssid, sizeof(store.ssid));
+    memcpy(store.profiles, s_discovered_bridge_profiles,
+           s_discovered_bridge_profile_count * sizeof(store.profiles[0]));
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(BRIDGE_TARGET_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "open bridge profile NVS for write");
+    err = nvs_set_blob(handle, BRIDGE_PROFILE_STORE_KEY, &store, sizeof(store));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "bridge profiles saved ssid=%s count=%u",
+                 current_ssid, (unsigned int)s_discovered_bridge_profile_count);
+    }
+    return err;
 }
 
 static int bridge_profile_index_by_id(const char *id)
@@ -2413,6 +2545,114 @@ static esp_err_t http_request_target(const char *method, const char *host, int p
     return err;
 }
 
+static bool bridge_health_name_valid(const cJSON *bridge_name)
+{
+    return cJSON_IsString(bridge_name) &&
+           (strcmp(bridge_name->valuestring, "vibestick-bridge") == 0 ||
+            strcmp(bridge_name->valuestring, "capswriter-m5-voice-bridge") == 0);
+}
+
+static void bridge_discovery_fallback_id(const char *host, char *id, size_t id_len)
+{
+    snprintf(id, id_len, "lan-%s", host ? host : "bridge");
+    for (char *cursor = id; *cursor != '\0'; cursor++) {
+        if (*cursor == '.') {
+            *cursor = '-';
+        }
+    }
+}
+
+static bool bridge_parse_discovered_health(const char *response, const char *host, int port,
+                                           const char *token,
+                                           bridge_discovered_profile_t *profile)
+{
+    if (!response || !host || !profile) {
+        return false;
+    }
+    cJSON *root = cJSON_Parse(response);
+    if (!root) {
+        return false;
+    }
+    cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
+    cJSON *bridge_name = cJSON_GetObjectItemCaseSensitive(root, "bridge_name");
+    cJSON *bridge_id = cJSON_GetObjectItemCaseSensitive(root, "bridge_id");
+    cJSON *bridge_label = cJSON_GetObjectItemCaseSensitive(root, "bridge_label");
+    bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok) &&
+                   bridge_health_name_valid(bridge_name);
+    if (!healthy) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    memset(profile, 0, sizeof(*profile));
+    strlcpy(profile->host, host, sizeof(profile->host));
+    profile->port = port;
+    strlcpy(profile->token, token ? token : "", sizeof(profile->token));
+
+    bool generic_id = !cJSON_IsString(bridge_id) ||
+                      bridge_id->valuestring[0] == '\0' ||
+                      strcmp(bridge_id->valuestring, "capswriter-m5-voice-bridge") == 0 ||
+                      strcmp(bridge_id->valuestring, "vibestick-bridge") == 0;
+    if (generic_id) {
+        bridge_discovery_fallback_id(host, profile->id, sizeof(profile->id));
+    } else {
+        strlcpy(profile->id, bridge_id->valuestring, sizeof(profile->id));
+    }
+
+    bool generic_label = !cJSON_IsString(bridge_label) ||
+                         bridge_label->valuestring[0] == '\0' ||
+                         strcmp(bridge_label->valuestring,
+                                "capswriter-m5-voice-bridge") == 0 ||
+                         strcmp(bridge_label->valuestring, "vibestick-bridge") == 0;
+    strlcpy(profile->label,
+            generic_label ? host : bridge_label->valuestring,
+            sizeof(profile->label));
+    cJSON_Delete(root);
+    return true;
+}
+
+static bool bridge_probe_discovered(const char *host, int port,
+                                    bridge_discovered_profile_t *profile)
+{
+    char response[256] = {0};
+    esp_err_t anonymous_err =
+        http_request_target("GET", host, port, "", "/health", NULL, response,
+                            sizeof(response), BRIDGE_DISCOVERY_TIMEOUT_MS);
+    if (anonymous_err != ESP_OK) {
+        return false;
+    }
+    if (bridge_parse_discovered_health(response, host, port, "", profile)) {
+        return true;
+    }
+
+    size_t configured_count =
+        sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]);
+    for (size_t index = 0; index < configured_count; index++) {
+        const char *token = k_configured_bridge_profiles[index].token;
+        if (!token || token[0] == '\0') {
+            continue;
+        }
+        bool already_tried = false;
+        for (size_t previous = 0; previous < index; previous++) {
+            const char *previous_token = k_configured_bridge_profiles[previous].token;
+            if (previous_token && strcmp(previous_token, token) == 0) {
+                already_tried = true;
+                break;
+            }
+        }
+        if (already_tried) {
+            continue;
+        }
+        response[0] = '\0';
+        if (http_request_target("GET", host, port, token, "/health", NULL, response,
+                                sizeof(response), BRIDGE_DISCOVERY_TIMEOUT_MS) == ESP_OK &&
+            bridge_parse_discovered_health(response, host, port, token, profile)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool bridge_probe_profile(const bridge_profile_config_t *profile, int timeout_ms)
 {
     char response[160] = {0};
@@ -2432,22 +2672,97 @@ static bool bridge_probe_profile(const bridge_profile_config_t *profile, int tim
     cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
     cJSON *bridge_name = cJSON_GetObjectItemCaseSensitive(root, "bridge_name");
     cJSON *bridge_id = cJSON_GetObjectItemCaseSensitive(root, "bridge_id");
+    bool generic_profile_id = strncmp(profile->id, "lan-", 4) == 0;
     bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok) &&
-                   cJSON_IsString(bridge_name) &&
-                   (strcmp(bridge_name->valuestring, "vibestick-bridge") == 0 ||
-                    strcmp(bridge_name->valuestring, "capswriter-m5-voice-bridge") == 0) &&
-                   cJSON_IsString(bridge_id) &&
-                   strcmp(bridge_id->valuestring, profile->id) == 0;
+                   bridge_health_name_valid(bridge_name) &&
+                   (generic_profile_id ||
+                    (cJSON_IsString(bridge_id) &&
+                     strcmp(bridge_id->valuestring, profile->id) == 0));
     cJSON_Delete(root);
     return healthy;
 }
 
+static bool bridge_scan_add(const bridge_discovered_profile_t *profile)
+{
+    if (!profile || profile->host[0] == '\0' ||
+        s_bridge_scan_profile_count >= VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT) {
+        return false;
+    }
+    for (size_t index = 0; index < s_bridge_scan_profile_count; index++) {
+        if (strcmp(s_bridge_scan_profiles[index].host, profile->host) == 0 &&
+            s_bridge_scan_profiles[index].port == profile->port) {
+            return false;
+        }
+    }
+    s_bridge_scan_profiles[s_bridge_scan_profile_count++] = *profile;
+    return true;
+}
+
+static size_t bridge_discover_subnet_profiles(void)
+{
+    unsigned int a = 0;
+    unsigned int b = 0;
+    unsigned int c = 0;
+    unsigned int self = 0;
+    if (sscanf(s_state.wifi_ip, "%u.%u.%u.%u", &a, &b, &c, &self) != 4 ||
+        a > 255 || b > 255 || c > 255 || self > 255) {
+        return 0;
+    }
+
+    memset(s_bridge_scan_profiles, 0, sizeof(s_bridge_scan_profiles));
+    s_bridge_scan_profile_count = 0;
+    ESP_LOGI(TAG, "bridge discovery start prefix=%u.%u.%u.0/24 port=%d",
+             a, b, c, VIBE_STICK_BRIDGE_PORT);
+    for (int host_id = 254;
+         host_id >= 1 &&
+         s_bridge_scan_profile_count < VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT;
+         host_id--) {
+        if ((unsigned int)host_id == self) {
+            continue;
+        }
+        char host[BRIDGE_TARGET_HOST_LEN] = {0};
+        snprintf(host, sizeof(host), "%u.%u.%u.%d", a, b, c, host_id);
+        bridge_discovered_profile_t profile = {0};
+        if (!bridge_probe_discovered(host, VIBE_STICK_BRIDGE_PORT, &profile)) {
+            continue;
+        }
+        if (bridge_scan_add(&profile)) {
+            ESP_LOGI(TAG, "bridge discovered id=%s label=%s host=%s port=%ld",
+                     profile.id, profile.label, profile.host, (long)profile.port);
+        }
+    }
+    if (s_bridge_scan_profile_count == 0) {
+        ESP_LOGW(TAG, "bridge discovery found no bridge prefix=%u.%u.%u.0/24",
+                 a, b, c);
+        return 0;
+    }
+
+    bridge_profiles_clear();
+    memcpy(s_discovered_bridge_profiles, s_bridge_scan_profiles,
+           s_bridge_scan_profile_count * sizeof(s_bridge_scan_profiles[0]));
+    s_discovered_bridge_profile_count = s_bridge_scan_profile_count;
+    bridge_profile_views_rebuild();
+    (void)bridge_profiles_save_nvs();
+    ESP_LOGI(TAG, "bridge discovery complete count=%u",
+             (unsigned int)s_discovered_bridge_profile_count);
+    return s_discovered_bridge_profile_count;
+}
+
 static void bridge_ensure_target(void)
 {
-    if (!wifi_connected() || !bridge_target_needs_selection()) {
+    if (!wifi_connected()) {
         return;
     }
-    if (bridge_target_load_nvs() == ESP_OK) {
+    char current_ssid[WIFI_PROFILE_SSID_LEN] = {0};
+    current_wifi_ssid(current_ssid, sizeof(current_ssid));
+    if (current_ssid[0] != '\0' &&
+        strcmp(s_bridge_profiles_loaded_ssid, current_ssid) != 0) {
+        (void)bridge_profiles_load_nvs(current_ssid);
+        (void)bridge_target_load_nvs();
+        strlcpy(s_bridge_profiles_loaded_ssid, current_ssid,
+                sizeof(s_bridge_profiles_loaded_ssid));
+    }
+    if (!bridge_target_needs_selection()) {
         return;
     }
     if (bridge_target_set_profile(0, "default", false)) {
@@ -2464,9 +2779,35 @@ static void cycle_bridge_profile(void)
     bridge_ensure_target();
     bridge_target_t current;
     bridge_target_copy(&current);
+    show_mode_switch_visual("SEARCHING",
+                            "LAN BRIDGES",
+                            s_mode_switch_dict_frames,
+                            sizeof(s_mode_switch_dict_frames) /
+                                sizeof(s_mode_switch_dict_frames[0]),
+                            lv_color_hex(0x93c5fd));
+    if (bridge_discover_subnet_profiles() == 0) {
+        show_mode_switch_visual("NO BRIDGE",
+                                "SIDE 1X RETRY",
+                                s_mode_switch_dict_frames,
+                                sizeof(s_mode_switch_dict_frames) /
+                                    sizeof(s_mode_switch_dict_frames[0]),
+                                lv_color_hex(0xfca5a5));
+        return;
+    }
+
     size_t count = bridge_profile_count();
+    int current_index = -1;
+    for (size_t index = 0; index < count; index++) {
+        const bridge_profile_config_t *profile = bridge_profile_at(index);
+        if (profile &&
+            (strcmp(profile->id, current.profile_id) == 0 ||
+             strcmp(profile->host, current.host) == 0)) {
+            current_index = (int)index;
+            break;
+        }
+    }
     for (size_t offset = 1; offset <= count; offset++) {
-        size_t index = (current.profile_index + offset) % count;
+        size_t index = (size_t)((current_index + (int)offset) % (int)count);
         const bridge_profile_config_t *profile = bridge_profile_at(index);
         if (!bridge_probe_profile(profile, 1200)) {
             continue;

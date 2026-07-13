@@ -41,8 +41,7 @@ firmware because they are used during recovery-style updates on the local LAN.
 ## Multiple Bridges
 
 For multiple desktop targets on the same LAN, configure each bridge with a
-stable DHCP address or unique hostname, a unique bridge ID, a human-readable
-label, and its own token:
+unique bridge ID, a human-readable label, and its own token:
 
 ```text
 M5_VOICE_BRIDGE_ID=desk
@@ -50,12 +49,18 @@ M5_VOICE_BRIDGE_LABEL="Desk"
 M5_VOICE_BRIDGE_TOKEN=<desk-token>
 ```
 
-`GET /health` must return the configured `bridge_id` and requires the token
-when one is configured. Add matching `{ id, label, host, port, token }`
-profiles to the device's local `VIBE_STICK_BRIDGE_PROFILES` configuration.
-The StickS3 side button cycles only these profiles, validates `/health` before
-switching, and keeps one selected profile for the entire recording session.
-It intentionally does not scan the LAN and select the first matching bridge.
+`GET /health` should return the configured `bridge_id` and requires the token
+when one is configured. A side-button single click scans the current `/24`
+subnet for bridge health endpoints, stores the discovered profiles in ESP NVS,
+and switches to the next reachable profile. Legacy bridges without
+`bridge_id`, and bridges still using the generic default ID, receive an
+IP-derived local identity so multiple instances remain distinguishable.
+Recording stays bound to the selected profile for the entire session.
+
+`VIBE_STICK_BRIDGE_PROFILES` remains the fallback list and supplies known
+tokens for authenticated discovery. Once a scan succeeds, future IP additions
+or changes do not require another firmware build; press the side button to
+refresh the NVS-backed list.
 
 ## State Endpoint
 
