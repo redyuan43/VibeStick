@@ -352,9 +352,21 @@ def test_serial_debug_command_uses_the_side_button_event_path() -> None:
     serial_task = serial_task.split("void app_main", 1)[0]
 
     assert "esp_rom_output_rx_one_char(&input)" in serial_task
+    assert "usb_serial_jtag_driver_install(&usb_config)" in serial_task
+    assert "usb_serial_jtag_read_bytes(&input, 1" in serial_task
     assert "serial debug command: side button full scan" in serial_task
-    assert "BRIDGE_SELECTION_ENTRY_WINDOW_MS" in serial_task
-    assert "queue_event(VIBE_STICK_EVENT_BRIDGE_SCAN_FULL)" in serial_task
+    assert "side_button_up_cb(NULL, NULL)" in serial_task
+    assert "serial debug command: clear runtime bridge profiles" in serial_task
+    assert "bridge_profiles_clear()" in serial_task
+    assert "serial debug command: front button short press" in serial_task
+    assert "button_press_down_cb(NULL, NULL)" in serial_task
+    assert "button_up_cb(NULL, NULL)" in serial_task
+    assert "button_single_click_cb(NULL, NULL)" in serial_task
+    assert "serial debug command: front button 1.5s hold" in serial_task
+    assert "bridge_selection_confirm_long_cb(NULL, NULL)" in serial_task
+    assert "bridge selection confirmation visible" in source
+    assert "bridge selection mode exited" in source
+    assert 'xTaskCreate(serial_debug_task, "serial_debug", 6144' in source
 
 
 def test_recording_start_uses_descending_chirp_and_stop_uses_legacy_beep() -> None:

@@ -19,6 +19,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_app_desc.h"
@@ -48,6 +49,7 @@
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#include "soc/soc_caps.h"
 
 #define LCD_HOST VIBE_BOARD_LCD_HOST
 #define LCD_H_RES VIBE_BOARD_LCD_H_RES
@@ -1836,6 +1838,7 @@ static void update_pet_visual(void)
         lv_label_set_text(s_mode_switch_hint, "已确认");
         lv_obj_set_style_text_color(s_mode_switch_title,
                                     lv_color_hex(0x86efac), 0);
+        ESP_LOGI(TAG, "bridge selection confirmation visible");
     } else if (s_bridge_selection_ui_phase == BRIDGE_SELECTION_UI_CONFIRMED &&
                now_ms >= s_bridge_selection_ui_deadline_ms) {
         s_bridge_selection_ui_phase = BRIDGE_SELECTION_UI_IDLE;
@@ -1845,6 +1848,7 @@ static void update_pet_visual(void)
         atomic_store(&s_front_bridge_gesture_active, false);
         atomic_store(&s_front_bridge_gesture_confirmed, false);
         finish_mode_switch_visual();
+        ESP_LOGI(TAG, "bridge selection mode exited");
     }
     if (mode_switch_visual_active(now_ms)) {
         if (now_ms >= s_mode_switch_next_frame_ms) {
@@ -5560,21 +5564,53 @@ static void app_task(void *arg)
 static void serial_debug_task(void *arg)
 {
     (void)arg;
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+    usb_serial_jtag_driver_config_t usb_config =
+        USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    esp_err_t usb_err = usb_serial_jtag_driver_install(&usb_config);
+    if (usb_err != ESP_OK && usb_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "serial debug USB-JTAG init failed: %s",
+                 esp_err_to_name(usb_err));
+    } else {
+        ESP_LOGI(TAG, "serial debug USB-JTAG input ready");
+    }
+#endif
     while (true) {
         uint8_t input = 0;
-        if (esp_rom_output_rx_one_char(&input) == 0) {
-            if (input == 's' || input == 'S') {
-                ESP_LOGI(TAG, "serial debug command: side button full scan");
-                register_activity();
-                if (!recording_network_busy()) {
-                    atomic_store(&s_bridge_selection_entry_deadline_ms,
-                                 esp_timer_get_time() / 1000 +
-                                     BRIDGE_SELECTION_ENTRY_WINDOW_MS);
-                }
-                (void)queue_event(VIBE_STICK_EVENT_BRIDGE_SCAN_FULL);
-            }
+        bool received = false;
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+        received =
+            usb_serial_jtag_read_bytes(&input, 1, pdMS_TO_TICKS(20)) == 1;
+#else
+        received = esp_rom_output_rx_one_char(&input) == 0;
+#endif
+        if (!received) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        if (input == 's' || input == 'S') {
+            ESP_LOGI(TAG, "serial debug command: side button full scan");
+            side_button_up_cb(NULL, NULL);
+        } else if (input == 'c' || input == 'C') {
+            ESP_LOGI(TAG, "serial debug command: clear runtime bridge profiles");
+            bridge_profiles_clear();
+        } else if (input == 'p' || input == 'P') {
+            ESP_LOGI(TAG, "serial debug command: front button short press");
+            button_press_down_cb(NULL, NULL);
+            vTaskDelay(pdMS_TO_TICKS(80));
+            button_up_cb(NULL, NULL);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            button_single_click_cb(NULL, NULL);
+        } else if (input == 'h' || input == 'H') {
+            ESP_LOGI(TAG, "serial debug command: front button 1.5s hold");
+            button_press_down_cb(NULL, NULL);
+            vTaskDelay(pdMS_TO_TICKS(220));
+            button_long_start_cb(NULL, NULL);
+            vTaskDelay(pdMS_TO_TICKS(
+                BRIDGE_SELECTION_CONFIRM_HOLD_MS - 220));
+            bridge_selection_confirm_long_cb(NULL, NULL);
+            button_up_cb(NULL, NULL);
+        }
     }
 }
 
@@ -5610,7 +5646,7 @@ void app_main(void)
     s_bridge_target_lock = xSemaphoreCreateMutex();
     s_bridge_profiles_lock = xSemaphoreCreateMutex();
     s_bridge_probe_lock = xSemaphoreCreateMutex();
-    xTaskCreate(serial_debug_task, "serial_debug", 2048, NULL, 2, NULL);
+    xTaskCreate(serial_debug_task, "serial_debug", 6144, NULL, 2, NULL);
     ESP_ERROR_CHECK(init_wifi());
     ESP_ERROR_CHECK(init_display());
     register_activity();
