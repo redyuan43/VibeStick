@@ -13,6 +13,29 @@ class PasteResult:
 
 
 class MacPasteInjector:
+    def press_key(self, key: str) -> PasteResult:
+        key_codes = {
+            "enter": 36,
+            "escape": 53,
+        }
+        key_code = key_codes.get(key)
+        if key_code is None:
+            return PasteResult(False, f"Unsupported key: {key}")
+        if platform.system() != "Darwin":
+            return PasteResult(False, "Automatic key input is only available on macOS")
+
+        result = subprocess.run(
+            ["osascript", "-e", f'tell application "System Events" to key code {key_code}'],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "macOS key input failed").strip()
+            return PasteResult(False, message)
+        return PasteResult(True, f"Pressed {key}")
+
     def paste(self, text: str, press_enter: bool = False) -> PasteResult:
         text = text.strip()
         if not text:

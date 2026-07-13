@@ -1,5 +1,7 @@
 import os
+import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from vibe_stick.server import app
@@ -105,6 +107,55 @@ class ServerSecurityTests(unittest.TestCase):
     def test_playback_ok_status_is_not_agent_status(self) -> None:
         self.assertFalse(app._is_agent_status("ok"))
         self.assertTrue(app._is_agent_status("RUNNING"))
+
+    def test_followup_enter_injects_key_for_the_active_recording_session(self) -> None:
+        injector = mock.Mock()
+        injector.press_key.return_value = SimpleNamespace(success=True, message="Pressed enter")
+        store = app.BridgeStateStore.__new__(app.BridgeStateStore)
+        store._lock = threading.RLock()
+        store._events = []
+        store._state = app.default_state()
+        store._manual_status_until = 0.0
+        store.recording = SimpleNamespace(
+            session=SimpleNamespace(session_id="session-1"),
+            paste_injector=injector,
+        )
+        store._save_state_locked = mock.Mock()
+
+        store.update_from_event(
+            {
+                "event": "button_followup_enter",
+                "source": "sticks3",
+                "session_id": "session-1",
+            }
+        )
+
+        injector.press_key.assert_called_once_with("enter")
+        self.assertEqual(store._events[-1]["event"], "followup_key_sent")
+
+    def test_followup_key_ignores_a_stale_recording_session(self) -> None:
+        injector = mock.Mock()
+        store = app.BridgeStateStore.__new__(app.BridgeStateStore)
+        store._lock = threading.RLock()
+        store._events = []
+        store._state = app.default_state()
+        store._manual_status_until = 0.0
+        store.recording = SimpleNamespace(
+            session=SimpleNamespace(session_id="active-session"),
+            paste_injector=injector,
+        )
+        store._save_state_locked = mock.Mock()
+
+        store.update_from_event(
+            {
+                "event": "button_followup_escape",
+                "source": "sticks3",
+                "session_id": "stale-session",
+            }
+        )
+
+        injector.press_key.assert_not_called()
+        self.assertEqual(store._events[-1]["event"], "followup_key_ignored")
 
     def test_event_row_renders_playback_details(self) -> None:
         row = app._event_row(

@@ -218,8 +218,6 @@ typedef enum {
     VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE,
     VIBE_STICK_EVENT_MOTION_START,
     VIBE_STICK_EVENT_MOTION_STOP,
-    VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER,
-    VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE,
     VIBE_STICK_EVENT_TTS_PROBE,
     VIBE_STICK_EVENT_OTA_CHECK,
     VIBE_STICK_EVENT_BRIDGE_SCAN_FULL,
@@ -413,6 +411,7 @@ static atomic_bool s_recording_finalize_active;
 static char s_recording_finalize_event_name[32];
 static char s_ptt_followup_session_id[40];
 static int64_t s_ptt_followup_enter_deadline_ms;
+static atomic_bool s_ptt_followup_dispatch_active;
 static char s_last_tts_playback_request_id[56];
 static bool s_cyber_tts_waiting;
 static int64_t s_cyber_tts_wait_deadline_ms;
@@ -641,6 +640,7 @@ static void update_power_saving(int64_t now_ms);
 static void maybe_enter_deep_sleep(int64_t now_ms);
 static void build_bridge_url(const char *path_or_url, char *url, size_t url_len);
 static void clear_ptt_followup_enter_window(void);
+static bool start_ptt_followup_key_dispatch(const char *event_name, agent_sound_t sound);
 
 static bool queue_event(agent_event_type_t type)
 {
@@ -4389,6 +4389,56 @@ static void post_ptt_followup_key_event(const char *event_name, agent_sound_t so
     }
 }
 
+typedef struct {
+    const char *event_name;
+    agent_sound_t sound;
+} ptt_followup_key_dispatch_t;
+
+static const ptt_followup_key_dispatch_t s_ptt_followup_enter_dispatch = {
+    .event_name = "button_followup_enter",
+    .sound = VIBE_STICK_SOUND_FOLLOWUP_ENTER,
+};
+
+static const ptt_followup_key_dispatch_t s_ptt_followup_escape_dispatch = {
+    .event_name = "button_followup_escape",
+    .sound = VIBE_STICK_SOUND_FOLLOWUP_ESCAPE,
+};
+
+static void ptt_followup_key_dispatch_task(void *arg)
+{
+    const ptt_followup_key_dispatch_t *dispatch = arg;
+    if (dispatch) {
+        post_ptt_followup_key_event(dispatch->event_name, dispatch->sound);
+    }
+    atomic_store(&s_ptt_followup_dispatch_active, false);
+    vTaskDelete(NULL);
+}
+
+static bool start_ptt_followup_key_dispatch(const char *event_name, agent_sound_t sound)
+{
+    const ptt_followup_key_dispatch_t *dispatch =
+        sound == VIBE_STICK_SOUND_FOLLOWUP_ENTER
+            ? &s_ptt_followup_enter_dispatch
+            : &s_ptt_followup_escape_dispatch;
+    if (!event_name || strcmp(event_name, dispatch->event_name) != 0 ||
+        atomic_exchange(&s_ptt_followup_dispatch_active, true)) {
+        ESP_LOGW(TAG, "PTT follow-up key dispatch ignored event=%s",
+                 event_name ? event_name : "-");
+        return false;
+    }
+
+    BaseType_t ok = xTaskCreatePinnedToCore(ptt_followup_key_dispatch_task,
+                                            "ptt_followup", 4096,
+                                            (void *)dispatch, 4, NULL,
+                                            VIBE_STICK_NETWORK_CORE);
+    if (ok != pdPASS) {
+        atomic_store(&s_ptt_followup_dispatch_active, false);
+        ESP_LOGW(TAG, "PTT follow-up key task create failed");
+        return false;
+    }
+    return true;
+}
+
 static bool parse_recording_session_id(const char *json, char *session_id, size_t session_id_len)
 {
     cJSON *root = cJSON_Parse(json);
@@ -5148,7 +5198,8 @@ static void button_single_click_cb(void *button_handle, void *usr_data)
     if (recording_intent_is_cyber()) {
         clear_ptt_followup_enter_window();
     } else if (consume_ptt_followup_enter_window()) {
-        if (!queue_event(VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER)) {
+        if (!start_ptt_followup_key_dispatch("button_followup_enter",
+                                             VIBE_STICK_SOUND_FOLLOWUP_ENTER)) {
             clear_ptt_followup_enter_window();
         }
         return;
@@ -5174,7 +5225,8 @@ static void button_double_click_cb(void *button_handle, void *usr_data)
     }
 #endif
     if (consume_ptt_followup_enter_window()) {
-        if (!queue_event(VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE)) {
+        if (!start_ptt_followup_key_dispatch("button_followup_escape",
+                                             VIBE_STICK_SOUND_FOLLOWUP_ESCAPE)) {
             clear_ptt_followup_enter_window();
         }
         return;
@@ -5516,14 +5568,6 @@ static void app_task(void *arg)
                 s_motion_lift_armed = true;
                 s_motion_start_pending = false;
             }
-            break;
-        case VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER:
-            post_ptt_followup_key_event("button_followup_enter",
-                                        VIBE_STICK_SOUND_FOLLOWUP_ENTER);
-            break;
-        case VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE:
-            post_ptt_followup_key_event("button_followup_escape",
-                                        VIBE_STICK_SOUND_FOLLOWUP_ESCAPE);
             break;
         case VIBE_STICK_EVENT_TTS_PROBE: {
             clear_cyber_tts_wait();

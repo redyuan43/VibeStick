@@ -47,17 +47,19 @@ def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> Non
     button_single_click = button_single_click.split("static void button_double_click_cb", 1)[0]
 
     assert "#define PTT_ENTER_GRACE_MS 5000" in source
-    assert "VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER" in source
     assert '\\"event\\":\\"%s\\"' in source
     assert '"button_followup_enter"' in source
     assert '\\"session_id\\":\\"%s\\"' in source
+    assert "static void ptt_followup_key_dispatch_task" in source
+    assert "start_ptt_followup_key_dispatch" in source
     assert "recording_intent_is_cyber()" in button_single_click
     assert button_single_click.index("recording_intent_is_cyber()") < button_single_click.index(
         "consume_ptt_followup_enter_window()"
     )
     assert button_single_click.index("consume_ptt_followup_enter_window()") < button_single_click.index(
-        "queue_event(VIBE_STICK_EVENT_RECORDING_TOGGLE)"
+        "start_ptt_followup_key_dispatch"
     )
+    assert "queue_event(VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER)" not in button_single_click
 
 
 def test_ptt_release_followup_double_click_sends_escape_before_double_click_action() -> None:
@@ -65,12 +67,12 @@ def test_ptt_release_followup_double_click_sends_escape_before_double_click_acti
     button_double_click = source.split("static void button_double_click_cb", 1)[1]
     button_double_click = button_double_click.split("static void side_button_long_start_cb", 1)[0]
 
-    assert "VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE" in source
     assert '\\"event\\":\\"%s\\"' in source
     assert '"button_followup_escape"' in source
     assert button_double_click.index("consume_ptt_followup_enter_window()") < button_double_click.index(
-        "queue_event(VIBE_STICK_EVENT_DOUBLE_CLICK)"
+        "start_ptt_followup_key_dispatch"
     )
+    assert "queue_event(VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE)" not in button_double_click
 
 
 def test_ptt_followup_enter_arms_after_long_press_or_tap_stop() -> None:
@@ -417,8 +419,8 @@ def test_followup_enter_and_escape_use_distinct_buzz_sounds() -> None:
     assert "{.freq_hz = 3200, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS}" in followup_escape
     assert "{.freq_hz = 520, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS}" in followup_escape
     assert followup_enter != followup_escape
-    assert "post_ptt_followup_key_event(\"button_followup_enter\"" in main_source
-    assert "post_ptt_followup_key_event(\"button_followup_escape\"" in main_source
+    assert 'start_ptt_followup_key_dispatch("button_followup_enter"' in main_source
+    assert 'start_ptt_followup_key_dispatch("button_followup_escape"' in main_source
 
 
 def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:

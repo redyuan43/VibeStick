@@ -194,12 +194,18 @@ class BridgeStateStore:
             return self._state
 
     def update_from_event(self, event: dict[str, Any]) -> VibeStickState:
+        event_name = str(event.get("event") or "")
+        session_id = str(event.get("session_id") or "")
+        followup_key = {
+            "button_followup_enter": "enter",
+            "button_followup_escape": "escape",
+        }.get(event_name)
+        followup_allowed = False
         with self._lock:
-            event_name = str(event.get("event") or "")
             self._append_event_locked(
                 event_name or "event",
                 source=str(event.get("source") or ""),
-                session_id=str(event.get("session_id") or ""),
+                session_id=session_id,
                 status=str(event.get("status") or ""),
                 message=str(event.get("message") or ""),
             )
@@ -213,8 +219,36 @@ class BridgeStateStore:
                 self.refresh_quota_locked()
             elif event_name == "button_short":
                 self._state.alert = AlertState(event_id="", type=AlertType.NONE, message="")
+            elif followup_key:
+                followup_allowed = bool(
+                    session_id and session_id == self.recording.session.session_id
+                )
             self._save_state_locked()
-            return self._state
+
+        if followup_key:
+            if followup_allowed:
+                result = self.recording.paste_injector.press_key(followup_key)
+                event_result = "followup_key_sent" if result.success else "followup_key_failed"
+                with self._lock:
+                    self._append_event_locked(
+                        event_result,
+                        source=str(event.get("source") or ""),
+                        session_id=session_id,
+                        status=followup_key,
+                        message=result.message,
+                    )
+                    self._save_state_locked()
+            else:
+                with self._lock:
+                    self._append_event_locked(
+                        "followup_key_ignored",
+                        source=str(event.get("source") or ""),
+                        session_id=session_id,
+                        status=followup_key,
+                        message="Recording session did not match",
+                    )
+                    self._save_state_locked()
+        return self._state
 
     def refresh_quota(self) -> VibeStickState:
         with self._lock:
