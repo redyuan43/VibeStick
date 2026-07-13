@@ -75,6 +75,7 @@
 #define OTA_READ_BUFFER_BYTES 4096
 #define OTA_PERIODIC_CHECK_MS 300000
 #define HTTP_CLIENT_BUFFER_SIZE 2048
+#define BRIDGE_HEALTH_RESPONSE_BYTES 512
 #define TTS_AUDIO_MAX_BYTES (1024 * 1024)
 #define FIRMWARE_BUILD_ID __DATE__ " " __TIME__
 #define VIBE_STICK_APP_CORE 0
@@ -2957,7 +2958,7 @@ static bool bridge_parse_discovered_health(const char *response, const char *hos
 static bool bridge_probe_discovered(const char *host, int port,
                                     bridge_discovered_profile_t *profile)
 {
-    char response[256] = {0};
+    char response[BRIDGE_HEALTH_RESPONSE_BYTES] = {0};
     esp_err_t anonymous_err =
         http_request_target("GET", host, port, "", "/health", NULL, response,
                             sizeof(response), BRIDGE_DISCOVERY_HEALTH_TIMEOUT_MS);
@@ -2996,7 +2997,7 @@ static bool bridge_probe_discovered(const char *host, int port,
 
 static bool bridge_probe_profile(const bridge_profile_config_t *profile, int timeout_ms)
 {
-    char response[160] = {0};
+    char response[BRIDGE_HEALTH_RESPONSE_BYTES] = {0};
     if (!profile || !profile->host || !profile->id || profile->host[0] == '\0' ||
         profile->id[0] == '\0') {
         return false;

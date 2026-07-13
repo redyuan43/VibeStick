@@ -336,13 +336,19 @@ def test_discovery_supports_legacy_and_generic_bridge_identity() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     parser = source.split("static bool bridge_parse_discovered_health", 1)[1]
     parser = parser.split("static bool bridge_probe_discovered", 1)[0]
+    discovery_probe = source.split("static bool bridge_probe_discovered", 1)[1]
+    discovery_probe = discovery_probe.split("static bool bridge_probe_profile", 1)[0]
     profile_probe = source.split("static bool bridge_probe_profile", 1)[1]
     profile_probe = profile_probe.split("static bool bridge_scan_add", 1)[0]
 
+    assert "#define BRIDGE_HEALTH_RESPONSE_BYTES 512" in source
     assert 'cJSON_GetObjectItemCaseSensitive(root, "bridge_name")' in parser
     assert 'cJSON_GetObjectItemCaseSensitive(root, "bridge_id")' in parser
     assert '"capswriter-m5-voice-bridge"' in parser
     assert "bridge_discovery_fallback_id(host" in parser
+    assert "char response[BRIDGE_HEALTH_RESPONSE_BYTES] = {0};" in discovery_probe
+    assert "char response[BRIDGE_HEALTH_RESPONSE_BYTES] = {0};" in profile_probe
+    assert "char response[160]" not in profile_probe
     assert 'strncmp(profile->id, "lan-", 4) == 0' in profile_probe
 
 
