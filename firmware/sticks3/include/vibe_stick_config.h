@@ -27,3 +27,10 @@
 #ifndef VIBE_STICK_BRIDGE_TOKEN
 #define VIBE_STICK_BRIDGE_TOKEN ""
 #endif
+#ifndef VIBE_STICK_BRIDGE_ID
+#define VIBE_STICK_BRIDGE_ID "capswriter-m5-voice-bridge"
+#endif
+#ifndef VIBE_STICK_BRIDGE_LABEL
+#define VIBE_STICK_BRIDGE_LABEL "CapsWriter"
+#endif
+#define VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT 8

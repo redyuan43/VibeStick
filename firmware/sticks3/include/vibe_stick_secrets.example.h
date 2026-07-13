@@ -17,3 +17,12 @@
 #define VIBE_STICK_BRIDGE_HOST "192.168.1.10"
 #define VIBE_STICK_BRIDGE_PORT 8765
 #define VIBE_STICK_BRIDGE_TOKEN "paste-generated-token-here"
+
+// Each bridge needs a stable DHCP address (or unique hostname), identity, and token.
+// The side button cycles these profiles on the device; recording always stays on the
+// selected profile for the whole session.
+#define VIBE_STICK_BRIDGE_PROFILES \
+    { \
+        { "desk", "Desk", "192.168.1.10", 8765, "replace-desk-token" }, \
+        { "studio", "Studio", "192.168.1.11", 8765, "replace-studio-token" }, \
+    }

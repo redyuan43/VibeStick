@@ -113,10 +113,10 @@
 #define BRIDGE_TARGET_HOST_KEY "host"
 #define BRIDGE_TARGET_PORT_KEY "port"
 #define BRIDGE_TARGET_SSID_KEY "ssid"
+#define BRIDGE_TARGET_PROFILE_KEY "profile"
 #define BRIDGE_TARGET_HOST_LEN 64
+#define BRIDGE_TARGET_PROFILE_LEN 65
 #define BRIDGE_TARGET_SOURCE_LEN 12
-#define BRIDGE_TARGET_FAILURE_LIMIT 3
-#define BRIDGE_DISCOVERY_HOSTNAME "vibestick.local"
 
 static const char *TAG = "vibe_stick";
 
@@ -139,6 +139,27 @@ typedef struct {
 
 static const wifi_profile_t k_configured_wifi_profiles[] = VIBE_STICK_WIFI_PROFILES;
 
+typedef struct {
+    const char *id;
+    const char *label;
+    const char *host;
+    int port;
+    const char *token;
+} bridge_profile_config_t;
+
+#ifndef VIBE_STICK_BRIDGE_PROFILES
+#define VIBE_STICK_BRIDGE_PROFILES \
+    { { VIBE_STICK_BRIDGE_ID, VIBE_STICK_BRIDGE_LABEL, VIBE_STICK_BRIDGE_HOST, \
+        VIBE_STICK_BRIDGE_PORT, VIBE_STICK_BRIDGE_TOKEN } }
+#endif
+
+static const bridge_profile_config_t k_configured_bridge_profiles[] = VIBE_STICK_BRIDGE_PROFILES;
+_Static_assert(sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]) > 0,
+               "at least one bridge profile is required");
+_Static_assert(sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]) <=
+                   VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT,
+               "too many bridge profiles");
+
 typedef enum {
     VIBE_STICK_EVENT_POLL_STATE,
     VIBE_STICK_EVENT_RECORDING_TOGGLE,
@@ -154,6 +175,7 @@ typedef enum {
     VIBE_STICK_EVENT_PTT_FOLLOWUP_ESCAPE,
     VIBE_STICK_EVENT_TTS_PROBE,
     VIBE_STICK_EVENT_OTA_CHECK,
+    VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT,
 } agent_event_type_t;
 
 typedef struct {
@@ -216,6 +238,8 @@ typedef struct {
 typedef struct {
     char host[BRIDGE_TARGET_HOST_LEN];
     int port;
+    size_t profile_index;
+    char profile_id[BRIDGE_TARGET_PROFILE_LEN];
     char source[BRIDGE_TARGET_SOURCE_LEN];
     char ssid[WIFI_PROFILE_SSID_LEN];
     int failure_count;
@@ -283,6 +307,8 @@ static SemaphoreHandle_t s_bridge_target_lock;
 static bridge_target_t s_bridge_target = {
     .host = VIBE_STICK_BRIDGE_HOST,
     .port = VIBE_STICK_BRIDGE_PORT,
+    .profile_index = 0,
+    .profile_id = VIBE_STICK_BRIDGE_ID,
     .source = "boot",
     .ssid = "",
     .failure_count = 0,
@@ -351,6 +377,7 @@ static lv_obj_t *s_battery_cap;
 static lv_obj_t *s_battery_bolt;
 static lv_obj_t *s_mode_label;
 static lv_obj_t *s_intent_label;
+static lv_obj_t *s_bridge_label;
 static lv_obj_t *s_ip_label;
 static lv_obj_t *s_pet_image;
 static lv_obj_t *s_mode_switch_layer;
@@ -510,6 +537,9 @@ static const lv_point_precise_t s_battery_bolt_points[] = {
 static void render_state(void);
 static void copy_json_string(cJSON *root, const char *key, char *target, size_t target_len);
 static void register_activity(void);
+static void cycle_bridge_profile(void);
+static void bridge_target_copy(bridge_target_t *target);
+static const bridge_profile_config_t *bridge_target_profile(const bridge_target_t *target);
 static bool front_button_is_pressed(void);
 static void poll_front_button_fallback(int64_t now_ms);
 static void update_power_saving(int64_t now_ms);
@@ -1802,6 +1832,11 @@ static void create_ui(void)
     s_intent_label = make_label(screen, "DICT", &lv_font_montserrat_10, lv_color_hex(0x8a9099), 32, LV_TEXT_ALIGN_LEFT);
     lv_obj_align(s_intent_label, LV_ALIGN_TOP_MID, 12, 9);
 
+    s_bridge_label = make_label(screen, "B CapsWriter", &lv_font_montserrat_10,
+                                 lv_color_hex(0x686e78), 128, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_long_mode(s_bridge_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_bridge_label, LV_ALIGN_BOTTOM_MID, 0, -20);
+
     s_ip_label = make_label(screen, "IP --", &lv_font_montserrat_10, lv_color_hex(0x686e78), 128, LV_TEXT_ALIGN_CENTER);
     lv_obj_align(s_ip_label, LV_ALIGN_BOTTOM_MID, 0, -7);
 
@@ -1928,6 +1963,16 @@ static void render_state(void)
     lv_obj_set_style_text_color(s_intent_label,
                                 recording_intent_is_cyber() ?
                                     provider->accent_color : lv_color_hex(0x8a9099),
+                                0);
+    bridge_target_t target;
+    bridge_target_copy(&target);
+    const bridge_profile_config_t *bridge_profile = bridge_target_profile(&target);
+    char bridge_text[40];
+    snprintf(bridge_text, sizeof(bridge_text), "B %s",
+             bridge_profile && bridge_profile->label ? bridge_profile->label : "Unassigned");
+    lv_label_set_text(s_bridge_label, bridge_text);
+    lv_obj_set_style_text_color(s_bridge_label,
+                                target.available ? lv_color_hex(0x8a9099) : lv_color_hex(0xc98484),
                                 0);
     update_pet_visual();
     lvgl_unlock();
@@ -2145,18 +2190,58 @@ static void bridge_target_copy(bridge_target_t *target)
     }
 }
 
-static void bridge_target_set(const char *host, int port, const char *source, bool available)
+static size_t bridge_profile_count(void)
 {
-    if (!host || host[0] == '\0' || port <= 0) {
-        return;
+    return sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]);
+}
+
+static const bridge_profile_config_t *bridge_profile_at(size_t index)
+{
+    return index < bridge_profile_count() ? &k_configured_bridge_profiles[index] : NULL;
+}
+
+static int bridge_profile_index_by_id(const char *id)
+{
+    if (!id || id[0] == '\0') {
+        return -1;
+    }
+    for (size_t index = 0; index < bridge_profile_count(); index++) {
+        const bridge_profile_config_t *profile = bridge_profile_at(index);
+        if (profile && profile->id && strcmp(profile->id, id) == 0) {
+            return (int)index;
+        }
+    }
+    return -1;
+}
+
+static const bridge_profile_config_t *bridge_target_profile(const bridge_target_t *target)
+{
+    if (!target) {
+        return NULL;
+    }
+    const bridge_profile_config_t *profile = bridge_profile_at(target->profile_index);
+    if (!profile || !profile->id || strcmp(profile->id, target->profile_id) != 0) {
+        return NULL;
+    }
+    return profile;
+}
+
+static bool bridge_target_set_profile(size_t profile_index, const char *source, bool available)
+{
+    const bridge_profile_config_t *profile = bridge_profile_at(profile_index);
+    if (!profile || !profile->id || !profile->host || profile->id[0] == '\0' ||
+        profile->host[0] == '\0' || profile->port <= 0) {
+        return false;
     }
     char ssid[WIFI_PROFILE_SSID_LEN] = {0};
     current_wifi_ssid(ssid, sizeof(ssid));
     if (s_bridge_target_lock) {
         xSemaphoreTake(s_bridge_target_lock, portMAX_DELAY);
     }
-    strlcpy(s_bridge_target.host, host, sizeof(s_bridge_target.host));
-    s_bridge_target.port = port;
+    strlcpy(s_bridge_target.host, profile->host, sizeof(s_bridge_target.host));
+    s_bridge_target.port = profile->port;
+    s_bridge_target.profile_index = profile_index;
+    strlcpy(s_bridge_target.profile_id, profile->id, sizeof(s_bridge_target.profile_id));
     strlcpy(s_bridge_target.source, source ? source : "runtime",
             sizeof(s_bridge_target.source));
     strlcpy(s_bridge_target.ssid, ssid, sizeof(s_bridge_target.ssid));
@@ -2165,6 +2250,7 @@ static void bridge_target_set(const char *host, int port, const char *source, bo
     if (s_bridge_target_lock) {
         xSemaphoreGive(s_bridge_target_lock);
     }
+    return true;
 }
 
 static void bridge_target_note_result(esp_err_t err)
@@ -2177,22 +2263,19 @@ static void bridge_target_note_result(esp_err_t err)
         s_bridge_target.available = true;
     } else {
         s_bridge_target.failure_count++;
-        if (s_bridge_target.failure_count >= BRIDGE_TARGET_FAILURE_LIMIT) {
-            ESP_LOGW(TAG, "bridge target stale host=%s port=%d source=%s",
-                     s_bridge_target.host, s_bridge_target.port, s_bridge_target.source);
-            s_bridge_target.available = false;
-        }
+        s_bridge_target.available = false;
     }
     if (s_bridge_target_lock) {
         xSemaphoreGive(s_bridge_target_lock);
     }
 }
 
-static bool bridge_target_needs_discovery(void)
+static bool bridge_target_needs_selection(void)
 {
     bridge_target_t target;
     bridge_target_copy(&target);
-    return !target.available || target.host[0] == '\0' || target.port <= 0;
+    return target.host[0] == '\0' || target.port <= 0 ||
+           bridge_target_profile(&target) == NULL;
 }
 
 static esp_err_t bridge_target_load_nvs(void)
@@ -2211,28 +2294,25 @@ static esp_err_t bridge_target_load_nvs(void)
     ESP_RETURN_ON_ERROR(err, TAG, "open bridge target NVS");
 
     char ssid[WIFI_PROFILE_SSID_LEN] = {0};
-    char host[BRIDGE_TARGET_HOST_LEN] = {0};
+    char profile_id[BRIDGE_TARGET_PROFILE_LEN] = {0};
     size_t ssid_len = sizeof(ssid);
-    size_t host_len = sizeof(host);
-    int32_t port = 0;
+    size_t profile_id_len = sizeof(profile_id);
     err = nvs_get_str(handle, BRIDGE_TARGET_SSID_KEY, ssid, &ssid_len);
     if (err == ESP_OK) {
-        err = nvs_get_str(handle, BRIDGE_TARGET_HOST_KEY, host, &host_len);
-    }
-    if (err == ESP_OK) {
-        err = nvs_get_i32(handle, BRIDGE_TARGET_PORT_KEY, &port);
+        err = nvs_get_str(handle, BRIDGE_TARGET_PROFILE_KEY, profile_id, &profile_id_len);
     }
     nvs_close(handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-    if (strcmp(ssid, current_ssid) != 0 || host[0] == '\0' ||
-        port <= 0 || port != VIBE_STICK_BRIDGE_PORT) {
+    if (err != ESP_OK || strcmp(ssid, current_ssid) != 0) {
         return ESP_ERR_NOT_FOUND;
     }
-    bridge_target_set(host, (int)port, "nvs", true);
-    ESP_LOGI(TAG, "bridge target restored ssid=%s host=%s port=%d",
-             current_ssid, host, (int)port);
+
+    int profile_index = bridge_profile_index_by_id(profile_id);
+    if (profile_index < 0 ||
+        !bridge_target_set_profile((size_t)profile_index, "nvs", false)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_LOGI(TAG, "bridge profile restored ssid=%s id=%s",
+             current_ssid, profile_id);
     return ESP_OK;
 }
 
@@ -2240,7 +2320,7 @@ static esp_err_t bridge_target_save_nvs(void)
 {
     bridge_target_t target;
     bridge_target_copy(&target);
-    if (!target.available || target.host[0] == '\0' || target.ssid[0] == '\0') {
+    if (target.profile_id[0] == '\0' || target.ssid[0] == '\0') {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2248,6 +2328,9 @@ static esp_err_t bridge_target_save_nvs(void)
     esp_err_t err = nvs_open(BRIDGE_TARGET_NAMESPACE, NVS_READWRITE, &handle);
     ESP_RETURN_ON_ERROR(err, TAG, "open bridge target NVS for write");
     err = nvs_set_str(handle, BRIDGE_TARGET_SSID_KEY, target.ssid);
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, BRIDGE_TARGET_PROFILE_KEY, target.profile_id);
+    }
     if (err == ESP_OK) {
         err = nvs_set_str(handle, BRIDGE_TARGET_HOST_KEY, target.host);
     }
@@ -2259,13 +2342,13 @@ static esp_err_t bridge_target_save_nvs(void)
     }
     nvs_close(handle);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "bridge target saved ssid=%s host=%s port=%d source=%s",
-                 target.ssid, target.host, target.port, target.source);
+        ESP_LOGI(TAG, "bridge profile saved ssid=%s id=%s source=%s",
+                 target.ssid, target.profile_id, target.source);
     }
     return err;
 }
 
-static void set_common_http_headers(esp_http_client_handle_t client)
+static void set_common_http_headers(esp_http_client_handle_t client, const char *token)
 {
     esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Name", FIRMWARE_NAME);
     esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Version", FIRMWARE_VERSION);
@@ -2286,14 +2369,14 @@ static void set_common_http_headers(esp_http_client_handle_t client)
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Ssid", ssid);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Bssid", bssid);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Rssi", rssi);
-    if (strlen(VIBE_STICK_BRIDGE_TOKEN) > 0) {
-        esp_http_client_set_header(client, "X-Vibe-Stick-Token", VIBE_STICK_BRIDGE_TOKEN);
+    if (token && token[0] != '\0') {
+        esp_http_client_set_header(client, "X-Vibe-Stick-Token", token);
     }
 }
 
 static esp_err_t http_request_target(const char *method, const char *host, int port,
-                                     const char *path, const char *body, char *response,
-                                     int response_len, int timeout_ms)
+                                     const char *token, const char *path, const char *body,
+                                     char *response, int response_len, int timeout_ms)
 {
     char url[160];
     snprintf(url, sizeof(url), "http://%s:%d%s", host, port, path);
@@ -2316,7 +2399,7 @@ static esp_err_t http_request_target(const char *method, const char *host, int p
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "http init");
     esp_http_client_set_method(client, strcmp(method, "POST") == 0 ? HTTP_METHOD_POST : HTTP_METHOD_GET);
-    set_common_http_headers(client);
+    set_common_http_headers(client, token);
     if (body) {
         esp_http_client_set_header(client, "Content-Type", "application/json");
         esp_http_client_set_post_field(client, body, strlen(body));
@@ -2330,11 +2413,15 @@ static esp_err_t http_request_target(const char *method, const char *host, int p
     return err;
 }
 
-static bool bridge_probe_target_timeout(const char *host, int port, int timeout_ms)
+static bool bridge_probe_profile(const bridge_profile_config_t *profile, int timeout_ms)
 {
     char response[160] = {0};
-    esp_err_t err = http_request_target("GET", host, port, "/health", NULL, response,
-                                        sizeof(response), timeout_ms);
+    if (!profile || !profile->host || !profile->id || profile->host[0] == '\0' ||
+        profile->id[0] == '\0') {
+        return false;
+    }
+    esp_err_t err = http_request_target("GET", profile->host, profile->port, profile->token,
+                                        "/health", NULL, response, sizeof(response), timeout_ms);
     if (err != ESP_OK || response[0] == '\0') {
         return false;
     }
@@ -2344,117 +2431,101 @@ static bool bridge_probe_target_timeout(const char *host, int port, int timeout_
     }
     cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
     cJSON *bridge_name = cJSON_GetObjectItemCaseSensitive(root, "bridge_name");
+    cJSON *bridge_id = cJSON_GetObjectItemCaseSensitive(root, "bridge_id");
     bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok) &&
                    cJSON_IsString(bridge_name) &&
                    (strcmp(bridge_name->valuestring, "vibestick-bridge") == 0 ||
-                    strcmp(bridge_name->valuestring, "capswriter-m5-voice-bridge") == 0);
+                    strcmp(bridge_name->valuestring, "capswriter-m5-voice-bridge") == 0) &&
+                   cJSON_IsString(bridge_id) &&
+                   strcmp(bridge_id->valuestring, profile->id) == 0;
     cJSON_Delete(root);
     return healthy;
 }
 
-static bool bridge_probe_target(const char *host, int port)
-{
-    return bridge_probe_target_timeout(host, port, 1200);
-}
-
-static bool bridge_discover_mdns(void)
-{
-    struct addrinfo hints = {
-        .ai_family = AF_INET,
-        .ai_socktype = SOCK_STREAM,
-    };
-    struct addrinfo *result = NULL;
-    int rc = getaddrinfo(BRIDGE_DISCOVERY_HOSTNAME, NULL, &hints, &result);
-    if (rc != 0 || result == NULL) {
-        ESP_LOGD(TAG, "bridge mDNS lookup failed host=%s rc=%d",
-                 BRIDGE_DISCOVERY_HOSTNAME, rc);
-        return false;
-    }
-    char host[BRIDGE_TARGET_HOST_LEN] = {0};
-    for (struct addrinfo *item = result; item != NULL; item = item->ai_next) {
-        struct sockaddr_in *addr = (struct sockaddr_in *)item->ai_addr;
-        if (addr && inet_ntop(AF_INET, &addr->sin_addr, host, sizeof(host)) != NULL) {
-            break;
-        }
-    }
-    freeaddrinfo(result);
-    if (host[0] == '\0') {
-        return false;
-    }
-    if (!bridge_probe_target(host, VIBE_STICK_BRIDGE_PORT)) {
-        ESP_LOGW(TAG, "bridge mDNS candidate failed host=%s port=%d",
-                 host, VIBE_STICK_BRIDGE_PORT);
-        return false;
-    }
-    bridge_target_set(host, VIBE_STICK_BRIDGE_PORT, "mdns", true);
-    (void)bridge_target_save_nvs();
-    ESP_LOGI(TAG, "bridge target discovered host=%s port=%d",
-             host, VIBE_STICK_BRIDGE_PORT);
-    return true;
-}
-
-static bool bridge_discover_subnet(void)
-{
-    unsigned int a = 0;
-    unsigned int b = 0;
-    unsigned int c = 0;
-    unsigned int self = 0;
-    if (sscanf(s_state.wifi_ip, "%u.%u.%u.%u", &a, &b, &c, &self) != 4 ||
-        a > 255 || b > 255 || c > 255 || self > 255) {
-        return false;
-    }
-
-    ESP_LOGI(TAG, "bridge subnet scan start prefix=%u.%u.%u.0/24 port=%d",
-             a, b, c, VIBE_STICK_BRIDGE_PORT);
-    for (int host_id = 254; host_id >= 1; host_id--) {
-        if ((unsigned int)host_id == self) {
-            continue;
-        }
-        char host[BRIDGE_TARGET_HOST_LEN] = {0};
-        snprintf(host, sizeof(host), "%u.%u.%u.%d", a, b, c, host_id);
-        if (!bridge_probe_target_timeout(host, VIBE_STICK_BRIDGE_PORT, 180)) {
-            continue;
-        }
-        bridge_target_set(host, VIBE_STICK_BRIDGE_PORT, "scan", true);
-        (void)bridge_target_save_nvs();
-        ESP_LOGI(TAG, "bridge target found by subnet scan host=%s port=%d",
-                 host, VIBE_STICK_BRIDGE_PORT);
-        return true;
-    }
-    ESP_LOGW(TAG, "bridge subnet scan found no bridge prefix=%u.%u.%u.0/24",
-             a, b, c);
-    return false;
-}
-
 static void bridge_ensure_target(void)
 {
-    if (!wifi_connected() || !bridge_target_needs_discovery()) {
+    if (!wifi_connected() || !bridge_target_needs_selection()) {
         return;
     }
     if (bridge_target_load_nvs() == ESP_OK) {
-        bridge_target_t target;
-        bridge_target_copy(&target);
-        if (bridge_probe_target(target.host, target.port)) {
-            return;
+        return;
+    }
+    if (bridge_target_set_profile(0, "default", false)) {
+        (void)bridge_target_save_nvs();
+    }
+}
+
+static void cycle_bridge_profile(void)
+{
+    if (recording_network_busy()) {
+        ESP_LOGI(TAG, "bridge profile switch ignored while recording");
+        return;
+    }
+    bridge_ensure_target();
+    bridge_target_t current;
+    bridge_target_copy(&current);
+    size_t count = bridge_profile_count();
+    for (size_t offset = 1; offset <= count; offset++) {
+        size_t index = (current.profile_index + offset) % count;
+        const bridge_profile_config_t *profile = bridge_profile_at(index);
+        if (!bridge_probe_profile(profile, 1200)) {
+            continue;
         }
-        bridge_target_note_result(ESP_FAIL);
-    }
-    if (bridge_discover_mdns()) {
+        if (!bridge_target_set_profile(index, "manual", true)) {
+            continue;
+        }
+        (void)bridge_target_save_nvs();
+        ESP_LOGI(TAG, "bridge profile selected id=%s host=%s port=%d",
+                 profile->id, profile->host, profile->port);
+        render_state();
+        show_mode_switch_visual(profile->label ? profile->label : profile->id,
+                                "BRIDGE READY",
+                                s_mode_switch_dict_frames,
+                                sizeof(s_mode_switch_dict_frames) /
+                                    sizeof(s_mode_switch_dict_frames[0]),
+                                lv_color_hex(0x86efac));
         return;
     }
-    if (bridge_discover_subnet()) {
-        return;
+    ESP_LOGW(TAG, "no configured bridge profile is reachable");
+    show_mode_switch_visual("NO BRIDGE",
+                            "SIDE 1X RETRY",
+                            s_mode_switch_dict_frames,
+                            sizeof(s_mode_switch_dict_frames) /
+                                sizeof(s_mode_switch_dict_frames[0]),
+                            lv_color_hex(0xfca5a5));
+}
+
+static esp_err_t bridge_prepare_active_target(bridge_target_t *target)
+{
+    bridge_ensure_target();
+    bridge_target_t current;
+    bridge_target_copy(&current);
+    const bridge_profile_config_t *profile = bridge_target_profile(&current);
+    if (!profile) {
+        return ESP_ERR_NOT_FOUND;
     }
-    bridge_target_set(VIBE_STICK_BRIDGE_HOST, VIBE_STICK_BRIDGE_PORT, "fallback", true);
+    if (!current.available) {
+        if (!bridge_probe_profile(profile, 1200)) {
+            bridge_target_note_result(ESP_FAIL);
+            return ESP_ERR_NOT_FOUND;
+        }
+        bridge_target_note_result(ESP_OK);
+        bridge_target_copy(&current);
+    }
+    if (target) {
+        *target = current;
+    }
+    return ESP_OK;
 }
 
 static esp_err_t http_request_timeout(const char *method, const char *path, const char *body,
                                       char *response, int response_len, int timeout_ms)
 {
-    bridge_ensure_target();
     bridge_target_t target;
-    bridge_target_copy(&target);
-    esp_err_t err = http_request_target(method, target.host, target.port, path, body,
+    ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG, "prepare bridge target");
+    const bridge_profile_config_t *profile = bridge_target_profile(&target);
+    const char *token = profile ? profile->token : VIBE_STICK_BRIDGE_TOKEN;
+    esp_err_t err = http_request_target(method, target.host, target.port, token, path, body,
                                         response, response_len, timeout_ms);
     bridge_target_note_result(err);
     return err;
@@ -2470,9 +2541,8 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
                                   char *response, int response_len)
 {
     char url[256];
-    bridge_ensure_target();
     bridge_target_t target;
-    bridge_target_copy(&target);
+    ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG, "prepare bridge target");
     snprintf(url, sizeof(url), "http://%s:%d%s", target.host, target.port, path);
     http_response_capture_t capture = {
         .data = response,
@@ -2493,7 +2563,8 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "http init");
     esp_http_client_set_method(client, HTTP_METHOD_POST);
-    set_common_http_headers(client);
+    const bridge_profile_config_t *profile = bridge_target_profile(&target);
+    set_common_http_headers(client, profile ? profile->token : VIBE_STICK_BRIDGE_TOKEN);
     esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
     esp_http_client_set_header(client, "X-Vibe-Stick-Sample-Rate", "16000");
     esp_http_client_set_header(client, "X-Vibe-Stick-Channels", "1");
@@ -2574,6 +2645,8 @@ static esp_err_t download_tts_audio(uint8_t **audio, size_t *audio_len)
     *audio = NULL;
     *audio_len = 0;
 
+    bridge_target_t target;
+    ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG, "prepare bridge target");
     char url[256];
     build_bridge_url(VIBE_STICK_RECORDING_TTS_PATH, url, sizeof(url));
     esp_http_client_config_t config = {
@@ -2584,7 +2657,8 @@ static esp_err_t download_tts_audio(uint8_t **audio, size_t *audio_len)
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "tts http init");
-    set_common_http_headers(client);
+    const bridge_profile_config_t *profile = bridge_target_profile(&target);
+    set_common_http_headers(client, profile ? profile->token : VIBE_STICK_BRIDGE_TOKEN);
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
@@ -2787,6 +2861,8 @@ static esp_err_t perform_ota_update(const ota_manifest_t *manifest)
     }
 
     char url[256];
+    bridge_target_t target;
+    ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG, "prepare bridge target");
     build_bridge_url(path_or_url, url, sizeof(url));
     ESP_LOGI(TAG, "OTA update available board=%s version=%s build=%s size=%d partition=%s",
              manifest->board, manifest->version, manifest->build_id, manifest->size,
@@ -2801,13 +2877,8 @@ static esp_err_t perform_ota_update(const ota_manifest_t *manifest)
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "OTA http init");
-    esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Name", FIRMWARE_NAME);
-    esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Version", FIRMWARE_VERSION);
-    esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Transport", TRANSPORT);
-    esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Build-Date", FIRMWARE_BUILD_ID);
-    if (strlen(VIBE_STICK_BRIDGE_TOKEN) > 0) {
-        esp_http_client_set_header(client, "X-Vibe-Stick-Token", VIBE_STICK_BRIDGE_TOKEN);
-    }
+    const bridge_profile_config_t *profile = bridge_target_profile(&target);
+    set_common_http_headers(client, profile ? profile->token : VIBE_STICK_BRIDGE_TOKEN);
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
@@ -4145,6 +4216,14 @@ static void side_button_double_click_cb(void *button_handle, void *usr_data)
     queue_event(VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE);
 }
 
+static void side_button_single_click_cb(void *button_handle, void *usr_data)
+{
+    (void)button_handle;
+    (void)usr_data;
+    register_activity();
+    queue_event(VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT);
+}
+
 static void button_long_start_cb(void *button_handle, void *usr_data)
 {
     (void)button_handle;
@@ -4220,6 +4299,9 @@ static esp_err_t init_button(void)
         .enable_power_save = false,
     };
     ESP_RETURN_ON_ERROR(iot_button_new_gpio_device(&button_config, &side_gpio_config, &side_button), TAG, "side button");
+    ESP_RETURN_ON_ERROR(iot_button_register_cb(side_button, BUTTON_SINGLE_CLICK, NULL,
+                                               side_button_single_click_cb, NULL),
+                        TAG, "side button single");
     ESP_RETURN_ON_ERROR(iot_button_register_cb(side_button, BUTTON_DOUBLE_CLICK, NULL,
                                                side_button_double_click_cb, NULL),
                         TAG, "side button double");
@@ -4364,6 +4446,9 @@ static void app_task(void *arg)
             break;
         case VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE:
             toggle_recording_intent();
+            break;
+        case VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT:
+            cycle_bridge_profile();
             break;
         case VIBE_STICK_EVENT_MOTION_START:
             if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&

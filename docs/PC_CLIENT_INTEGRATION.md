@@ -1,9 +1,9 @@
 # PC Client Integration
 
 This document describes what a PC-side client must provide when it replaces or
-embeds the default VibeStick bridge. The firmware is intentionally simple: it
-talks to one HTTP bridge on the LAN and expects the bridge to own desktop
-integration, transcription, paste injection, and OTA file serving.
+embeds the default VibeStick bridge. The firmware selects one configured HTTP
+bridge per recording session; that bridge owns desktop integration,
+transcription, paste injection, and OTA file serving.
 
 ## Required Bridge Shape
 
@@ -26,8 +26,9 @@ The firmware sends this token as:
 X-Vibe-Stick-Token: <shared-token>
 ```
 
-Protected endpoints are:
+When a token is configured, these endpoints require it:
 
+- `GET /health`
 - `POST /event`
 - `POST /quota/refresh`
 - `POST /recording/start`
@@ -36,6 +37,25 @@ Protected endpoints are:
 
 OTA `GET` endpoints are intentionally not token-protected in the current
 firmware because they are used during recovery-style updates on the local LAN.
+
+## Multiple Bridges
+
+For multiple desktop targets on the same LAN, configure each bridge with a
+stable DHCP address or unique hostname, a unique bridge ID, a human-readable
+label, and its own token:
+
+```text
+M5_VOICE_BRIDGE_ID=desk
+M5_VOICE_BRIDGE_LABEL="Desk"
+M5_VOICE_BRIDGE_TOKEN=<desk-token>
+```
+
+`GET /health` must return the configured `bridge_id` and requires the token
+when one is configured. Add matching `{ id, label, host, port, token }`
+profiles to the device's local `VIBE_STICK_BRIDGE_PROFILES` configuration.
+The StickS3 side button cycles only these profiles, validates `/health` before
+switching, and keeps one selected profile for the entire recording session.
+It intentionally does not scan the LAN and select the first matching bridge.
 
 ## State Endpoint
 
@@ -220,7 +240,7 @@ in that precedence order.
 
 Before shipping a PC client integration:
 
-- `GET /health` returns `ok: true`.
+- Authenticated `GET /health` returns `ok: true` and the configured `bridge_id`.
 - `GET /state` returns valid JSON while no device is connected.
 - `POST /recording/start` creates or selects one active recording session.
 - `POST /recording/audio?...append=1` appends raw PCM chunks.
