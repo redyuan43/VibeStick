@@ -66,6 +66,8 @@
 #define LVGL_TICK_PERIOD_MS 10
 #define LVGL_TASK_STACK_BYTES 12288
 #define BATTERY_FILL_MAX_WIDTH 20
+#define BATTERY_LOW_THRESHOLD_PERCENT 20
+#define BATTERY_HIGH_THRESHOLD_PERCENT 50
 #define RECORDING_UPLOAD_BATCH_CHUNKS 4
 #define RECORDING_UPLOAD_BUFFER_BYTES 8192
 #define RECORDING_UPLOAD_WAIT_MS 10000
@@ -453,7 +455,6 @@ static volatile int64_t s_front_button_iot_up_ms;
 
 static lv_display_t *s_display;
 static lv_obj_t *s_wifi_label;
-static lv_obj_t *s_battery_label;
 static lv_obj_t *s_battery_icon;
 static lv_obj_t *s_battery_fill;
 static lv_obj_t *s_battery_cap;
@@ -1446,26 +1447,26 @@ static void set_battery_ui(int battery_value, bool charging, bool usb_powered)
         battery_value = 100;
     }
 
-    char battery[8];
-    if (battery_value > 0) {
-        snprintf(battery, sizeof(battery), "%d%%", battery_value);
-    } else {
-        snprintf(battery, sizeof(battery), "--%%");
-    }
-    lv_label_set_text(s_battery_label, battery);
-
-    int fill_width = battery_value > 0 ? (battery_value * 20) / 100 : 0;
+    int fill_width = battery_value > 0 ? (battery_value * BATTERY_FILL_MAX_WIDTH) / 100 : 0;
     if (fill_width < 1 && battery_value > 0) {
         fill_width = 1;
     }
 
     const bool external_power = charging || usb_powered;
-    const lv_color_t normal_color = lv_color_hex(0xf3f4f6);
-    const lv_color_t charging_color = lv_color_hex(0x32d583);
+    lv_color_t battery_color = lv_color_hex(0x6b7280);
+    if (s_battery_display_valid) {
+        if (battery_value < BATTERY_LOW_THRESHOLD_PERCENT) {
+            battery_color = lv_color_hex(0xef4444);
+        } else if (battery_value < BATTERY_HIGH_THRESHOLD_PERCENT) {
+            battery_color = lv_color_hex(0xfacc15);
+        } else {
+            battery_color = lv_color_hex(0x32d583);
+        }
+    }
 
-    lv_obj_set_style_border_color(s_battery_icon, normal_color, 0);
-    lv_obj_set_style_bg_color(s_battery_fill, external_power ? charging_color : normal_color, 0);
-    lv_obj_set_style_bg_color(s_battery_cap, normal_color, 0);
+    lv_obj_set_style_border_color(s_battery_icon, battery_color, 0);
+    lv_obj_set_style_bg_color(s_battery_fill, battery_color, 0);
+    lv_obj_set_style_bg_color(s_battery_cap, battery_color, 0);
     lv_obj_set_width(s_battery_fill, fill_width);
 
     if (s_battery_bolt) {
@@ -1993,12 +1994,10 @@ static void create_ui(void)
     s_wifi_label = make_label(screen, "WiFi", &lv_font_montserrat_10, lv_color_hex(0xf3f4f6), 38, LV_TEXT_ALIGN_LEFT);
     lv_obj_align(s_wifi_label, LV_ALIGN_TOP_LEFT, 9, 9);
 
-    s_battery_label = make_label(screen, "--%", &lv_font_montserrat_10, lv_color_hex(0xf3f4f6), 28, LV_TEXT_ALIGN_RIGHT);
-    lv_obj_align(s_battery_label, LV_ALIGN_TOP_RIGHT, -35, 9);
     s_battery_icon = make_plain_obj(screen, 26, 13, lv_color_hex(0x000000), LV_OPA_TRANSP, 3);
     lv_obj_set_style_border_width(s_battery_icon, 1, 0);
     lv_obj_set_style_border_color(s_battery_icon, lv_color_hex(0xf3f4f6), 0);
-    lv_obj_align(s_battery_icon, LV_ALIGN_TOP_RIGHT, -7, 9);
+    lv_obj_align(s_battery_icon, LV_ALIGN_TOP_RIGHT, -9, 9);
     s_battery_fill = make_plain_obj(s_battery_icon, 1, 9, lv_color_hex(0xf3f4f6), LV_OPA_COVER, 2);
     lv_obj_align(s_battery_fill, LV_ALIGN_LEFT_MID, 2, 0);
     s_battery_bolt = lv_line_create(s_battery_icon);

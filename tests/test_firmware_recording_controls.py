@@ -480,6 +480,24 @@ def test_battery_display_filters_raw_voltage_status() -> None:
     assert "power status battery_raw=%d battery_display=%d battery_mv=%d charging=%d usb=%d" in source
 
 
+def test_battery_ui_uses_color_bands_without_a_percentage_label() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    battery_ui = source.split("static void set_battery_ui", 1)[1]
+    battery_ui = battery_ui.split("typedef struct {", 1)[0]
+
+    assert "BATTERY_LOW_THRESHOLD_PERCENT 20" in source
+    assert "BATTERY_HIGH_THRESHOLD_PERCENT 50" in source
+    assert "s_battery_label" not in source
+    assert 'snprintf(battery' not in battery_ui
+    assert "battery_value < BATTERY_LOW_THRESHOLD_PERCENT" in battery_ui
+    assert "battery_value < BATTERY_HIGH_THRESHOLD_PERCENT" in battery_ui
+    assert "0xef4444" in battery_ui
+    assert "0xfacc15" in battery_ui
+    assert "0x32d583" in battery_ui
+    assert "lv_obj_set_style_border_color(s_battery_icon, battery_color, 0);" in battery_ui
+    assert "lv_obj_set_style_bg_color(s_battery_fill, battery_color, 0);" in battery_ui
+
+
 def test_state_polling_stops_while_screen_is_off() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 
