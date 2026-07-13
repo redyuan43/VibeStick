@@ -590,8 +590,6 @@ static provider_display_state_t s_provider_states[PROVIDER_COUNT] = {
     },
 };
 
-extern const lv_font_t vibe_stick_cn_16;
-#define FONT_CN (&vibe_stick_cn_16)
 #define FONT_ASCII (&lv_font_montserrat_10)
 
 static const agent_provider_config_t s_provider_configs[] = {
@@ -1428,20 +1426,6 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text, const lv_font_t 
     return label;
 }
 
-static bool text_is_ascii(const char *text)
-{
-    if (!text) {
-        return true;
-    }
-    while (*text) {
-        if ((unsigned char)*text >= 0x80) {
-            return false;
-        }
-        ++text;
-    }
-    return true;
-}
-
 static lv_obj_t *make_plain_obj(lv_obj_t *parent, int32_t w, int32_t h,
                                 lv_color_t color, lv_opa_t opa, int32_t radius)
 {
@@ -1754,7 +1738,7 @@ static void refresh_bridge_selection_visual(void)
     }
     bridge_target_t target;
     bridge_target_copy(&target);
-    show_bridge_selection_visual(target.available ? "在线" : "离线",
+    show_bridge_selection_visual(target.available ? "ONLINE" : "OFFLINE",
                                  target.available ? lv_color_hex(0x86efac)
                                                   : lv_color_hex(0xfca5a5));
 }
@@ -1764,7 +1748,7 @@ static void begin_bridge_selection_confirmation(void)
     char title[BRIDGE_TARGET_LABEL_LEN] = {0};
     bridge_selection_title(title, sizeof(title));
     show_persistent_mode_switch_visual(
-        title, "确认中",
+        title, "CONFIRMING",
         s_pet_approval_frames,
         sizeof(s_pet_approval_frames) / sizeof(s_pet_approval_frames[0]),
         lv_color_hex(0x93c5fd));
@@ -1836,7 +1820,7 @@ static void update_pet_visual(void)
             sizeof(s_pet_done_frames) / sizeof(s_pet_done_frames[0]);
         s_mode_switch_frame_index = 0;
         s_mode_switch_next_frame_ms = 0;
-        lv_label_set_text(s_mode_switch_hint, "已确认");
+        lv_label_set_text(s_mode_switch_hint, "CONFIRMED");
         lv_obj_set_style_text_color(s_mode_switch_title,
                                     lv_color_hex(0x86efac), 0);
         ESP_LOGI(TAG, "bridge selection confirmation visible");
@@ -2124,13 +2108,13 @@ static void create_ui(void)
                                                   lv_color_hex(0xf4f5f7), LV_OPA_COVER, 3);
     }
 
-    s_recording_title = make_label(s_recording_overlay, "正在聆听", FONT_CN,
+    s_recording_title = make_label(s_recording_overlay, "LISTENING", FONT_ASCII,
                                    lv_color_hex(0xf4f5f7), 120, LV_TEXT_ALIGN_CENTER);
-    lv_obj_set_style_text_font(s_recording_title, FONT_CN, 0);
+    lv_obj_set_style_text_font(s_recording_title, FONT_ASCII, 0);
     lv_obj_align(s_recording_title, LV_ALIGN_CENTER, 0, 22);
-    s_recording_hint = make_label(s_recording_overlay, "松开发送", FONT_CN,
+    s_recording_hint = make_label(s_recording_overlay, "RELEASE TO SEND", FONT_ASCII,
                                   lv_color_hex(0x8b9098), 120, LV_TEXT_ALIGN_CENTER);
-    lv_obj_set_style_text_font(s_recording_hint, FONT_CN, 0);
+    lv_obj_set_style_text_font(s_recording_hint, FONT_ASCII, 0);
     lv_obj_align(s_recording_hint, LV_ALIGN_BOTTOM_MID, 0, -22);
 }
 
@@ -2187,15 +2171,11 @@ static void show_recording_overlay(const char *title, const char *hint, bool vis
     lvgl_lock();
     if (visible) {
         if (title) {
-            lv_obj_set_style_text_font(s_recording_title,
-                                       text_is_ascii(title) ? FONT_ASCII : FONT_CN,
-                                       0);
+            lv_obj_set_style_text_font(s_recording_title, FONT_ASCII, 0);
             lv_label_set_text(s_recording_title, title);
         }
         if (hint) {
-            lv_obj_set_style_text_font(s_recording_hint,
-                                       text_is_ascii(hint) ? FONT_ASCII : FONT_CN,
-                                       0);
+            lv_obj_set_style_text_font(s_recording_hint, FONT_ASCII, 0);
             lv_label_set_text(s_recording_hint, hint);
             if (hint[0] == '\0') {
                 lv_obj_add_flag(s_recording_hint, LV_OBJ_FLAG_HIDDEN);
@@ -2225,7 +2205,7 @@ static void start_cyber_tts_wait(void)
     s_cyber_tts_wait_deadline_ms =
         esp_timer_get_time() / 1000 + VIBE_STICK_CYBER_TTS_WAIT_TIMEOUT_MS;
     ESP_LOGI(TAG, "cyber tts wait started");
-    show_recording_overlay("正在发送", "", true);
+    show_recording_overlay("SENDING", "", true);
 }
 
 static void maybe_timeout_cyber_tts_wait(int64_t now_ms)
@@ -3307,7 +3287,7 @@ static void bridge_discovery_task(void *arg)
                                     lv_color_hex(0x86efac));
         }
     } else if (!atomic_load(&s_bridge_selection_active)) {
-        show_mode_switch_visual("NO BRIDGE", "离线",
+        show_mode_switch_visual("NO BRIDGE", "OFFLINE",
                                 s_mode_switch_dict_frames,
                                 sizeof(s_mode_switch_dict_frames) /
                                     sizeof(s_mode_switch_dict_frames[0]),
@@ -3392,7 +3372,7 @@ static void cycle_bridge_profile(void)
     size_t count = bridge_saved_profile_count();
     if (count == 0) {
         ESP_LOGW(TAG, "bridge selection has no saved profiles");
-        show_bridge_selection_visual("离线", lv_color_hex(0xfca5a5));
+        show_bridge_selection_visual("OFFLINE", lv_color_hex(0xfca5a5));
         return;
     }
 
@@ -3416,14 +3396,14 @@ static void cycle_bridge_profile(void)
         !bridge_target_set_profile(next_index, "manual", false)) {
         ESP_LOGW(TAG, "bridge selection failed index=%u",
                  (unsigned int)next_index);
-        show_bridge_selection_visual("离线", lv_color_hex(0xfca5a5));
+        show_bridge_selection_visual("OFFLINE", lv_color_hex(0xfca5a5));
         return;
     }
     (void)bridge_target_save_nvs();
     ESP_LOGI(TAG, "bridge profile selected id=%s host=%s port=%d",
              next.id, next.host, next.port);
     render_state();
-    show_bridge_selection_visual("连接中", lv_color_hex(0x93c5fd));
+    show_bridge_selection_visual("CONNECTING", lv_color_hex(0x93c5fd));
     (void)queue_event(VIBE_STICK_EVENT_POLL_STATE);
 }
 
@@ -4669,7 +4649,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
     set_recording_session_active(true);
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_NONE));
-    show_recording_overlay("正在连接", "", true);
+    show_recording_overlay("CONNECTING", "", true);
 
     ESP_LOGI(TAG, "recording start event=%s mode=%s intent=%s session=%s",
              event_name,
@@ -4704,7 +4684,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
         }
     } else {
         ESP_LOGW(TAG, "recording start bridge request failed: %s", esp_err_to_name(err));
-        show_recording_overlay("连接失败", "", true);
+        show_recording_overlay("CONNECT FAILED", "", true);
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
         s_recording_session_id[0] = '\0';
@@ -4721,7 +4701,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
     esp_err_t audio_err = vibe_audio_start();
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "hardware recording start failed: %s", esp_err_to_name(audio_err));
-        show_recording_overlay("录音失败", "", true);
+        show_recording_overlay("MIC FAILED", "", true);
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
         s_recording_session_id[0] = '\0';
@@ -4732,7 +4712,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
     if (!start_recording_upload_task()) {
         (void)vibe_audio_stop();
         vibe_audio_clear();
-        show_recording_overlay("发送失败", "", true);
+        show_recording_overlay("SEND FAILED", "", true);
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
         s_recording_session_id[0] = '\0';
@@ -4740,7 +4720,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
         return false;
     }
-    show_recording_overlay("正在聆听", hint, true);
+    show_recording_overlay("LISTENING", hint, true);
     return true;
 }
 
@@ -4758,7 +4738,7 @@ static void finish_recording_stop(const char *event_name)
     log_recording_diagnostics();
     vibe_audio_clear();
 
-    show_recording_overlay("正在识别", "", true);
+    show_recording_overlay("TRANSCRIBING", "", true);
     bool paste_result = !recording_intent_is_cyber();
     ESP_LOGI(TAG, "recording stop event=%s mode=%s intent=%s session=%s paste=%d",
              event_name,
@@ -4797,11 +4777,11 @@ static void finish_recording_stop(const char *event_name)
         ESP_LOGW(TAG, "recording stop bridge request failed: %s", esp_err_to_name(err));
         const char *title = (strcmp(recording_status, "audio_skipped") == 0 ||
                              strcmp(recording_status, "transcript_rejected") == 0)
-            ? "未听清" : "识别失败";
+            ? "NOT HEARD" : "TRANSCRIBE FAILED";
         show_recording_overlay(title, "", true);
         vTaskDelay(pdMS_TO_TICKS(900));
     } else if (strcmp(recording_status, "cyber_done") == 0) {
-        show_recording_overlay("正在播放", "", true);
+        show_recording_overlay("PLAYING", "", true);
         esp_err_t playback_err = play_latest_tts_audio();
         post_recording_playback_event(playback_err == ESP_OK ? "tts_played" : "tts_failed",
                                       playback_err);
@@ -4837,7 +4817,7 @@ static void handle_recording_stop(const char *event_name)
         ESP_LOGI(TAG, "recording stop ignored while finalize is active");
         return;
     }
-    show_recording_overlay("正在发送", "", true);
+    show_recording_overlay("SENDING", "", true);
     s_tap_recording_active = false;
 
     if (s_recording_session_id[0] == '\0') {
@@ -4888,7 +4868,7 @@ static void handle_recording_toggle(void)
         s_tap_recording_active = false;
         return;
     }
-    s_tap_recording_active = handle_recording_start("button_tap_start", "再按发送");
+    s_tap_recording_active = handle_recording_start("button_tap_start", "TAP TO SEND");
 }
 
 static bool wifi_profile_has_ssid(const wifi_profile_t *profile)
@@ -5500,7 +5480,7 @@ static void app_task(void *arg)
             }
             break;
         case VIBE_STICK_EVENT_LONG_START:
-            if (!handle_recording_start("button_long_start", "松开发送")) {
+            if (!handle_recording_start("button_long_start", "RELEASE TO SEND")) {
                 s_long_press_active = false;
             }
             break;
@@ -5524,7 +5504,7 @@ static void app_task(void *arg)
                 !s_motion_recording_active) {
                 s_motion_start_pending = false;
                 s_motion_recording_active =
-                    handle_recording_start("motion_lift_start", "放回发送");
+                    handle_recording_start("motion_lift_start", "PLACE DOWN");
                 if (!s_motion_recording_active) {
                     s_motion_lift_armed = true;
                 }
@@ -5548,7 +5528,7 @@ static void app_task(void *arg)
             break;
         case VIBE_STICK_EVENT_TTS_PROBE: {
             clear_cyber_tts_wait();
-            show_recording_overlay("正在播放", "", true);
+            show_recording_overlay("PLAYING", "", true);
             esp_err_t playback_err = play_latest_tts_audio();
             post_recording_playback_event(playback_err == ESP_OK ? "tts_probe_played" : "tts_probe_failed",
                                           playback_err);

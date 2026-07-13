@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -14,7 +15,7 @@ def test_front_single_click_toggles_device_recording() -> None:
 
     assert "VIBE_STICK_EVENT_RECORDING_TOGGLE" in source
     assert "queue_event(VIBE_STICK_EVENT_RECORDING_TOGGLE);" in source
-    assert 'handle_recording_start("button_tap_start", "再按发送")' in source
+    assert 'handle_recording_start("button_tap_start", "TAP TO SEND")' in source
     assert 'handle_recording_stop("button_tap_stop")' in source
     assert "front tap toggle mode=%s" in source
     assert "front button down mode=%s" in source
@@ -85,7 +86,7 @@ def test_ptt_followup_enter_arms_after_long_press_or_tap_stop() -> None:
     assert "arm_ptt_followup_enter_window();" in handle_stop
     assert "clear_ptt_followup_enter_window();" in handle_stop
     assert 'handle_recording_stop("button_tap_stop")' in handle_toggle
-    assert 'handle_recording_start("button_tap_start", "再按发送")' in handle_toggle
+    assert 'handle_recording_start("button_tap_start", "TAP TO SEND")' in handle_toggle
 
 
 def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
@@ -163,7 +164,7 @@ def test_side_button_only_starts_full_scan_and_arms_selection_window() -> None:
     assert "start_bridge_discovery_task" not in cycle
     assert "bridge_saved_profile_count()" in cycle
     assert "bridge_target_set_profile(next_index, \"manual\", false)" in cycle
-    assert 'show_bridge_selection_visual("连接中"' in cycle
+    assert 'show_bridge_selection_visual("CONNECTING"' in cycle
     assert "queue_event(VIBE_STICK_EVENT_POLL_STATE)" in cycle
     assert "bridge_profiles_reachable_ordered" not in cycle
     assert "bridge_probe_profile(" not in cycle
@@ -193,8 +194,8 @@ def test_front_button_enters_persistent_bridge_selection_and_confirms_on_hold() 
     assert "#define BRIDGE_SELECTION_CONFIRM_HOLD_MS 1500" in source
     assert ".press_time = BRIDGE_SELECTION_CONFIRM_HOLD_MS" in init_button
     assert "bridge_selection_confirm_long_cb" in init_button
-    assert '"确认中"' in source
-    assert '"已确认"' in source
+    assert '"CONFIRMING"' in source
+    assert '"CONFIRMED"' in source
 
 
 def test_full_scan_uses_probe_lock_but_saved_bridge_switch_does_not() -> None:
@@ -616,7 +617,7 @@ def test_deep_sleep_button_wake_restores_ptt_hold() -> None:
     assert "front button held during deep sleep wake; pending PTT restore" in source
     assert "restoring front long press after deep sleep wake" in source
     assert "s_wake_front_button_pending = false;" in source
-    assert 'handle_recording_start("button_long_start", "松开发送")' in source
+    assert 'handle_recording_start("button_long_start", "RELEASE TO SEND")' in source
 
 
 def test_deep_sleep_wake_defers_pet_animation_until_state_restores() -> None:
@@ -675,6 +676,15 @@ def test_cyber_processing_keeps_overlay_until_tts_probe() -> None:
     assert 'strcmp(recording_status, "cyber_processing") == 0' in finish_stop
     assert "start_cyber_tts_wait();" in finish_stop
     assert "if (!s_cyber_tts_waiting)" in finish_stop
-    assert 'show_recording_overlay("正在发送", "", true);' in source
+    assert 'show_recording_overlay("SENDING", "", true);' in source
     assert "maybe_timeout_cyber_tts_wait(now_ms);" in source
     assert "clear_cyber_tts_wait();" in tts_probe
+
+
+def test_firmware_runtime_ui_uses_ascii_only() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    cmake = (ROOT / "firmware" / "sticks3" / "src" / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert re.search(r"[\u4e00-\u9fff]", source) is None
+    assert "FONT_CN" not in source
+    assert "vibe_stick_cn_16" not in cmake
