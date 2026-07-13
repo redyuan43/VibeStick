@@ -158,18 +158,33 @@ def test_side_button_fast_switch_uses_known_list_and_single_background_scan() ->
     assert "atomic_compare_exchange_strong(&s_bridge_discovery_active" in start_task
     assert "bridge discovery already running" in start_task
     assert "xTaskCreatePinnedToCore(bridge_discovery_task" in start_task
-    assert "BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS" in cycle
     assert "BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS" in source
     assert "bridge_profiles_reachable_ordered(" in cycle
     assert "work->profiles, count, current_index, work->reachable" in cycle
-    assert "bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)" in cycle
     assert "const bool background_started = start_bridge_discovery_task" in cycle
+    assert "bridge_probe_profile(" not in cycle
     assert cycle.index("bridge_profiles_reachable_ordered") < cycle.index(
-        "bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)"
+        "bridge_target_set_profile"
     )
-    assert cycle.index(
-        "bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)"
-    ) < cycle.index("(void)start_bridge_discovery_task(false, false)")
+
+
+def test_side_button_starts_bridge_switch_on_release_without_double_click_delay() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    side_up = source.split("static void side_button_up_cb", 1)[1]
+    side_up = side_up.split("static void button_long_start_cb", 1)[0]
+    init_button = source.split("static esp_err_t init_button", 1)[1]
+    init_button = init_button.split("static void restore_wake_button_intent", 1)[0]
+    side_setup = init_button.split(
+        "iot_button_new_gpio_device(&button_config, &side_gpio_config", 1
+    )[1]
+
+    assert "static volatile bool s_side_button_long_press_active;" in source
+    assert "s_side_button_long_press_active = true;" in source
+    assert "s_side_button_long_press_active = false;" in side_up
+    assert "BUTTON_PRESS_UP" in side_setup
+    assert "side_button_up_cb" in side_setup
+    assert "BUTTON_SINGLE_CLICK" not in side_setup
+    assert "queue_event(VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT);" in side_up
 
 
 def test_quick_switch_and_background_scan_serialize_socket_probes() -> None:
@@ -493,7 +508,7 @@ def test_recording_mode_preference_survives_deep_sleep_restart() -> None:
     assert "vibe_motion_recalibrate()" in source
 
 
-def test_recording_trigger_and_intent_toggle_are_independent() -> None:
+def test_recording_trigger_is_independent_from_disabled_cyber_intents() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
     toggle = source.split("static void toggle_recording_mode(void)", 1)[1]
@@ -502,24 +517,26 @@ def test_recording_trigger_and_intent_toggle_are_independent() -> None:
     intent_toggle = intent_toggle.split("static void lvgl_lock", 1)[0]
     migration = source.split("static void migrate_legacy_recording_mode", 1)[1]
     migration = migration.split("static esp_err_t restore_recording_mode_preference", 1)[0]
+    init_button = source.split("static esp_err_t init_button", 1)[1]
+    init_button = init_button.split("static void restore_wake_button_intent", 1)[0]
+    side_button_setup = init_button.split(
+        "iot_button_new_gpio_device(&button_config, &side_gpio_config", 1
+    )[1]
 
     assert "VIBE_STICK_ANIM_PREVIEW 0" in source
-    assert "#define VIBE_BOARD_HAS_CYBER_INTENTS 0" in board_profile
-    assert "#define VIBE_BOARD_HAS_CYBER_INTENTS 1" in board_profile
+    assert board_profile.count("#define VIBE_BOARD_HAS_CYBER_INTENTS 0") == 2
     assert "recording_intent_supported" in source
     assert "sanitize_recording_intent();" in source
     assert "cyber intents unavailable" in intent_toggle
     assert "s_recording_trigger_mode = RECORDING_TRIGGER_LIFT_TO_TALK;" in source
     assert "s_recording_trigger_mode = RECORDING_TRIGGER_PUSH_TO_TALK;" in source
-    assert "s_recording_intent = RECORDING_INTENT_CYBER_FORTUNE;" in intent_toggle
-    assert "s_recording_intent = RECORDING_INTENT_CYBER_ALMANAC;" in intent_toggle
     assert "s_recording_intent = RECORDING_INTENT_DICTATION;" in intent_toggle
     assert "RECORDING_INTENT_CYBER_FORTUNE" not in toggle
     assert "case RECORDING_MODE_CYBER_FORTUNE:" in migration
     assert "case RECORDING_MODE_CYBER_ALMANAC:" in migration
     assert "VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE" in source
-    assert "side_button_double_click_cb" in source
-    assert "BUTTON_DOUBLE_CLICK, NULL,\n                                               side_button_double_click_cb" in source
+    assert "side_button_double_click_cb" not in source
+    assert "BUTTON_DOUBLE_CLICK, NULL" not in side_button_setup
 
 
 def test_side_mode_switches_show_large_main_screen_visual_feedback() -> None:

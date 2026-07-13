@@ -129,7 +129,6 @@
 #define BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS 250
 #define BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE 6
 #define BRIDGE_DISCOVERY_HEALTH_TIMEOUT_MS 900
-#define BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS 450
 #define BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS 180
 #define BRIDGE_DISCOVERY_PAUSE_POLL_MS 250
 
@@ -426,6 +425,7 @@ static bool s_front_fallback_pressed;
 static bool s_front_fallback_suppressed;
 static int64_t s_front_fallback_down_ms;
 static volatile int64_t s_front_button_iot_down_ms;
+static volatile bool s_side_button_long_press_active;
 static volatile int64_t s_front_button_iot_single_ms;
 static volatile int64_t s_front_button_iot_up_ms;
 
@@ -3359,11 +3359,6 @@ static void cycle_bridge_profile(void)
         sizeof(work->reachable) / sizeof(work->reachable[0]));
     for (size_t offset = 0; offset < reachable_count; offset++) {
         size_t index = work->reachable[offset];
-        bridge_profile_config_t profile_view;
-        bridge_profile_snapshot_view(&work->profiles[index], &profile_view);
-        if (!bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)) {
-            continue;
-        }
         bridge_probe_unlock();
         if (!bridge_target_set_profile(work->source_indices[index], "manual", true)) {
             bridge_probe_lock();
@@ -5155,22 +5150,20 @@ static void side_button_long_start_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
+    s_side_button_long_press_active = true;
     queue_event(VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE);
 }
 
-static void side_button_double_click_cb(void *button_handle, void *usr_data)
+static void side_button_up_cb(void *button_handle, void *usr_data)
 {
     (void)button_handle;
     (void)usr_data;
     register_activity();
-    queue_event(VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE);
-}
-
-static void side_button_single_click_cb(void *button_handle, void *usr_data)
-{
-    (void)button_handle;
-    (void)usr_data;
-    register_activity();
+    if (s_side_button_long_press_active) {
+        s_side_button_long_press_active = false;
+        return;
+    }
+    ESP_LOGI(TAG, "side button release: bridge profile next");
     queue_event(VIBE_STICK_EVENT_BRIDGE_PROFILE_NEXT);
 }
 
@@ -5249,12 +5242,9 @@ static esp_err_t init_button(void)
         .enable_power_save = false,
     };
     ESP_RETURN_ON_ERROR(iot_button_new_gpio_device(&button_config, &side_gpio_config, &side_button), TAG, "side button");
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(side_button, BUTTON_SINGLE_CLICK, NULL,
-                                               side_button_single_click_cb, NULL),
-                        TAG, "side button single");
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(side_button, BUTTON_DOUBLE_CLICK, NULL,
-                                               side_button_double_click_cb, NULL),
-                        TAG, "side button double");
+    ESP_RETURN_ON_ERROR(iot_button_register_cb(side_button, BUTTON_PRESS_UP, NULL,
+                                               side_button_up_cb, NULL),
+                        TAG, "side button release");
     button_event_args_t side_long_press_args = {
         .long_press = {
             .press_time = 3000,
