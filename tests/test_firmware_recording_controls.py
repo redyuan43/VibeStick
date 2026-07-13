@@ -46,12 +46,17 @@ def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> Non
     button_single_click = source.split("static void button_single_click_cb", 1)[1]
     button_single_click = button_single_click.split("static void button_double_click_cb", 1)[0]
 
-    assert "#define PTT_ENTER_GRACE_MS 5000" in source
+    assert "#define PTT_ENTER_GRACE_MS 3000" in source
+    assert "#define PTT_FOLLOWUP_REQUEST_TIMEOUT_MS 1000" in source
     assert '\\"event\\":\\"%s\\"' in source
     assert '"button_followup_enter"' in source
     assert '\\"session_id\\":\\"%s\\"' in source
     assert "static void ptt_followup_key_dispatch_task" in source
     assert "start_ptt_followup_key_dispatch" in source
+    assert "VIBE_STICK_FOLLOWUP_CORE VIBE_STICK_APP_CORE" in source
+    assert "VIBE_STICK_FOLLOWUP_PRIORITY 6" in source
+    assert "PTT_FOLLOWUP_REQUEST_TIMEOUT_MS" in source
+    assert "free(dispatch);" in source
     assert "recording_intent_is_cyber()" in button_single_click
     assert button_single_click.index("recording_intent_is_cyber()") < button_single_click.index(
         "consume_ptt_followup_enter_window()"

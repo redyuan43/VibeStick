@@ -73,7 +73,8 @@
 #define RECORDING_UPLOAD_WAIT_MS 10000
 #define RECORDING_START_TIMEOUT_MS 1200
 #define RECORDING_STOP_TIMEOUT_MS 210000
-#define PTT_ENTER_GRACE_MS 5000
+#define PTT_ENTER_GRACE_MS 3000
+#define PTT_FOLLOWUP_REQUEST_TIMEOUT_MS 1000
 #define OTA_READ_BUFFER_BYTES 4096
 #define OTA_PERIODIC_CHECK_MS 300000
 #define HTTP_CLIENT_BUFFER_SIZE 2048
@@ -83,6 +84,8 @@
 #define VIBE_STICK_APP_CORE 0
 #define VIBE_STICK_UI_CORE 1
 #define VIBE_STICK_NETWORK_CORE 1
+#define VIBE_STICK_FOLLOWUP_CORE VIBE_STICK_APP_CORE
+#define VIBE_STICK_FOLLOWUP_PRIORITY 6
 #define VIBE_STICK_IDLE_DIM_MS 30000
 #define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_DEEP_SLEEP_MS 600000
@@ -4357,17 +4360,19 @@ static bool consume_ptt_followup_enter_window(void)
     return true;
 }
 
-static void post_ptt_followup_key_event(const char *event_name, agent_sound_t sound)
-{
-    char session_id[sizeof(s_ptt_followup_session_id)];
-    strlcpy(session_id, s_ptt_followup_session_id, sizeof(session_id));
-    clear_ptt_followup_enter_window();
+typedef struct {
+    char session_id[40];
+    const char *event_name;
+    agent_sound_t sound;
+} ptt_followup_key_dispatch_t;
 
-    if (session_id[0] == '\0') {
-        return;
+static bool post_ptt_followup_key_event(const ptt_followup_key_dispatch_t *dispatch)
+{
+    if (!dispatch || dispatch->session_id[0] == '\0') {
+        return false;
     }
 
-    esp_err_t sound_err = vibe_audio_play_sound(sound);
+    esp_err_t sound_err = vibe_audio_play_sound(dispatch->sound);
     if (sound_err != ESP_OK) {
         ESP_LOGW(TAG, "follow-up key sound failed: %s", esp_err_to_name(sound_err));
     }
@@ -4375,63 +4380,66 @@ static void post_ptt_followup_key_event(const char *event_name, agent_sound_t so
     char body[160];
     snprintf(body, sizeof(body),
              "{\"event\":\"%s\",\"source\":\"%s\",\"session_id\":\"%s\"}",
-             event_name,
+             dispatch->event_name,
              VIBE_BOARD_EVENT_SOURCE,
-             session_id);
+             dispatch->session_id);
     char response[512] = {0};
-    esp_err_t err = http_request("POST", VIBE_STICK_EVENT_PATH, body, response,
-                                 sizeof(response));
+    esp_err_t err = http_request_timeout("POST", VIBE_STICK_EVENT_PATH, body, response,
+                                         sizeof(response),
+                                         PTT_FOLLOWUP_REQUEST_TIMEOUT_MS);
     if (err == ESP_OK && response[0] != '\0' && parse_state_json(response)) {
         complete_pet_fast_resume();
         render_state();
+        return true;
     } else if (err != ESP_OK) {
         ESP_LOGW(TAG, "PTT follow-up key event failed: %s", esp_err_to_name(err));
+        (void)vibe_audio_play_sound(VIBE_STICK_SOUND_ERROR);
+        show_recording_overlay("CONFIRM FAILED", "", true);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        if (recording_finalize_active() || atomic_load(&s_recording_session_active)) {
+            show_recording_overlay("TRANSCRIBING", "", true);
+        } else {
+            show_recording_overlay(NULL, NULL, false);
+        }
     }
+    return false;
 }
-
-typedef struct {
-    const char *event_name;
-    agent_sound_t sound;
-} ptt_followup_key_dispatch_t;
-
-static const ptt_followup_key_dispatch_t s_ptt_followup_enter_dispatch = {
-    .event_name = "button_followup_enter",
-    .sound = VIBE_STICK_SOUND_FOLLOWUP_ENTER,
-};
-
-static const ptt_followup_key_dispatch_t s_ptt_followup_escape_dispatch = {
-    .event_name = "button_followup_escape",
-    .sound = VIBE_STICK_SOUND_FOLLOWUP_ESCAPE,
-};
 
 static void ptt_followup_key_dispatch_task(void *arg)
 {
-    const ptt_followup_key_dispatch_t *dispatch = arg;
-    if (dispatch) {
-        post_ptt_followup_key_event(dispatch->event_name, dispatch->sound);
-    }
+    ptt_followup_key_dispatch_t *dispatch = arg;
+    (void)post_ptt_followup_key_event(dispatch);
+    free(dispatch);
     atomic_store(&s_ptt_followup_dispatch_active, false);
     vTaskDelete(NULL);
 }
 
 static bool start_ptt_followup_key_dispatch(const char *event_name, agent_sound_t sound)
 {
-    const ptt_followup_key_dispatch_t *dispatch =
-        sound == VIBE_STICK_SOUND_FOLLOWUP_ENTER
-            ? &s_ptt_followup_enter_dispatch
-            : &s_ptt_followup_escape_dispatch;
-    if (!event_name || strcmp(event_name, dispatch->event_name) != 0 ||
+    if (!event_name || s_ptt_followup_session_id[0] == '\0' ||
         atomic_exchange(&s_ptt_followup_dispatch_active, true)) {
         ESP_LOGW(TAG, "PTT follow-up key dispatch ignored event=%s",
                  event_name ? event_name : "-");
         return false;
     }
 
+    ptt_followup_key_dispatch_t *dispatch = calloc(1, sizeof(*dispatch));
+    if (!dispatch) {
+        atomic_store(&s_ptt_followup_dispatch_active, false);
+        ESP_LOGW(TAG, "PTT follow-up key dispatch allocation failed");
+        return false;
+    }
+    strlcpy(dispatch->session_id, s_ptt_followup_session_id, sizeof(dispatch->session_id));
+    dispatch->event_name = event_name;
+    dispatch->sound = sound;
+    clear_ptt_followup_enter_window();
+
     BaseType_t ok = xTaskCreatePinnedToCore(ptt_followup_key_dispatch_task,
                                             "ptt_followup", 4096,
-                                            (void *)dispatch, 4, NULL,
-                                            VIBE_STICK_NETWORK_CORE);
+                                            dispatch, VIBE_STICK_FOLLOWUP_PRIORITY, NULL,
+                                            VIBE_STICK_FOLLOWUP_CORE);
     if (ok != pdPASS) {
+        free(dispatch);
         atomic_store(&s_ptt_followup_dispatch_active, false);
         ESP_LOGW(TAG, "PTT follow-up key task create failed");
         return false;
