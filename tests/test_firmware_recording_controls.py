@@ -101,6 +101,8 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     bridge_probe = source.split("static bool bridge_probe_discovered", 1)[1]
     bridge_probe = bridge_probe.split("static bool bridge_probe_profile", 1)[0]
+    socket_wait = source.split("static void bridge_wait_for_socket_connections", 1)[1]
+    socket_wait = socket_wait.split("static size_t bridge_discover_subnet_profiles", 1)[0]
     discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
     discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
     merge = source.split("static bool bridge_profiles_merge_profile", 1)[1]
@@ -118,7 +120,11 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     assert "k_configured_bridge_profiles[index].token" in bridge_probe
     assert "bridge_parse_discovered_health" in bridge_probe
     assert "BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE" in discovery
-    assert "select(max_socket + 1, NULL, &write_fds" in discovery
+    assert "bridge_wait_for_socket_connections(" in discovery
+    assert "select(max_socket + 1, NULL, &write_fds" in socket_wait
+    assert "while (true)" in socket_wait
+    assert "deadline_us" in socket_wait
+    assert "settled[index] = true" in socket_wait
     assert "next_host_id = 254" in discovery
     assert "recording_network_busy()" in discovery
     assert "bridge_profiles_save_nvs()" not in discovery
@@ -164,6 +170,32 @@ def test_side_button_fast_switch_uses_known_list_and_single_background_scan() ->
     assert cycle.index(
         "bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)"
     ) < cycle.index("(void)start_bridge_discovery_task(false, false)")
+
+
+def test_quick_switch_and_background_scan_serialize_socket_probes() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
+    discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
+    cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
+    cycle = cycle.split("static esp_err_t bridge_prepare_active_target", 1)[0]
+
+    assert "static SemaphoreHandle_t s_bridge_probe_lock;" in source
+    assert "s_bridge_probe_lock = xSemaphoreCreateMutex();" in source
+    assert "static void bridge_probe_lock(void)" in source
+    assert "static void bridge_probe_unlock(void)" in source
+    assert "bridge_probe_lock();" in discovery
+    assert "bridge_probe_unlock();" in discovery
+    assert discovery.index("bridge_probe_lock();") < discovery.index(
+        "bridge_wait_for_socket_connections("
+    )
+    assert discovery.index("bridge_wait_for_socket_connections(") < discovery.index(
+        "bridge_probe_unlock();"
+    )
+    assert "bridge_probe_lock();" in cycle
+    assert "bridge_probe_unlock();" in cycle
+    assert cycle.index("bridge_probe_lock();") < cycle.index(
+        "bridge_profiles_reachable_ordered("
+    )
 
 
 def test_bridge_profile_store_access_uses_lock_and_snapshots() -> None:

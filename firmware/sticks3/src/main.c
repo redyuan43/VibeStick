@@ -350,6 +350,7 @@ static size_t s_wifi_profile_index;
 static int s_wifi_profile_retry_count;
 static SemaphoreHandle_t s_bridge_target_lock;
 static SemaphoreHandle_t s_bridge_profiles_lock;
+static SemaphoreHandle_t s_bridge_probe_lock;
 static bridge_discovered_profile_t
     s_discovered_bridge_profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
 static bridge_profile_config_t
@@ -2302,6 +2303,20 @@ static void bridge_profiles_unlock(void)
     }
 }
 
+static void bridge_probe_lock(void)
+{
+    if (s_bridge_probe_lock) {
+        xSemaphoreTake(s_bridge_probe_lock, portMAX_DELAY);
+    }
+}
+
+static void bridge_probe_unlock(void)
+{
+    if (s_bridge_probe_lock) {
+        xSemaphoreGive(s_bridge_probe_lock);
+    }
+}
+
 static void bridge_profile_snapshot_from_config(const bridge_profile_config_t *profile,
                                                 bridge_profile_snapshot_t *snapshot)
 {
@@ -2885,6 +2900,61 @@ static bool bridge_scan_add(const bridge_discovered_profile_t *profile)
     return true;
 }
 
+static void bridge_wait_for_socket_connections(int *sockets, bool *connected,
+                                               size_t socket_count, int timeout_ms)
+{
+    bool settled[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT] = {0};
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    for (size_t index = 0; index < socket_count; index++) {
+        settled[index] = connected[index];
+    }
+
+    while (true) {
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        int max_socket = -1;
+        size_t pending = 0;
+        for (size_t index = 0; index < socket_count; index++) {
+            if (settled[index]) {
+                continue;
+            }
+            FD_SET(sockets[index], &write_fds);
+            if (sockets[index] > max_socket) {
+                max_socket = sockets[index];
+            }
+            pending++;
+        }
+        if (pending == 0) {
+            return;
+        }
+
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) {
+            return;
+        }
+        struct timeval timeout = {
+            .tv_sec = (time_t)(remaining_us / 1000000),
+            .tv_usec = (suseconds_t)(remaining_us % 1000000),
+        };
+        int ready = select(max_socket + 1, NULL, &write_fds, NULL, &timeout);
+        if (ready <= 0) {
+            return;
+        }
+        for (size_t index = 0; index < socket_count; index++) {
+            if (settled[index] || !FD_ISSET(sockets[index], &write_fds)) {
+                continue;
+            }
+            int socket_error = 0;
+            socklen_t error_len = sizeof(socket_error);
+            connected[index] =
+                getsockopt(sockets[index], SOL_SOCKET, SO_ERROR,
+                           &socket_error, &error_len) == 0 &&
+                socket_error == 0;
+            settled[index] = true;
+        }
+    }
+}
+
 static size_t bridge_discover_subnet_profiles(void)
 {
     char scan_ssid[WIFI_PROFILE_SSID_LEN] = {0};
@@ -2916,13 +2986,11 @@ static size_t bridge_discover_subnet_profiles(void)
             }
             vTaskDelay(pdMS_TO_TICKS(BRIDGE_DISCOVERY_PAUSE_POLL_MS));
         }
+        bridge_probe_lock();
         int sockets[BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE];
         int host_ids[BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE];
         bool connected[BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE] = {0};
         size_t socket_count = 0;
-        int max_socket = -1;
-        fd_set write_fds;
-        FD_ZERO(&write_fds);
 
         while (next_host_id >= 1 &&
                socket_count < BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE) {
@@ -2957,30 +3025,13 @@ static size_t bridge_discover_subnet_profiles(void)
             sockets[socket_count] = sock;
             host_ids[socket_count] = host_id;
             connected[socket_count] = result == 0;
-            FD_SET(sock, &write_fds);
-            if (sock > max_socket) {
-                max_socket = sock;
-            }
             socket_count++;
         }
 
-        struct timeval timeout = {
-            .tv_sec = BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS / 1000,
-            .tv_usec = (BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS % 1000) * 1000,
-        };
-        int ready = socket_count > 0
-                        ? select(max_socket + 1, NULL, &write_fds, NULL, &timeout)
-                        : 0;
+        bridge_wait_for_socket_connections(
+            sockets, connected, socket_count, BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS);
         for (size_t index = 0; index < socket_count; index++) {
             bool port_open = connected[index];
-            if (!port_open && ready > 0 && FD_ISSET(sockets[index], &write_fds)) {
-                int socket_error = 0;
-                socklen_t error_len = sizeof(socket_error);
-                port_open =
-                    getsockopt(sockets[index], SOL_SOCKET, SO_ERROR,
-                               &socket_error, &error_len) == 0 &&
-                    socket_error == 0;
-            }
             close(sockets[index]);
             if (!port_open) {
                 continue;
@@ -3005,6 +3056,7 @@ static size_t bridge_discover_subnet_profiles(void)
                 (void)bridge_profiles_merge_profile(&profile, scan_ssid);
             }
         }
+        bridge_probe_unlock();
     }
     if (s_bridge_scan_profile_count == 0) {
         ESP_LOGW(TAG, "bridge discovery found no bridge prefix=%u.%u.%u.0/24",
@@ -3234,9 +3286,6 @@ static size_t bridge_profiles_reachable_ordered(
     size_t profile_indices[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
     bool connected[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT] = {0};
     size_t socket_count = 0;
-    int max_socket = -1;
-    fd_set write_fds;
-    FD_ZERO(&write_fds);
 
     for (size_t offset = 1; offset <= count; offset++) {
         size_t index = (size_t)((current_index + (int)offset) % (int)count);
@@ -3249,31 +3298,14 @@ static size_t bridge_profiles_reachable_ordered(
         sockets[socket_count] = sock;
         profile_indices[socket_count] = index;
         connected[socket_count] = immediately_connected;
-        FD_SET(sock, &write_fds);
-        if (sock > max_socket) {
-            max_socket = sock;
-        }
         socket_count++;
     }
 
-    struct timeval timeout = {
-        .tv_sec = BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS / 1000,
-        .tv_usec = (BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS % 1000) * 1000,
-    };
-    int ready = socket_count > 0
-                    ? select(max_socket + 1, NULL, &write_fds, NULL, &timeout)
-                    : 0;
+    bridge_wait_for_socket_connections(
+        sockets, connected, socket_count, BRIDGE_PROFILE_QUICK_TCP_TIMEOUT_MS);
     size_t reachable_count = 0;
     for (size_t socket_index = 0; socket_index < socket_count; socket_index++) {
         bool port_open = connected[socket_index];
-        if (!port_open && ready > 0 && FD_ISSET(sockets[socket_index], &write_fds)) {
-            int socket_error = 0;
-            socklen_t error_len = sizeof(socket_error);
-            port_open =
-                getsockopt(sockets[socket_index], SOL_SOCKET, SO_ERROR,
-                           &socket_error, &error_len) == 0 &&
-                socket_error == 0;
-        }
         close(sockets[socket_index]);
         if (port_open && reachable_count < reachable_cap) {
             reachable[reachable_count++] = profile_indices[socket_index];
@@ -3320,9 +3352,11 @@ static void cycle_bridge_profile(void)
         count = snapshot_count;
     }
     size_t reachable_count =
-        bridge_profiles_reachable_ordered(
-            work->profiles, count, current_index, work->reachable,
-            sizeof(work->reachable) / sizeof(work->reachable[0]));
+        0;
+    bridge_probe_lock();
+    reachable_count = bridge_profiles_reachable_ordered(
+        work->profiles, count, current_index, work->reachable,
+        sizeof(work->reachable) / sizeof(work->reachable[0]));
     for (size_t offset = 0; offset < reachable_count; offset++) {
         size_t index = work->reachable[offset];
         bridge_profile_config_t profile_view;
@@ -3330,7 +3364,9 @@ static void cycle_bridge_profile(void)
         if (!bridge_probe_profile(&profile_view, BRIDGE_PROFILE_QUICK_HEALTH_TIMEOUT_MS)) {
             continue;
         }
+        bridge_probe_unlock();
         if (!bridge_target_set_profile(work->source_indices[index], "manual", true)) {
+            bridge_probe_lock();
             continue;
         }
         (void)bridge_target_save_nvs();
@@ -3350,6 +3386,7 @@ static void cycle_bridge_profile(void)
         (void)start_bridge_discovery_task(false, false);
         return;
     }
+    bridge_probe_unlock();
     free(work);
     const bool select_from_search = !current.available;
     const bool background_started = start_bridge_discovery_task(select_from_search,
@@ -5449,6 +5486,7 @@ void app_main(void)
     s_lvgl_lock = xSemaphoreCreateMutex();
     s_bridge_target_lock = xSemaphoreCreateMutex();
     s_bridge_profiles_lock = xSemaphoreCreateMutex();
+    s_bridge_probe_lock = xSemaphoreCreateMutex();
     xTaskCreate(serial_debug_task, "serial_debug", 2048, NULL, 2, NULL);
     ESP_ERROR_CHECK(init_wifi());
     ESP_ERROR_CHECK(init_display());
