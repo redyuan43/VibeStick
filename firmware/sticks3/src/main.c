@@ -5764,6 +5764,7 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "boot %s board=%s version=%s build=%s transport=%s",
              FIRMWARE_NAME, VIBE_BOARD_NAME, FIRMWARE_VERSION, FIRMWARE_BUILD_ID, TRANSPORT);
+    ESP_LOGI(TAG, "battery curve=%s", VIBE_BOARD_BATTERY_CURVE_VERSION);
     ESP_LOGI(TAG, "wake cause=%d ext1_status=0x%llx",
              wake_cause, (unsigned long long)ext1_wake_status);
     esp_err_t nvs = nvs_flash_init();

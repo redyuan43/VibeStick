@@ -187,6 +187,19 @@ def test_bridge_discovery_fallback_id_is_bounded() -> None:
     assert "snprintf(id, id_len" not in fallback
 
 
+def test_battery_curves_are_board_specific_and_calibrated() -> None:
+    board = BOARD_C.read_text(encoding="utf-8")
+    profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
+
+    assert '#include "sticks3_battery_curve.h"' in board
+    assert "*level_percent = vibe_sticks3_battery_percent(voltage_mv);" in board
+    assert "{3082, 0}" in board
+    assert "{3625, 50}" in board
+    assert "{4042, 100}" in board
+    assert 'VIBE_BOARD_BATTERY_CURVE_VERSION "sticks3-20260714-full-v1"' in profile
+    assert 'VIBE_BOARD_BATTERY_CURVE_VERSION "stickc-plus-20260714-full-v1"' in profile
+
+
 def test_side_button_only_starts_full_scan_and_arms_selection_window() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     side_up = source.split("static void side_button_up_cb", 1)[1]
