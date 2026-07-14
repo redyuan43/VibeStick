@@ -37,6 +37,10 @@ firmware/sticks3/sdkconfig.old
 # Firmware-local secrets: Wi-Fi profiles, bridge host, and bridge token.
 # This file is generated from vibe_stick_secrets.example.h and must stay local.
 firmware/sticks3/include/vibe_stick_secrets.h
+firmware/telemetry/**/build/
+firmware/telemetry/**/sdkconfig
+firmware/telemetry/**/sdkconfig.old
+firmware/telemetry/secrets/vibe_telemetry_secrets.h
 bridge/.vibestick-state.json
 docs/CLAUDE_PROVIDER_PLAN.md
 recordings/

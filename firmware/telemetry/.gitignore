@@ -1,0 +1,4 @@
+secrets/vibe_telemetry_secrets.h
+build-host-tests/
+*/build*/
+*/sdkconfig*

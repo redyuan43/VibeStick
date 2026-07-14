@@ -10,6 +10,28 @@ VibeStick 把 M5Stack StickS3 / M5StickC Plus 变成一个桌面 AI agent 小终
 
 VibeStick 面向 M5Stack StickS3 和 M5StickC Plus，不是 M5Stack 官方项目。Codex、Claude 等第三方 agent 名称只用于说明本地兼容工具和集成。
 
+## 电池放电遥测
+
+仓库另外提供 StickS3 和 M5StickC Plus 1.1 的专用电池测试固件。测试固件保持屏幕与 Wi-Fi 负载稳定，通过无线网络向 bridge 上报电池电压；烧录完成并拔掉 USB 线后仍会继续采样。
+
+它们不是完整 VibeStick 移植。Plus 1.1 测试固件不包含 Agent 界面、录音和提醒音。
+
+常用的十分钟冒烟测试：
+
+```sh
+./scripts/battery-test.sh smoke --board sticks3 --port auto
+./scripts/battery-test.sh smoke --board stickc_plus_11 --port auto
+```
+
+只读实时曲线页面：
+
+```text
+http://127.0.0.1:8765/telemetry
+```
+
+隔离构建、烧录、完整放电、CSV 导出和结果解释见
+[电池遥测文档](docs/BATTERY_TELEMETRY.md)。
+
 ## 开始前的准备
 
 - [ ] M5 StickS3 或 M5StickC Plus｜一根数据线｜一台电脑（最好是Mac）
@@ -247,6 +269,7 @@ VibeStick/
   .env.example
   docs/
   firmware/sticks3/
+  firmware/telemetry/
   bridge/src/vibe_stick/
   app/macos/VibeStickHUD/
   scripts/

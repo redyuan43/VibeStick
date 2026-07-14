@@ -10,6 +10,32 @@ VibeStick turns an M5Stack StickS3 or M5StickC Plus into a tiny desktop companio
 
 VibeStick targets M5Stack StickS3 and M5StickC Plus hardware and is not an official M5Stack project. Third-party agent names such as Codex and Claude describe compatible local tools and integrations only.
 
+## Battery discharge telemetry
+
+The repository also contains dedicated battery-test firmware for StickS3 and
+M5StickC Plus 1.1. These images keep the screen and Wi-Fi workload stable,
+report battery voltage to the bridge over Wi-Fi, and continue working after
+the USB cable is removed.
+
+They are test images, not full VibeStick ports. The Plus 1.1 image does not
+include the agent UI, recording, or alert sounds.
+
+Typical smoke tests:
+
+```sh
+./scripts/battery-test.sh smoke --board sticks3 --port auto
+./scripts/battery-test.sh smoke --board stickc_plus_11 --port auto
+```
+
+Open the read-only live dashboard at:
+
+```text
+http://127.0.0.1:8765/telemetry
+```
+
+See [Battery Telemetry](docs/BATTERY_TELEMETRY.md) for isolated builds,
+flashing, full-discharge runs, exports, and result interpretation.
+
 ## What you'll need (prepare first)
 
 - [ ] M5Stack StickS3 or M5StickC Plus and a data cable.
@@ -247,6 +273,7 @@ VibeStick/
   .env.example
   docs/
   firmware/sticks3/
+  firmware/telemetry/
   bridge/src/vibe_stick/
   app/macos/VibeStickHUD/
   scripts/

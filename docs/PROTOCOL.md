@@ -42,7 +42,7 @@ When `VIBE_STICK_BRIDGE_TOKEN` is configured on the bridge and firmware, protect
 X-Vibe-Stick-Token: <shared-token>
 ```
 
-Protected endpoints are `/event`, `/quota/refresh`, `/recording/start`, `/recording/audio`, and `/recording/stop`. If the bridge binds outside loopback, such as `0.0.0.0`, `VIBE_STICK_BRIDGE_TOKEN` is required and placeholder tokens are rejected. If the bridge binds to loopback only, missing tokens are allowed for local development.
+Protected endpoints are `/event`, `/quota/refresh`, `/recording/start`, `/recording/audio`, `/recording/stop`, and telemetry POST endpoints. If the bridge binds outside loopback, such as `0.0.0.0`, `VIBE_STICK_BRIDGE_TOKEN` is required and placeholder tokens are rejected. If the bridge binds to loopback only, missing tokens are allowed for local development.
 
 ## GET /state
 
@@ -259,3 +259,56 @@ Stops the session and runs transcription:
 Push-to-talk uses `button_long_stop`; lift-to-talk uses `motion_lift_stop`.
 
 When transcription succeeds, the bridge pastes the transcript into the focused macOS app. Recording status does not trigger agent alert sounds.
+
+## POST /telemetry/v1/samples
+
+Receives one sample from dedicated battery-test firmware. The request is
+protected by `X-Vibe-Stick-Token`.
+
+```json
+{
+  "schema_version": 1,
+  "device_id": "sticks3-d565c4",
+  "board": "sticks3",
+  "pmic": "m5pm1",
+  "firmware_version": "0.1.0",
+  "boot_id": "8f19a204",
+  "sequence": 42,
+  "uptime_ms": 210000,
+  "sample_interval_ms": 5000,
+  "battery_mv": 3912,
+  "usb_mv": 0,
+  "charging": false,
+  "usb_powered": false
+}
+```
+
+Power fields may be `null` when a PMIC read fails. The bridge validates the
+sample and adds its own receive timestamp.
+
+## Telemetry Sessions
+
+The authenticated CLI uses:
+
+```text
+POST /telemetry/v1/sessions
+POST /telemetry/v1/sessions/<session-id>/stop
+```
+
+Read-only dashboard and export endpoints are:
+
+```text
+GET /telemetry/v1/devices
+GET /telemetry/v1/devices/<device-id>/raw
+GET /telemetry/v1/devices/<device-id>/raw/export.csv
+GET /telemetry/v1/sessions
+GET /telemetry/v1/sessions/<session-id>
+GET /telemetry/v1/sessions/<session-id>/samples
+GET /telemetry/v1/sessions/<session-id>/export.csv
+```
+
+The optional `boot_id` query parameter limits raw telemetry reads and exports
+to one firmware boot. Session kinds are `smoke`, `full`, and `charge`.
+
+The normal `/state` response remains unchanged and continues to serialize
+`battery` as `null`.

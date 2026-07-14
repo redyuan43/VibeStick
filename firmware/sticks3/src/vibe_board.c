@@ -1,5 +1,6 @@
 #include "vibe_board.h"
 
+#include "sticks3_battery_curve.h"
 #include "vibe_board_profile.h"
 
 #include "driver/gpio.h"
@@ -124,6 +125,7 @@ static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, ui
     return i2c_master_bus_add_device(s_i2c_bus, &dev_config, &s_pmic_dev);
 }
 
+#if !VIBE_BOARD_HAS_ES8311
 static int voltage_to_percent(int voltage_mv)
 {
     static const struct {
@@ -160,6 +162,7 @@ static int voltage_to_percent(int voltage_mv)
     }
     return curve[last].percent;
 }
+#endif
 
 #if VIBE_BOARD_HAS_ES8311
 
@@ -253,7 +256,7 @@ esp_err_t vibe_board_battery_level(int *level_percent)
 
     int voltage_mv = 0;
     ESP_RETURN_ON_ERROR(vibe_board_battery_voltage_mv(&voltage_mv), TAG, "read bat voltage");
-    *level_percent = voltage_to_percent(voltage_mv);
+    *level_percent = vibe_sticks3_battery_percent(voltage_mv);
     return ESP_OK;
 }
 

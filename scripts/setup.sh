@@ -6,6 +6,8 @@ ENV_PATH="$ROOT_DIR/.env"
 ENV_EXAMPLE_PATH="$ROOT_DIR/.env.example"
 SECRETS_PATH="$ROOT_DIR/firmware/sticks3/include/vibe_stick_secrets.h"
 SECRETS_EXAMPLE_PATH="$ROOT_DIR/firmware/sticks3/include/vibe_stick_secrets.example.h"
+TELEMETRY_SECRETS_PATH="$ROOT_DIR/firmware/telemetry/secrets/vibe_telemetry_secrets.h"
+TELEMETRY_SECRETS_EXAMPLE_PATH="$ROOT_DIR/firmware/telemetry/secrets/vibe_telemetry_secrets.example.h"
 
 is_placeholder_token() {
   case "${1:-}" in
@@ -126,6 +128,15 @@ else
   printf '%s\n' "Kept existing firmware/sticks3/include/vibe_stick_secrets.h."
 fi
 
+if [ -f "$TELEMETRY_SECRETS_EXAMPLE_PATH" ]; then
+  if [ ! -f "$TELEMETRY_SECRETS_PATH" ]; then
+    cp "$TELEMETRY_SECRETS_EXAMPLE_PATH" "$TELEMETRY_SECRETS_PATH"
+    printf '%s\n' "Created firmware/telemetry/secrets/vibe_telemetry_secrets.h from example."
+  else
+    printf '%s\n' "Kept existing firmware/telemetry/secrets/vibe_telemetry_secrets.h."
+  fi
+fi
+
 env_token="$(env_value VIBE_STICK_BRIDGE_TOKEN "$ENV_PATH")"
 secret_token="$(secret_value VIBE_STICK_BRIDGE_TOKEN "$SECRETS_PATH")"
 
@@ -153,7 +164,17 @@ else
   printf '%s\n' "Generated and wrote one shared bridge token to .env and firmware secrets."
 fi
 
+if [ -f "$TELEMETRY_SECRETS_PATH" ]; then
+  shared_token="$(env_value VIBE_STICK_BRIDGE_TOKEN "$ENV_PATH")"
+  if ! is_placeholder_token "$shared_token"; then
+    set_secret_value VIBE_TELEMETRY_SHARED_SECRET "$shared_token" "$TELEMETRY_SECRETS_PATH"
+  fi
+fi
+
 lan_ip="$(ipconfig getifaddr en0 2>/dev/null || true)"
+if [ -z "$lan_ip" ] && command -v ip >/dev/null 2>&1; then
+  lan_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; ++i) if ($i == "src") { print $(i + 1); exit } }')"
+fi
 if [ -n "$lan_ip" ]; then
   printf '%s\n' "Detected Mac LAN IP on en0: $lan_ip"
   bridge_host="$(secret_value VIBE_STICK_BRIDGE_HOST "$SECRETS_PATH")"
@@ -169,7 +190,23 @@ else
   printf '%s\n' "WARN: Could not detect a LAN IP from en0; set VIBE_STICK_BRIDGE_HOST manually."
 fi
 
+if [ -f "$TELEMETRY_SECRETS_PATH" ]; then
+  wifi_ssid="$(secret_value VIBE_STICK_WIFI_SSID "$SECRETS_PATH")"
+  wifi_password="$(secret_value VIBE_STICK_WIFI_PASSWORD "$SECRETS_PATH")"
+  bridge_host="$(secret_value VIBE_STICK_BRIDGE_HOST "$SECRETS_PATH")"
+  bridge_port="${VIBE_STICK_TELEMETRY_PORT:-}"
+  if [ -z "$bridge_port" ]; then
+    bridge_port="$(awk '$1 == "#define" && $2 == "VIBE_STICK_BRIDGE_PORT" { print $3; exit }' "$SECRETS_PATH")"
+  fi
+  bridge_port="${bridge_port:-8765}"
+  set_secret_value VIBE_TELEMETRY_WIFI_SSID "$wifi_ssid" "$TELEMETRY_SECRETS_PATH"
+  set_secret_value VIBE_TELEMETRY_WIFI_PASSWORD "$wifi_password" "$TELEMETRY_SECRETS_PATH"
+  set_secret_value VIBE_TELEMETRY_BASE_URL "http://$bridge_host:$bridge_port" "$TELEMETRY_SECRETS_PATH"
+  printf '%s\n' "Synced Wi-Fi, bridge URL, and token into battery telemetry firmware secrets."
+fi
+
 printf '\n%s\n' "Next steps:"
 printf '%s\n' "1. Edit firmware/sticks3/include/vibe_stick_secrets.h with Wi-Fi SSID, password, and Mac IP."
 printf '%s\n' "2. Optionally edit .env with ASR settings such as VIBE_STICK_ASR_PROVIDER and VIBE_STICK_ASR_API_KEY."
-printf '%s\n' "3. Run scripts/doctor.sh to check the local setup before building or flashing."
+printf '%s\n' "3. Re-run scripts/setup.sh after changing firmware network settings to sync battery telemetry secrets."
+printf '%s\n' "4. Run scripts/doctor.sh to check the local setup before building or flashing."

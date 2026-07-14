@@ -9,3 +9,4 @@ dependencies = [
 
 [project.scripts]
 vibestick-bridge = "vibe_stick.__main__:main"
+vibestick-battery = "vibe_stick.telemetry.cli:main"
