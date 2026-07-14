@@ -73,7 +73,7 @@
 #define RECORDING_UPLOAD_WAIT_MS 10000
 #define RECORDING_START_TIMEOUT_MS 1200
 #define RECORDING_STOP_TIMEOUT_MS 210000
-#define PTT_ENTER_GRACE_MS 5000
+#define PTT_ENTER_GRACE_MS 3000
 #define PTT_FOLLOWUP_REQUEST_TIMEOUT_MS 1000
 #define FRONT_PTT_LONG_PRESS_MS 400
 #define OTA_READ_BUFFER_BYTES 4096
@@ -4898,7 +4898,6 @@ static void finish_recording_stop(const char *event_name)
     char response[1024] = {0};
     esp_err_t err = http_request_timeout("POST", VIBE_STICK_RECORDING_STOP_PATH, body, response,
                                          sizeof(response), RECORDING_STOP_TIMEOUT_MS);
-    clear_ptt_followup_enter_window();
     bool recording_failed = false;
     char recording_status[32] = {0};
     if (err == ESP_OK && response[0] != '\0') {

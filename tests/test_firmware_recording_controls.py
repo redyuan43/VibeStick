@@ -46,7 +46,7 @@ def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> Non
     button_single_click = source.split("static void button_single_click_cb", 1)[1]
     button_single_click = button_single_click.split("static void button_double_click_cb", 1)[0]
 
-    assert "#define PTT_ENTER_GRACE_MS 5000" in source
+    assert "#define PTT_ENTER_GRACE_MS 3000" in source
     assert "#define PTT_FOLLOWUP_REQUEST_TIMEOUT_MS 1000" in source
     assert '\\"event\\":\\"%s\\"' in source
     assert '"button_followup_enter"' in source
@@ -116,9 +116,10 @@ def test_ptt_followup_enter_arms_after_long_press_or_tap_stop() -> None:
     assert "!recording_intent_is_cyber()" in handle_stop
     assert "arm_ptt_followup_enter_window();" in handle_stop
     assert "clear_ptt_followup_enter_window();" in handle_stop
-    assert "clear_ptt_followup_enter_window();" in source.split(
-        "static void finish_recording_stop", 1
-    )[1].split("static void recording_finalize_task", 1)[0]
+    finish_stop = source.split("static void finish_recording_stop", 1)[1].split(
+        "static void recording_finalize_task", 1
+    )[0]
+    assert "clear_ptt_followup_enter_window();" not in finish_stop
     assert 'handle_recording_stop("button_tap_stop")' in handle_toggle
     assert 'handle_recording_start("button_tap_start", "TAP TO SEND")' in handle_toggle
 
@@ -516,8 +517,8 @@ def test_battery_level_uses_voltage_curve_and_voltage_api() -> None:
 
     assert "esp_err_t vibe_board_battery_voltage_mv(int *voltage_mv);" in board_header
     assert "esp_err_t vibe_board_battery_voltage_mv(int *voltage_mv)" in board_source
-    assert "{3350, 0}" in board_source
-    assert "{4180, 100}" in board_source
+    assert "{3082, 0}" in board_source
+    assert "{4042, 100}" in board_source
     assert "int level = (voltage_mv - 3300) * 100 / (4150 - 3350);" not in board_source
     assert "vibe_board_battery_voltage_mv(&voltage_mv)" in board_source
 
