@@ -4,6 +4,7 @@ set -u
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 ENV_PATH="$ROOT_DIR/.env"
 SECRETS_PATH="$ROOT_DIR/firmware/sticks3/include/vibe_stick_secrets.h"
+TELEMETRY_SECRETS_PATH="$ROOT_DIR/firmware/telemetry/secrets/vibe_telemetry_secrets.h"
 APP_SUPPORT_DIR="$HOME/Library/Application Support/VibeStick"
 
 PASS_COUNT=0
@@ -195,6 +196,43 @@ check_token_match() {
   fi
 }
 
+check_telemetry_secrets() {
+  if [ ! -f "$TELEMETRY_SECRETS_PATH" ]; then
+    warn "Battery telemetry firmware secrets are missing; run scripts/setup.sh."
+    return
+  fi
+
+  telemetry_ssid="$(secret_value VIBE_TELEMETRY_WIFI_SSID "$TELEMETRY_SECRETS_PATH")"
+  telemetry_password="$(secret_value VIBE_TELEMETRY_WIFI_PASSWORD "$TELEMETRY_SECRETS_PATH")"
+  telemetry_url="$(secret_value VIBE_TELEMETRY_BASE_URL "$TELEMETRY_SECRETS_PATH")"
+  telemetry_token="$(secret_value VIBE_TELEMETRY_SHARED_SECRET "$TELEMETRY_SECRETS_PATH")"
+  env_token="$(env_value VIBE_STICK_BRIDGE_TOKEN "$ENV_PATH")"
+
+  if is_placeholder_wifi "$telemetry_ssid"; then
+    fail "Battery telemetry Wi-Fi SSID is empty or placeholder."
+  else
+    pass "Battery telemetry Wi-Fi SSID is configured."
+  fi
+  if is_placeholder_password "$telemetry_password"; then
+    fail "Battery telemetry Wi-Fi password is empty or placeholder."
+  else
+    pass "Battery telemetry Wi-Fi password is configured."
+  fi
+  case "$telemetry_url" in
+    http://127.0.0.1:*|http://0.0.0.0:*|http://192.168.1.10:*|"")
+      fail "Battery telemetry bridge URL is loopback, wildcard, empty, or an example placeholder."
+      ;;
+    *)
+      pass "Battery telemetry bridge URL is configured."
+      ;;
+  esac
+  if [ "$telemetry_token" = "$env_token" ] && ! is_placeholder_token "$telemetry_token"; then
+    pass "Battery telemetry token matches .env."
+  else
+    fail "Battery telemetry token is missing, placeholder, or differs from .env."
+  fi
+}
+
 check_bridge_health() {
   if command -v curl >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1; then
     pass "Bridge health endpoint responded on 127.0.0.1:8765."
@@ -346,6 +384,7 @@ check_esp_idf
 check_dotenv
 check_secrets
 check_token_match
+check_telemetry_secrets
 check_bridge_health
 check_asr
 check_claude_token

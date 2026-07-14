@@ -6,6 +6,11 @@ VibeStick v0.1.2 targets M5Stack StickS3.
 
 The project does not currently claim support for other devices because the UI layout, front button behavior, microphone path, speaker path, PMIC battery reads, and screen size are all written around StickS3.
 
+The dedicated battery-telemetry firmware is separate from the main product
+firmware. It supports both StickS3 and M5StickC Plus 1.1 for screen-on,
+Wi-Fi-connected discharge testing. Plus 1.1 support does not include the
+VibeStick agent UI, microphone, speaker, or button workflows.
+
 ## Hardware Used
 
 - Screen: LVGL UI on the StickS3 display.
@@ -75,3 +80,17 @@ If automatic flashing fails, put the StickS3 into download mode and retry:
 ## Runtime Network
 
 The StickS3 talks to the Mac bridge by HTTP. The Mac bridge should listen on `0.0.0.0:8765` when the device is on the same Wi-Fi network.
+
+## Battery-Test Firmware
+
+Battery-test projects live under `firmware/telemetry/`. They use a shared
+five-second telemetry workload with board-specific power and display drivers:
+
+- StickS3: ESP32-S3, M5PM1, native USB serial/JTAG.
+- M5StickC Plus 1.1: ESP32, AXP192, FTDI serial.
+
+Use `scripts/battery-firmware.sh` for isolated builds and flashing. The helper
+checks the connected chip family before writing an image so an ESP32 image is
+not accidentally written to an ESP32-S3, or vice versa.
+
+See [Battery Telemetry](BATTERY_TELEMETRY.md) for the test procedure.

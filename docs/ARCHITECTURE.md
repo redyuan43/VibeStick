@@ -7,6 +7,9 @@ VibeStick has two active runtime parts:
 
 The StickS3 does not call cloud AI services directly. It polls and posts to the Mac bridge over HTTP on the local network.
 
+Battery testing adds two optional, dedicated firmware images. They share the
+bridge with VibeStick but do not run the normal agent UI or audio workflow.
+
 ```mermaid
 flowchart LR
   Codex["Local Codex sessions"] --> Bridge["VibeStick Bridge"]
@@ -61,6 +64,21 @@ Bridge state is stored under:
 v0.1.1 uses HTTP over Wi-Fi.
 
 BLE is not part of the current mainline transport. USB is used for flashing and serial logs, not for runtime state transport.
+
+Battery-test firmware also uses HTTP over Wi-Fi. USB must be removed during a
+discharge session; the bridge continues receiving samples wirelessly.
+
+## Battery Telemetry Flow
+
+1. A dedicated test image samples its board PMIC every five seconds.
+2. The device posts voltage and external-power state to
+   `POST /telemetry/v1/samples`.
+3. The bridge keeps the latest device state in memory.
+4. When a test session is active, matching samples are appended to that
+   session's JSONL file.
+5. The read-only dashboard polls bridge APIs and plots sessions by elapsed
+   time.
+6. The authenticated CLI owns session start and stop transitions.
 
 ## State Flow
 
