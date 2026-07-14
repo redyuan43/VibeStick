@@ -26,6 +26,38 @@ class ServerSecurityTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"VIBE_STICK_BRIDGE_TOKEN": "abc123-secret"}):
             self.assertEqual(app._bridge_token(), "abc123-secret")
 
+    def test_bridge_metadata_uses_configured_identity(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VIBE_STICK_BRIDGE_ID": "desk",
+                "VIBE_STICK_BRIDGE_LABEL": "Desk Bridge",
+            },
+            clear=True,
+        ):
+            metadata = app._bridge_metadata()
+
+        self.assertEqual(metadata["bridge_id"], "desk")
+        self.assertEqual(metadata["bridge_label"], "Desk Bridge")
+        self.assertEqual(metadata["bridge_name"], app.BRIDGE_NAME)
+
+    def test_bridge_metadata_supports_legacy_identity_variables(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "M5_VOICE_BRIDGE_ID": "legacy-desk",
+                "M5_VOICE_BRIDGE_LABEL": "Legacy Desk",
+            },
+            clear=True,
+        ):
+            metadata = app._bridge_metadata()
+
+        self.assertEqual(metadata["bridge_id"], "legacy-desk")
+        self.assertEqual(metadata["bridge_label"], "Legacy Desk")
+
+    def test_health_requires_token_when_bridge_has_one(self) -> None:
+        self.assertIn("/health", app._protected_get_paths())
+
     def test_debug_redaction_helpers_preserve_empty_values(self) -> None:
         self.assertEqual(app._redacted_text("今天有没有什么不宜的事情？"), "[redacted]")
         self.assertEqual(app._redacted_text(""), "")

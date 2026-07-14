@@ -516,8 +516,7 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                 self._send_json(
                     {
                         "ok": True,
-                        "bridge_name": BRIDGE_NAME,
-                        "bridge_version": BRIDGE_VERSION,
+                        **_bridge_metadata(),
                         "features": ["battery_telemetry_v1"],
                     }
                 )
@@ -848,6 +847,7 @@ def _protected_paths() -> set[str]:
 
 def _protected_get_paths() -> set[str]:
     return {
+        "/health",
         "/ota/manifest",
         "/ota/bin",
         "/recording/tts",
@@ -1110,9 +1110,27 @@ def _query_bool(query: dict[str, list[str]], key: str) -> bool:
 
 
 def _with_bridge_metadata(payload: dict[str, Any]) -> dict[str, Any]:
-    payload["bridge_name"] = BRIDGE_NAME
-    payload["bridge_version"] = BRIDGE_VERSION
+    payload.update(_bridge_metadata())
     return payload
+
+
+def _bridge_metadata() -> dict[str, str]:
+    bridge_id = (
+        os.environ.get("VIBE_STICK_BRIDGE_ID", "").strip()
+        or os.environ.get("M5_VOICE_BRIDGE_ID", "").strip()
+        or BRIDGE_NAME
+    )
+    bridge_label = (
+        os.environ.get("VIBE_STICK_BRIDGE_LABEL", "").strip()
+        or os.environ.get("M5_VOICE_BRIDGE_LABEL", "").strip()
+        or bridge_id
+    )
+    return {
+        "bridge_name": BRIDGE_NAME,
+        "bridge_version": BRIDGE_VERSION,
+        "bridge_id": bridge_id,
+        "bridge_label": bridge_label,
+    }
 
 
 def _is_device_firmware_request(headers: Any) -> bool:
