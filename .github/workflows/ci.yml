@@ -22,3 +22,32 @@ jobs:
 
       - name: Run unit tests
         run: PYTHONPATH=bridge/src python3 -m unittest discover -s tests
+
+      - name: Run firmware host tests
+        run: firmware/telemetry/tests/run-host-tests.sh
+
+      - name: Check shell and dashboard JavaScript
+        run: |
+          bash -n scripts/setup.sh scripts/doctor.sh scripts/install.sh scripts/dev.sh scripts/battery-firmware.sh scripts/battery-test.sh
+          node --check bridge/src/vibe_stick/web/telemetry/telemetry.js
+
+  telemetry-firmware:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.1
+    strategy:
+      matrix:
+        board: [sticks3, stickc_plus_11]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build isolated telemetry firmware
+        shell: bash
+        run: scripts/battery-firmware.sh build "${{ matrix.board }}"
+
+      - name: Upload firmware image
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemetry-${{ matrix.board }}
+          path: firmware/telemetry/${{ matrix.board }}/build.${{ matrix.board }}/*.bin

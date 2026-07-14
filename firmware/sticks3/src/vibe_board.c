@@ -1,4 +1,5 @@
 #include "vibe_board.h"
+#include "sticks3_battery_curve.h"
 
 #include "driver/i2c_master.h"
 #include "esp_check.h"
@@ -178,13 +179,7 @@ esp_err_t vibe_board_battery_level(int *level_percent)
     uint8_t data[2] = {0};
     ESP_RETURN_ON_ERROR(read_regs(M5PM1_REG_BAT_L, data, sizeof(data)), TAG, "read bat");
     int voltage_mv = (data[1] << 8) | data[0];
-    int level = (voltage_mv - 3300) * 100 / (4150 - 3350);
-    if (level < 0) {
-        level = 0;
-    } else if (level > 100) {
-        level = 100;
-    }
-    *level_percent = level;
+    *level_percent = vibe_sticks3_battery_percent(voltage_mv);
     return ESP_OK;
 }
 
