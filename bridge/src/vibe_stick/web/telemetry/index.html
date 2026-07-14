@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>VibeStick Telemetry</title>
+    <link rel="stylesheet" href="./telemetry.css">
+    <script type="module" src="./telemetry.js"></script>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="masthead" aria-label="Telemetry dashboard header">
+        <div class="masthead__titleblock">
+          <p class="eyebrow">Read-only battery telemetry</p>
+          <h1>VibeStick Telemetry</h1>
+          <p class="lede">Device state, session overlays, and live sample history.</p>
+        </div>
+        <div class="masthead__status" aria-live="polite">
+          <div class="status-chip status-chip--live" id="connection-state">Connecting</div>
+          <div class="status-chip" id="refresh-state">Waiting for data</div>
+          <div class="status-chip" id="fixture-state" hidden>Fixture mode</div>
+        </div>
+      </header>
+
+      <main class="layout" id="telemetry-app">
+        <section class="panel panel--devices" aria-labelledby="devices-heading">
+          <div class="panel__head">
+            <div>
+              <p class="panel__kicker">Devices</p>
+              <h2 id="devices-heading">Status rail</h2>
+            </div>
+            <div class="panel__meta" id="device-meta">0 devices</div>
+          </div>
+          <div class="device-list" id="device-list" role="list" aria-label="Telemetry devices"></div>
+        </section>
+
+        <section class="panel panel--chart" aria-labelledby="chart-heading">
+          <div class="panel__head panel__head--chart">
+            <div>
+              <p class="panel__kicker">Comparison</p>
+              <h2 id="chart-heading">Elapsed-time overlay</h2>
+            </div>
+            <div class="chart-controls" aria-label="Chart controls">
+              <div class="segmented" role="group" aria-label="Value mode">
+                <button class="segmented__button is-active" type="button" data-mode="voltage" aria-pressed="true">Voltage</button>
+                <button class="segmented__button" type="button" data-mode="percent" aria-pressed="false">Percent</button>
+              </div>
+              <a class="action-link" id="csv-link" href="#" aria-disabled="true">CSV</a>
+            </div>
+          </div>
+
+          <div class="chart-summary" id="summary" aria-live="polite">
+            Select a device and one or more sessions to compare.
+          </div>
+
+          <div class="chart-frame" aria-label="Battery telemetry chart">
+            <svg id="telemetry-chart" viewBox="0 0 960 360" role="img" aria-labelledby="chart-title chart-desc" preserveAspectRatio="none">
+              <title id="chart-title">Battery telemetry chart</title>
+              <desc id="chart-desc">Overlay of selected sessions by elapsed time.</desc>
+            </svg>
+          </div>
+
+          <div class="legend" id="legend" aria-label="Session legend"></div>
+        </section>
+
+        <section class="panel panel--sessions" aria-labelledby="sessions-heading">
+          <div class="panel__head">
+            <div>
+              <p class="panel__kicker">Sessions</p>
+              <h2 id="sessions-heading">Historical runs</h2>
+            </div>
+            <div class="panel__meta" id="session-meta">0 selected</div>
+          </div>
+          <div class="session-list" id="session-list" role="list" aria-label="Telemetry sessions"></div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

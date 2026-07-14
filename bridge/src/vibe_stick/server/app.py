@@ -4,6 +4,7 @@ import argparse
 import hmac
 import ipaddress
 import json
+import mimetypes
 import os
 import threading
 import time
@@ -11,7 +12,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from vibe_stick import __version__ as BRIDGE_VERSION
 from vibe_stick.audio.recorder import RecordingController
@@ -35,6 +36,7 @@ from vibe_stick.protocol.state import (
 from vibe_stick.providers.base import ProviderObservation
 from vibe_stick.providers.claude import observe_claude
 from vibe_stick.providers.codex import observe_codex
+from vibe_stick.telemetry import TelemetryError, TelemetryStore
 
 MANUAL_STATUS_SECONDS = 60
 BRIDGE_NAME = "vibestick-bridge"
@@ -68,6 +70,7 @@ class BridgeStateStore:
         self._state.codex.quota_updated_at = quota.quota_updated_at
         self._state.codex.quota_stale = quota.quota_stale
         self.recording = RecordingController(RECORDING_PATH)
+        self.telemetry = TelemetryStore()
         hide_hud()
 
     def get_state(self) -> VibeStickState:
@@ -290,59 +293,154 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
         server_version = "VibeStick/0.1"
 
         def do_GET(self) -> None:
-            if self.path == "/state":
-                self._send_json(_with_bridge_metadata(store.get_state().to_jsonable()))
-            elif self.path == "/health":
-                self._send_json(
-                    {
-                        "ok": True,
-                        "bridge_name": BRIDGE_NAME,
-                        "bridge_version": BRIDGE_VERSION,
-                    }
-                )
-            else:
-                self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path == "/state":
+                    self._send_json(_with_bridge_metadata(store.get_state().to_jsonable()))
+                elif parsed.path == "/health":
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "bridge_name": BRIDGE_NAME,
+                            "bridge_version": BRIDGE_VERSION,
+                            "features": ["battery_telemetry_v1"],
+                        }
+                    )
+                elif parsed.path == "/telemetry/v1/devices":
+                    self._send_json(store.telemetry.list_devices())
+                elif _telemetry_device_raw_route(parsed.path, "export.csv"):
+                    device_id = _telemetry_device_raw_route(parsed.path, "export.csv")
+                    query = parse_qs(parsed.query)
+                    self._send_text(
+                        store.telemetry.export_raw_csv(device_id, _first(query, "boot_id")),
+                        content_type="text/csv; charset=utf-8",
+                    )
+                elif _telemetry_device_raw_route(parsed.path, ""):
+                    device_id = _telemetry_device_raw_route(parsed.path, "")
+                    query = parse_qs(parsed.query)
+                    self._send_json(
+                        store.telemetry.list_raw_samples(device_id, _first(query, "boot_id"))
+                    )
+                elif parsed.path == "/telemetry/v1/sessions":
+                    self._send_json(store.telemetry.list_sessions())
+                elif _telemetry_session_route(parsed.path, "samples"):
+                    session_id = _telemetry_session_route(parsed.path, "samples")
+                    self._send_json(store.telemetry.list_samples(session_id))
+                elif _telemetry_session_route(parsed.path, "export.csv"):
+                    session_id = _telemetry_session_route(parsed.path, "export.csv")
+                    self._send_text(store.telemetry.export_csv(session_id), content_type="text/csv; charset=utf-8")
+                elif _telemetry_session_route(parsed.path, ""):
+                    session_id = _telemetry_session_route(parsed.path, "")
+                    self._send_json(store.telemetry.get_session(session_id))
+                elif parsed.path == "/telemetry":
+                    self._send_redirect("/telemetry/")
+                elif parsed.path.startswith("/telemetry/"):
+                    self._serve_dashboard(parsed.path)
+                else:
+                    self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+            except TelemetryError as exc:
+                self._send_error(exc.status, exc.message)
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path in _protected_paths() and not self._is_authorized():
+            if _is_protected_path(parsed.path) and not self._is_authorized():
                 self._send_error(HTTPStatus.UNAUTHORIZED, "Unauthorized")
                 return
 
-            if parsed.path == "/event":
-                body = self._read_json_body()
-                self._send_json(store.update_from_event(body).to_jsonable())
-            elif parsed.path == "/quota/refresh":
-                state = store.refresh_quota()
-                self._send_json({"refreshed": True, "state": state.to_jsonable()})
-            elif parsed.path == "/recording/start":
-                body = self._read_json_body()
-                self._send_json(store.start_recording(body))
-            elif parsed.path == "/recording/audio":
-                query = parse_qs(parsed.query)
-                content_length = self._content_length()
-                max_audio_bytes = _max_recording_audio_bytes()
-                if content_length > max_audio_bytes:
-                    self._send_error(
-                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                        f"Recording audio exceeds {max_audio_bytes} bytes",
+            try:
+                if parsed.path == "/event":
+                    body = self._read_json_body()
+                    self._send_json(store.update_from_event(body).to_jsonable())
+                elif parsed.path == "/quota/refresh":
+                    state = store.refresh_quota()
+                    self._send_json({"refreshed": True, "state": state.to_jsonable()})
+                elif parsed.path == "/recording/start":
+                    body = self._read_json_body()
+                    self._send_json(store.start_recording(body))
+                elif parsed.path == "/recording/audio":
+                    query = parse_qs(parsed.query)
+                    content_length = self._content_length()
+                    max_audio_bytes = _max_recording_audio_bytes()
+                    if content_length > max_audio_bytes:
+                        self._send_error(
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            f"Recording audio exceeds {max_audio_bytes} bytes",
+                        )
+                        return
+                    pcm = self._read_raw_body(content_length)
+                    self._send_json(
+                        store.upload_recording_audio(
+                            pcm,
+                            session_id=_first(query, "session_id"),
+                            sample_rate=_int_header(self.headers.get("X-Vibe-Stick-Sample-Rate"), 16000),
+                            channels=_int_header(self.headers.get("X-Vibe-Stick-Channels"), 1),
+                            bits_per_sample=_int_header(self.headers.get("X-Vibe-Stick-Bits-Per-Sample"), 16),
+                        )
                     )
-                    return
-                pcm = self._read_raw_body(content_length)
-                self._send_json(
-                    store.upload_recording_audio(
-                        pcm,
-                        session_id=_first(query, "session_id"),
-                        sample_rate=_int_header(self.headers.get("X-Vibe-Stick-Sample-Rate"), 16000),
-                        channels=_int_header(self.headers.get("X-Vibe-Stick-Channels"), 1),
-                        bits_per_sample=_int_header(self.headers.get("X-Vibe-Stick-Bits-Per-Sample"), 16),
+                elif parsed.path == "/recording/stop":
+                    body = self._read_json_body()
+                    self._send_json(store.stop_recording(body))
+                elif parsed.path == "/telemetry/v1/samples":
+                    body = self._read_json_body()
+                    body.setdefault(
+                        "firmware_name",
+                        self.headers.get("X-Vibe-Stick-Firmware-Name", ""),
                     )
-                )
-            elif parsed.path == "/recording/stop":
-                body = self._read_json_body()
-                self._send_json(store.stop_recording(body))
-            else:
-                self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+                    body.setdefault(
+                        "firmware_version",
+                        self.headers.get("X-Vibe-Stick-Firmware-Version", ""),
+                    )
+                    body.setdefault(
+                        "transport",
+                        self.headers.get("X-Vibe-Stick-Firmware-Transport", "HTTP"),
+                    )
+                    self._send_json(store.telemetry.submit_sample(body), status=HTTPStatus.CREATED)
+                elif parsed.path == "/telemetry/v1/sessions":
+                    body = self._read_json_body()
+                    self._send_json(store.telemetry.create_session(body), status=HTTPStatus.CREATED)
+                elif _telemetry_session_route(parsed.path, "stop"):
+                    session_id = _telemetry_session_route(parsed.path, "stop")
+                    body = self._read_json_body()
+                    self._send_json(store.telemetry.stop_session(session_id, body))
+                else:
+                    self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+            except TelemetryError as exc:
+                self._send_error(exc.status, exc.message)
+
+        def _serve_dashboard(self, request_path: str) -> None:
+            dashboard_file = _dashboard_static_file(request_path)
+            if dashboard_file is None:
+                self._send_error(HTTPStatus.NOT_FOUND, "Dashboard asset not found")
+                return
+            content_type = mimetypes.guess_type(str(dashboard_file))[0] or "application/octet-stream"
+            data = dashboard_file.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_text(
+            self,
+            payload: str,
+            *,
+            status: HTTPStatus = HTTPStatus.OK,
+            content_type: str = "text/plain; charset=utf-8",
+        ) -> None:
+            data = payload.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_redirect(self, location: str) -> None:
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def log_message(self, fmt: str, *args: object) -> None:
             firmware_name = self.headers.get("X-Vibe-Stick-Firmware-Name", "-")
@@ -419,7 +517,59 @@ def _protected_paths() -> set[str]:
         "/recording/start",
         "/recording/audio",
         "/recording/stop",
+        "/telemetry/v1/samples",
+        "/telemetry/v1/sessions",
     }
+
+
+def _is_protected_path(path: str) -> bool:
+    return path in _protected_paths() or bool(_telemetry_session_route(path, "stop"))
+
+
+def _telemetry_session_route(path: str, leaf: str) -> str:
+    prefix = "/telemetry/v1/sessions/"
+    if not path.startswith(prefix):
+        return ""
+    remainder = path.removeprefix(prefix).strip("/")
+    if not remainder:
+        return ""
+    parts = remainder.split("/")
+    if leaf == "":
+        return parts[0] if len(parts) == 1 else ""
+    return parts[0] if len(parts) == 2 and parts[1] == leaf else ""
+
+
+def _telemetry_device_raw_route(path: str, leaf: str) -> str:
+    prefix = "/telemetry/v1/devices/"
+    if not path.startswith(prefix):
+        return ""
+    remainder = path.removeprefix(prefix).strip("/")
+    parts = remainder.split("/")
+    expected = 2 if leaf == "" else 3
+    if len(parts) != expected or parts[1] != "raw":
+        return ""
+    if leaf and parts[2] != leaf:
+        return ""
+    return unquote(parts[0])
+
+
+def _dashboard_static_file(request_path: str) -> Path | None:
+    web_root = Path(__file__).resolve().parents[1] / "web" / "telemetry"
+    if request_path == "/telemetry/":
+        candidate = web_root / "index.html"
+    else:
+        relative = request_path.removeprefix("/telemetry/").strip("/")
+        candidate = web_root / relative
+    try:
+        resolved_root = web_root.resolve()
+        resolved_candidate = candidate.resolve()
+    except OSError:
+        return None
+    if resolved_root not in resolved_candidate.parents and resolved_candidate != resolved_root:
+        return None
+    if not resolved_candidate.is_file():
+        return None
+    return resolved_candidate
 
 
 def _bridge_token() -> str:
