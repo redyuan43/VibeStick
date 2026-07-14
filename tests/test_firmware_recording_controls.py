@@ -177,6 +177,16 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     assert "bridge_profile_index_by_id(profile_id)" in bridge_load
 
 
+def test_bridge_discovery_fallback_id_is_bounded() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    fallback = source.split("static void bridge_discovery_fallback_id", 1)[1]
+    fallback = fallback.split("static bool bridge_parse_discovered_health", 1)[0]
+
+    assert 'strlcpy(id, "lan-", id_len);' in fallback
+    assert 'strlcat(id, host && host[0] != \'\\0\' ? host : "bridge", id_len);' in fallback
+    assert "snprintf(id, id_len" not in fallback
+
+
 def test_side_button_only_starts_full_scan_and_arms_selection_window() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     side_up = source.split("static void side_button_up_cb", 1)[1]
@@ -565,6 +575,21 @@ def test_ota_check_runs_on_network_wake_and_periodically() -> None:
     assert "s_last_ota_check_ms" in source
     assert "now_ms - s_last_ota_check_ms >= OTA_PERIODIC_CHECK_MS" in source
     assert "VIBE_STICK_OTA_CHECK_MS" not in config
+
+
+def test_ota_rejects_lower_semantic_versions_before_hash_comparison() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    ota_check = source.split("static bool ota_manifest_is_new", 1)[1]
+    ota_check = ota_check.split("static esp_err_t perform_ota_update", 1)[0]
+
+    assert "static bool ota_parse_semantic_version" in source
+    assert "static bool ota_compare_semantic_versions" in source
+    assert "ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION" in ota_check
+    assert "version_comparison < 0" in ota_check
+    assert "OTA manifest version is older" in ota_check
+    assert ota_check.index("version_comparison < 0") < ota_check.index(
+        "if (manifest->sha256[0] != '\\0')"
+    )
 
 
 def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:

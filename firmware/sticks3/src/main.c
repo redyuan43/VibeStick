@@ -2881,7 +2881,11 @@ static bool bridge_health_name_valid(const cJSON *bridge_name)
 
 static void bridge_discovery_fallback_id(const char *host, char *id, size_t id_len)
 {
-    snprintf(id, id_len, "lan-%s", host ? host : "bridge");
+    if (!id || id_len == 0) {
+        return;
+    }
+    strlcpy(id, "lan-", id_len);
+    strlcat(id, host && host[0] != '\0' ? host : "bridge", id_len);
     for (char *cursor = id; *cursor != '\0'; cursor++) {
         if (*cursor == '.') {
             *cursor = '-';
@@ -3725,6 +3729,61 @@ static void build_bridge_url(const char *path_or_url, char *url, size_t url_len)
     snprintf(url, url_len, "http://%s:%d%s", target.host, target.port, path_or_url);
 }
 
+static bool ota_parse_semantic_version(const char *raw, uint32_t version[3])
+{
+    if (!raw || !version) {
+        return false;
+    }
+
+    const char *cursor = raw;
+    if (*cursor == 'v' || *cursor == 'V') {
+        cursor++;
+    }
+    for (size_t index = 0; index < 3; index++) {
+        errno = 0;
+        char *end = NULL;
+        unsigned long value = strtoul(cursor, &end, 10);
+        if (errno != 0 || end == cursor || value > UINT32_MAX) {
+            return false;
+        }
+        version[index] = (uint32_t)value;
+        if (index < 2) {
+            if (*end != '.') {
+                return false;
+            }
+            cursor = end + 1;
+        } else if (*end != '\0' && *end != '-' && *end != '+') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ota_compare_semantic_versions(const char *candidate,
+                                          const char *current,
+                                          int *comparison)
+{
+    uint32_t candidate_version[3] = {0};
+    uint32_t current_version[3] = {0};
+    if (!comparison ||
+        !ota_parse_semantic_version(candidate, candidate_version) ||
+        !ota_parse_semantic_version(current, current_version)) {
+        return false;
+    }
+    for (size_t index = 0; index < 3; index++) {
+        if (candidate_version[index] < current_version[index]) {
+            *comparison = -1;
+            return true;
+        }
+        if (candidate_version[index] > current_version[index]) {
+            *comparison = 1;
+            return true;
+        }
+    }
+    *comparison = 0;
+    return true;
+}
+
 static bool ota_manifest_is_new(const ota_manifest_t *manifest)
 {
     if (!manifest || !manifest->available) {
@@ -3733,6 +3792,14 @@ static bool ota_manifest_is_new(const ota_manifest_t *manifest)
     if (strcmp(manifest->board, VIBE_BOARD_NAME) != 0) {
         ESP_LOGW(TAG, "OTA manifest board mismatch got=%s expected=%s",
                  manifest->board, VIBE_BOARD_NAME);
+        return false;
+    }
+    int version_comparison = 0;
+    if (ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION,
+                                      &version_comparison) &&
+        version_comparison < 0) {
+        ESP_LOGW(TAG, "OTA manifest version is older candidate=%s current=%s",
+                 manifest->version, FIRMWARE_VERSION);
         return false;
     }
     if (manifest->sha256[0] != '\0') {
