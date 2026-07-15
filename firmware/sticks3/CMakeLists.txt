@@ -8,6 +8,7 @@ if(NOT DEFINED VIBE_BOARD)
     endif()
 endif()
 set(VIBE_BOARD "${VIBE_BOARD}" CACHE STRING "VibeStick board target")
+option(VIBE_SERIAL_DEBUG "Enable serial commands that simulate hardware buttons" OFF)
 
 if(VIBE_BOARD STREQUAL "stickc_plus")
     set(IDF_TARGET "esp32")
