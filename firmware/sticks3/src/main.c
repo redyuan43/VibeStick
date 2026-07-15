@@ -5551,7 +5551,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     (void)arg;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         s_wifi_reconnect_attempt = 0;
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *disconnected =
             (const wifi_event_sta_disconnected_t *)event_data;
@@ -5623,7 +5622,15 @@ static esp_err_t init_wifi(void)
 
     ESP_RETURN_ON_ERROR(wifi_apply_profile(s_wifi_profile_index), TAG, "wifi config");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
+#if VIBE_BOARD_WIFI_MAX_TX_POWER > 0
+    ESP_RETURN_ON_ERROR(
+        esp_wifi_set_max_tx_power(VIBE_BOARD_WIFI_MAX_TX_POWER),
+        TAG, "wifi tx power");
+    ESP_LOGI(TAG, "Wi-Fi max TX power set to %.2f dBm",
+             VIBE_BOARD_WIFI_MAX_TX_POWER / 4.0);
+#endif
     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS), TAG, "wifi power save");
+    ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "wifi connect");
     return ESP_OK;
 }
 
@@ -6220,11 +6227,9 @@ static esp_err_t init_power_management(void)
 #if CONFIG_PM_ENABLE
     const esp_pm_config_t config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-        .min_freq_mhz = VIBE_BOARD_ALLOW_DYNAMIC_FREQUENCY
-                            ? CONFIG_XTAL_FREQ
-                            : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_XTAL_FREQ,
 #if CONFIG_FREERTOS_USE_TICKLESS_IDLE
-        .light_sleep_enable = VIBE_BOARD_ALLOW_AUTOMATIC_LIGHT_SLEEP,
+        .light_sleep_enable = true,
 #else
         .light_sleep_enable = false,
 #endif

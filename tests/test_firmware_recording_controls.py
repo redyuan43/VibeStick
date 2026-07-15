@@ -1033,7 +1033,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.29"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.30"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.23"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
@@ -1053,21 +1053,39 @@ def test_wifi_reconnect_uses_delayed_backoff_instead_of_immediate_retry() -> Non
     assert "ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect())" not in disconnect
 
 
-def test_power_management_is_board_specific_after_s3_brownout() -> None:
+def test_power_management_and_tickless_idle_are_enabled_by_default() -> None:
     defaults = (ROOT / "firmware/sticks3/sdkconfig.defaults").read_text(encoding="utf-8")
     source = MAIN_C.read_text(encoding="utf-8")
-    profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
 
     assert "CONFIG_PM_ENABLE=y" in defaults
     assert "CONFIG_PM_DFS_INIT_AUTO=n" in defaults
     assert "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y" in defaults
     assert "esp_pm_configure(&config)" in source
-    assert "VIBE_BOARD_ALLOW_DYNAMIC_FREQUENCY" in source
-    assert "VIBE_BOARD_ALLOW_AUTOMATIC_LIGHT_SLEEP" in source
-    assert "#define VIBE_BOARD_ALLOW_DYNAMIC_FREQUENCY 1" in profile
-    assert "#define VIBE_BOARD_ALLOW_AUTOMATIC_LIGHT_SLEEP 1" in profile
-    assert "#define VIBE_BOARD_ALLOW_DYNAMIC_FREQUENCY 0" in profile
-    assert "#define VIBE_BOARD_ALLOW_AUTOMATIC_LIGHT_SLEEP 0" in profile
+    assert ".light_sleep_enable = true" in source
+
+
+def test_s3_limits_wifi_tx_power_before_connecting() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
+    init_wifi = source.split("static esp_err_t init_wifi(void)", 1)[1].split(
+        "#if VIBE_STICK_ANIM_PREVIEW", 1
+    )[0]
+    sta_start = source.split(
+        "event_id == WIFI_EVENT_STA_START", 1
+    )[1].split(
+        "event_id == WIFI_EVENT_STA_DISCONNECTED", 1
+    )[0]
+
+    assert "#define VIBE_BOARD_WIFI_MAX_TX_POWER 0" in profile
+    assert "#define VIBE_BOARD_WIFI_MAX_TX_POWER 52" in profile
+    assert "esp_wifi_set_max_tx_power(VIBE_BOARD_WIFI_MAX_TX_POWER)" in init_wifi
+    assert init_wifi.index("esp_wifi_start()") < init_wifi.index(
+        "esp_wifi_set_max_tx_power"
+    )
+    assert init_wifi.index("esp_wifi_set_max_tx_power") < init_wifi.index(
+        "esp_wifi_connect()"
+    )
+    assert "esp_wifi_connect()" not in sta_start
 
 
 def test_tts_playback_probe_reports_device_result() -> None:
