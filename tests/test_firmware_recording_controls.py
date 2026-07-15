@@ -856,12 +856,15 @@ def test_boot_diagnostics_survive_sleep_and_are_reported_to_bridge() -> None:
     assert "s_boot_wake_cause = esp_sleep_get_wakeup_cause();" in source
     assert "s_boot_reset_reason = esp_reset_reason();" in source
     assert "RTC_DATA_ATTR static uint32_t s_retained_boot_count;" in source
+    assert "RTC_DATA_ATTR static uint32_t s_retained_boot_magic;" in source
+    assert "s_retained_boot_magic != VIBE_STICK_RETAINED_BOOT_MAGIC" in source
     assert '"X-Vibe-Stick-Wake-Cause"' in source
     assert '"X-Vibe-Stick-Reset-Reason"' in source
     assert '"X-Vibe-Stick-Boot-Count"' in source
     assert '"X-Vibe-Stick-Pmic-Wake"' in source
     assert '"X-Vibe-Stick-Pmic-Irq"' in source
     assert '"X-Vibe-Stick-Pmic-Timer"' in source
+    assert '"X-Vibe-Stick-Pmic-Gpio-Wake"' in source
     assert "#define M5PM1_REG_WAKE_SRC 0x05" in board_source
     assert "vibe_board_boot_power_status_t" in board_header
     capture = board_source.split("esp_err_t vibe_board_init_power(void)", 1)[1]
@@ -871,8 +874,15 @@ def test_boot_diagnostics_survive_sleep_and_are_reported_to_bridge() -> None:
     assert "read_reg(M5PM1_REG_IRQ_STATUS2" in capture
     assert "read_reg(M5PM1_REG_IRQ_STATUS3" in capture
     assert "read_regs(M5PM1_REG_TIMER_COUNT0" in capture
+    assert "read_reg(M5PM1_REG_GPIO_WAKE_ENABLE" in capture
+    assert "read_reg(M5PM1_REG_GPIO_WAKE_CONFIG" in capture
     assert "write_reg(M5PM1_REG_TIMER_CONFIG, 0x00)" in board_source
     assert "write_reg(M5PM1_REG_TIMER_KEY, M5PM1_TIMER_RELOAD_KEY)" in board_source
+    assert "write_reg(M5PM1_REG_GPIO_WAKE_ENABLE, 0x00)" in board_source
+    assert "write_reg(M5PM1_REG_GPIO_WAKE_CONFIG, 0x00)" in board_source
+    irq_restore = board_source.index("M5PM1_GPIO_FUNC_IRQ(1)")
+    wake_clear = board_source.index("write_reg(M5PM1_REG_WAKE_SRC, 0x00)")
+    assert irq_restore < wake_clear
     assert "rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_FRONT)" in source
 
 

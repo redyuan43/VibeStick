@@ -14,6 +14,8 @@ typedef struct {
     uint8_t irq_status_button;
     uint8_t timer_config;
     uint32_t timer_seconds;
+    uint8_t gpio_wake_enable;
+    uint8_t gpio_wake_config;
 } vibe_board_boot_power_status_t;
 
 esp_err_t vibe_board_init_power(void);

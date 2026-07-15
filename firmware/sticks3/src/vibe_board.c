@@ -30,6 +30,8 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 #define M5PM1_REG_GPIO_IN 0x12
 #define M5PM1_REG_GPIO_DRV 0x13
 #define M5PM1_REG_GPIO_FUNC0 0x16
+#define M5PM1_REG_GPIO_WAKE_ENABLE 0x18
+#define M5PM1_REG_GPIO_WAKE_CONFIG 0x19
 #define M5PM1_REG_BAT_L 0x22
 #define M5PM1_REG_VIN_L 0x24
 #define M5PM1_REG_IRQ_STATUS1 0x40
@@ -227,7 +229,11 @@ esp_err_t vibe_board_init_power(void)
         read_reg(M5PM1_REG_IRQ_STATUS1, &s_boot_power_status.irq_status_gpio) == ESP_OK &&
         read_reg(M5PM1_REG_IRQ_STATUS2, &s_boot_power_status.irq_status_power) == ESP_OK &&
         read_reg(M5PM1_REG_IRQ_STATUS3, &s_boot_power_status.irq_status_button) == ESP_OK &&
-        read_regs(M5PM1_REG_TIMER_COUNT0, timer_data, sizeof(timer_data)) == ESP_OK;
+        read_regs(M5PM1_REG_TIMER_COUNT0, timer_data, sizeof(timer_data)) == ESP_OK &&
+        read_reg(M5PM1_REG_GPIO_WAKE_ENABLE,
+                 &s_boot_power_status.gpio_wake_enable) == ESP_OK &&
+        read_reg(M5PM1_REG_GPIO_WAKE_CONFIG,
+                 &s_boot_power_status.gpio_wake_config) == ESP_OK;
     if (s_boot_power_status.available) {
         s_boot_power_status.timer_seconds =
             (uint32_t)timer_data[0] |
@@ -236,17 +242,15 @@ esp_err_t vibe_board_init_power(void)
             ((uint32_t)(timer_data[3] & 0x7f) << 24);
         s_boot_power_status.timer_config = timer_data[4];
         ESP_LOGI(TAG,
-                 "boot power status wake=0x%02x irq_gpio=0x%02x irq_power=0x%02x irq_button=0x%02x timer_cfg=0x%02x timer_seconds=%lu",
+                 "boot power status wake=0x%02x irq_gpio=0x%02x irq_power=0x%02x irq_button=0x%02x timer_cfg=0x%02x timer_seconds=%lu gpio_wake=0x%02x/0x%02x",
                  s_boot_power_status.wake_source,
                  s_boot_power_status.irq_status_gpio,
                  s_boot_power_status.irq_status_power,
                  s_boot_power_status.irq_status_button,
                  s_boot_power_status.timer_config,
-                 (unsigned long)s_boot_power_status.timer_seconds);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_WAKE_SRC, 0x00));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_TIMER_CONFIG, 0x00));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            write_reg(M5PM1_REG_TIMER_KEY, M5PM1_TIMER_RELOAD_KEY));
+                 (unsigned long)s_boot_power_status.timer_seconds,
+                 s_boot_power_status.gpio_wake_enable,
+                 s_boot_power_status.gpio_wake_config);
     } else {
         ESP_LOGW(TAG, "boot power status unavailable");
     }
@@ -277,13 +281,23 @@ esp_err_t vibe_board_init_power(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(M5PM1_REG_GPIO_MODE, BIT(0), 0));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_IRQ_MASK1, 0x1F));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_IRQ_MASK3, 0x07));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_IRQ_STATUS1, 0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_IRQ_STATUS2, 0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_IRQ_STATUS3, 0x00));
     ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_IRQ_MASK2, 0x3F));
     ESP_ERROR_CHECK_WITHOUT_ABORT(update_reg(M5PM1_REG_GPIO_FUNC0,
                                              M5PM1_GPIO_FUNC_MASK(1),
                                              M5PM1_GPIO_FUNC_IRQ(1)));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_IRQ_STATUS1, 0x00));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_IRQ_STATUS2, 0x00));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_IRQ_STATUS3, 0x00));
+    if (s_boot_power_status.available) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_WAKE_SRC, 0x00));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            write_reg(M5PM1_REG_GPIO_WAKE_ENABLE, 0x00));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            write_reg(M5PM1_REG_GPIO_WAKE_CONFIG, 0x00));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_TIMER_CONFIG, 0x00));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            write_reg(M5PM1_REG_TIMER_KEY, M5PM1_TIMER_RELOAD_KEY));
+    }
 
     ESP_LOGI(TAG, "power hold enabled");
     return ESP_OK;

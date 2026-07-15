@@ -98,6 +98,7 @@
 #define VIBE_STICK_BATTERY_SAMPLE_COUNT 5
 #define VIBE_STICK_BATTERY_USB_UNPLUG_HOLD_MS 30000
 #define VIBE_STICK_BATTERY_WAKE_STABILIZE_MS 5000
+#define VIBE_STICK_RETAINED_BOOT_MAGIC 0x56494245u
 #define VIBE_STICK_BATTERY_LOG_GAP_PERCENT 5
 #define VIBE_STICK_BATTERY_RTC_MAGIC 0x56424231
 #define VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS 60
@@ -523,6 +524,7 @@ static int s_battery_raw_level = -1;
 static int s_battery_voltage_mv = -1;
 RTC_DATA_ATTR static uint32_t s_retained_battery_magic;
 RTC_DATA_ATTR static int s_retained_battery_display_level = -1;
+RTC_DATA_ATTR static uint32_t s_retained_boot_magic;
 RTC_DATA_ATTR static uint32_t s_retained_boot_count;
 static lv_obj_t *s_recording_overlay;
 static lv_obj_t *s_recording_wave_group;
@@ -3116,6 +3118,7 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
     char pmic_wake[8] = {0};
     char pmic_irq[24] = {0};
     char pmic_timer[24] = {0};
+    char pmic_gpio_wake[16] = {0};
     device_id(id, sizeof(id));
     current_wifi_ssid(ssid, sizeof(ssid));
     current_wifi_bssid(bssid, sizeof(bssid));
@@ -3135,6 +3138,9 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
     snprintf(pmic_timer, sizeof(pmic_timer), "%02x/%lu",
              s_boot_power_status.timer_config,
              (unsigned long)s_boot_power_status.timer_seconds);
+    snprintf(pmic_gpio_wake, sizeof(pmic_gpio_wake), "%02x/%02x",
+             s_boot_power_status.gpio_wake_enable,
+             s_boot_power_status.gpio_wake_config);
     esp_http_client_set_header(client, "X-Vibe-Stick-Device-Id", id);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Ssid", ssid);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Bssid", bssid);
@@ -3151,6 +3157,8 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
         esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Wake", pmic_wake);
         esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Irq", pmic_irq);
         esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Timer", pmic_timer);
+        esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Gpio-Wake",
+                                   pmic_gpio_wake);
     }
     if (token && token[0] != '\0') {
         esp_http_client_set_header(client, "X-Vibe-Stick-Token", token);
@@ -6242,6 +6250,10 @@ void app_main(void)
     s_boot_wake_cause = esp_sleep_get_wakeup_cause();
     s_boot_reset_reason = esp_reset_reason();
     s_boot_ext1_wake_status = esp_sleep_get_ext1_wakeup_status();
+    if (s_retained_boot_magic != VIBE_STICK_RETAINED_BOOT_MAGIC) {
+        s_retained_boot_magic = VIBE_STICK_RETAINED_BOOT_MAGIC;
+        s_retained_boot_count = 0;
+    }
     s_retained_boot_count++;
     s_woke_from_deep_sleep =
         s_boot_wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED;
