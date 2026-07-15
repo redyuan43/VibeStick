@@ -96,6 +96,7 @@
 #define VIBE_STICK_DEEP_SLEEP_RETRY_MS 5000
 #define VIBE_STICK_POWER_STATUS_POLL_MS 2000
 #define VIBE_STICK_BATTERY_SAMPLE_COUNT 5
+#define VIBE_STICK_BATTERY_FULL_LATCH_PERCENT 99
 #define VIBE_STICK_BATTERY_USB_UNPLUG_HOLD_MS 30000
 #define VIBE_STICK_BATTERY_WAKE_STABILIZE_MS 5000
 #define VIBE_STICK_RETAINED_BOOT_MAGIC 0x56494245u
@@ -519,6 +520,7 @@ static int s_battery_samples[VIBE_STICK_BATTERY_SAMPLE_COUNT];
 static size_t s_battery_sample_count;
 static size_t s_battery_sample_index;
 static bool s_battery_display_valid;
+static bool s_battery_full_latched;
 static int s_battery_display_level;
 static int s_battery_raw_level = -1;
 static int s_battery_voltage_mv = -1;
@@ -4582,6 +4584,9 @@ static void update_battery_display_level(int raw_level, int64_t now_ms)
     s_battery_raw_level = clamp_percent(raw_level);
     record_battery_sample(s_battery_raw_level);
     int target_level = median_battery_sample();
+    if (s_battery_full_latched) {
+        target_level = 100;
+    }
 
     if (!s_battery_display_valid) {
         if (s_woke_from_deep_sleep &&
@@ -4636,6 +4641,14 @@ static void refresh_power_status(bool force_log)
         ESP_LOGI(TAG, "external power removed");
         s_external_power_removed_ms = now_ms;
     }
+#if VIBE_BOARD_HOLD_FULL_BATTERY_ICON
+    if (!external_powered()) {
+        s_battery_full_latched = false;
+    } else if (battery_read_ok &&
+               battery_level >= VIBE_STICK_BATTERY_FULL_LATCH_PERCENT) {
+        s_battery_full_latched = true;
+    }
+#endif
 #if CONFIG_PM_ENABLE && VIBE_BOARD_HAS_GPIO_BACKLIGHT
     if (power_read_ok) {
         update_display_light_sleep_lock(

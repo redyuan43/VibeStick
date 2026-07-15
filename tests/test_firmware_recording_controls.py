@@ -569,6 +569,19 @@ def test_battery_display_filters_raw_voltage_status() -> None:
     assert "power status battery_raw=%d battery_display=%d battery_mv=%d charging=%d usb=%d" in source
 
 
+def test_battery_display_holds_full_while_external_power_remains_connected() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
+
+    assert "static bool s_battery_full_latched;" in source
+    assert "s_battery_full_latched = false;" in source
+    assert "battery_level >= VIBE_STICK_BATTERY_FULL_LATCH_PERCENT" in source
+    assert "if (s_battery_full_latched)" in source
+    assert "target_level = 100;" in source
+    assert "#define VIBE_BOARD_HOLD_FULL_BATTERY_ICON 0" in board_profile
+    assert "#define VIBE_BOARD_HOLD_FULL_BATTERY_ICON 1" in board_profile
+
+
 def test_battery_ui_uses_color_bands_without_a_percentage_label() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     battery_ui = source.split("static void set_battery_ui", 1)[1]
@@ -1033,7 +1046,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.30"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.31"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.23"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
