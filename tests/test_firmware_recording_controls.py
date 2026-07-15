@@ -201,6 +201,25 @@ def test_battery_curves_are_board_specific_and_calibrated() -> None:
     assert 'VIBE_BOARD_BATTERY_CURVE_VERSION "stickc-plus-20260714-full-v1"' in profile
 
 
+def test_idle_pet_bobs_briefly_then_uses_a_low_frequency_static_timer() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    activity = source.split("static void register_activity(void)\n{", 1)[1]
+    activity = activity.split("static void update_power_saving", 1)[0]
+    update_pet = source.split("static void update_pet_visual(void)\n{", 1)[1]
+    update_pet = update_pet.split("static void pet_timer_cb", 1)[0]
+
+    assert "#define VIBE_STICK_PET_ACTIVE_TIMER_MS 300" in source
+    assert "#define VIBE_STICK_PET_IDLE_TIMER_MS 1000" in source
+    assert "#define VIBE_STICK_PET_IDLE_BOB_STEPS 16" in source
+    assert "static int s_pet_idle_bob_steps_remaining;" in source
+    assert "s_pet_idle_bob_steps_remaining = VIBE_STICK_PET_IDLE_BOB_STEPS;" in activity
+    assert "lv_timer_set_period(s_pet_timer, VIBE_STICK_PET_ACTIVE_TIMER_MS);" in activity
+    assert "sequence.key != 0 || s_pet_idle_bob_steps_remaining > 0" in update_pet
+    assert "s_pet_idle_bob_steps_remaining--;" in update_pet
+    assert "set_pet_timer_period(VIBE_STICK_PET_IDLE_TIMER_MS);" in update_pet
+    assert "set_pet_vertical_offset(14);" in update_pet
+
+
 def test_side_button_only_starts_full_scan_and_arms_selection_window() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     side_up = source.split("static void side_button_up_cb", 1)[1]
@@ -434,18 +453,27 @@ def test_serial_debug_command_uses_the_side_button_event_path() -> None:
     assert 'xTaskCreate(serial_debug_task, "serial_debug", 6144' in source
 
 
-def test_recording_start_uses_descending_chirp_and_stop_uses_legacy_beep() -> None:
+def test_s3_uses_a_softer_recording_tone_profile_while_plus_keeps_its_buzzer_profile() -> None:
     source = AUDIO_C.read_text(encoding="utf-8")
     recording_start = source.split("static const sound_segment_t recording_start[] = {", 1)[1]
     recording_start = recording_start.split("};", 1)[0]
     recording_stop = source.split("static const sound_segment_t recording_stop[] = {", 1)[1]
     recording_stop = recording_stop.split("};", 1)[0]
 
-    assert "VIBE_STICK_RECORDING_CHIRP_MS" in source
-    assert "VIBE_STICK_RECORDING_CHIRP_GAP_MS" in source
-    assert "{.freq_hz = 3600, .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS}" in recording_start
-    assert "{.freq_hz = 1800, .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS}" in recording_start
-    assert "{.freq_hz = 4000, .duration_ms = VIBE_STICK_BEEP_MS}" in recording_stop
+    profile_block = source.split("#define VIBE_STICK_AUDIO_CORE 1\n\n", 1)[1]
+    profile_block = profile_block.split("\ntypedef struct", 1)[0]
+    s3_profile = profile_block.split("#if VIBE_BOARD_HAS_ES8311", 1)[1].split("#else", 1)[0]
+    plus_profile = profile_block.split("#else", 1)[1].split("#endif", 1)[0]
+
+    assert "#define VIBE_STICK_SOUND_VOLUME 0.28f" in s3_profile
+    assert "#define VIBE_STICK_SOUND_OUTPUT_VOLUME 70" in s3_profile
+    assert "#define VIBE_STICK_RECORDING_START_HIGH_HZ 1800" in s3_profile
+    assert "#define VIBE_STICK_RECORDING_STOP_HZ 1500" in s3_profile
+    assert "#define VIBE_STICK_RECORDING_START_HIGH_HZ 3600" in plus_profile
+    assert "#define VIBE_STICK_RECORDING_STOP_HZ 4000" in plus_profile
+    assert "{.freq_hz = VIBE_STICK_RECORDING_START_HIGH_HZ" in recording_start
+    assert "{.freq_hz = VIBE_STICK_RECORDING_START_LOW_HZ" in recording_start
+    assert "{.freq_hz = VIBE_STICK_RECORDING_STOP_HZ" in recording_stop
     assert "VIBE_STICK_SOUND_RECORDING_START" in source
     assert "VIBE_STICK_SOUND_RECORDING_STOP" in source
 
@@ -468,11 +496,11 @@ def test_followup_enter_and_escape_use_distinct_buzz_sounds() -> None:
     assert "VIBE_STICK_ESCAPE_GLITCH_SHORT_MS" in source
     assert "VIBE_STICK_ESCAPE_GLITCH_LONG_MS" in source
     assert "VIBE_STICK_ESCAPE_GLITCH_GAP_MS" in source
-    assert "{.freq_hz = 2600, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS}" in followup_enter
-    assert "{.freq_hz = 3200, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS}" in followup_enter
-    assert "{.freq_hz = 3600, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS}" in followup_escape
+    assert "{.freq_hz = VIBE_STICK_FOLLOWUP_ENTER_LOW_HZ" in followup_enter
+    assert "{.freq_hz = VIBE_STICK_FOLLOWUP_ENTER_HIGH_HZ" in followup_enter
+    assert "{.freq_hz = VIBE_STICK_FOLLOWUP_ESCAPE_HIGH_HZ" in followup_escape
     assert "{.freq_hz = 760, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS}" in followup_escape
-    assert "{.freq_hz = 3200, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS}" in followup_escape
+    assert "{.freq_hz = VIBE_STICK_FOLLOWUP_ESCAPE_MID_HZ" in followup_escape
     assert "{.freq_hz = 520, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS}" in followup_escape
     assert followup_enter != followup_escape
     assert 'start_ptt_followup_key_dispatch("button_followup_enter"' in main_source
@@ -560,7 +588,8 @@ def test_state_polling_stops_while_screen_is_off() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 
     assert "s_display_power_state == DISPLAY_POWER_ACTIVE" in source
-    assert "now_ms - last_poll >= VIBE_STICK_STATE_POLL_MS" in source
+    assert "now_ms - last_poll >= state_poll_interval_ms(now_ms)" in source
+    assert "VIBE_STICK_STATE_POLL_IDLE_MS 10000" in source
     assert "VIBE_STICK_IDLE_STATE_POLL_MS" not in source
 
 
@@ -586,8 +615,10 @@ def test_ota_check_runs_on_network_wake_and_periodically() -> None:
     assert "case VIBE_STICK_EVENT_OTA_CHECK:" in source
     assert "start_ota_check_task();" in source
     assert "#define OTA_PERIODIC_CHECK_MS 300000" in source
+    assert "#define OTA_BATTERY_CHECK_MS 1800000" in source
     assert "s_last_ota_check_ms" in source
-    assert "now_ms - s_last_ota_check_ms >= OTA_PERIODIC_CHECK_MS" in source
+    assert "now_ms - s_last_ota_check_ms >= ota_interval_ms" in source
+    assert "ota_power_policy_allows" in source
     assert "VIBE_STICK_OTA_CHECK_MS" not in config
 
 
@@ -601,7 +632,12 @@ def test_ota_rejects_lower_semantic_versions_before_hash_comparison() -> None:
     assert "ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION" in ota_check
     assert "version_comparison < 0" in ota_check
     assert "OTA manifest version is older" in ota_check
+    assert "version_comparison == 0" in ota_check
+    assert "OTA manifest version is not newer" in ota_check
     assert ota_check.index("version_comparison < 0") < ota_check.index(
+        "if (manifest->sha256[0] != '\\0')"
+    )
+    assert ota_check.index("version_comparison == 0") < ota_check.index(
         "if (manifest->sha256[0] != '\\0')"
     )
 
@@ -618,16 +654,33 @@ def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
 
 def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    motion_source = (ROOT / "firmware/sticks3/src/vibe_motion.c").read_text(encoding="utf-8")
+    motion_header = (ROOT / "firmware/sticks3/include/vibe_motion.h").read_text(encoding="utf-8")
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
+    plus_profile = board_profile.split("#else", 1)[0]
 
-    assert "VIBE_STICK_DEEP_SLEEP_MS 600000" in source
+    assert "VIBE_STICK_DEEP_SLEEP_MS 300000" in source
     assert "maybe_enter_deep_sleep(now_ms)" in source
     assert "esp_deep_sleep_start()" in source
     assert "esp_sleep_enable_ext0_wakeup(ext0_gpio, 0)" in source
+    assert "gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;" in source
+    assert "ext0_gpio = VIBE_BOARD_PIN_IMU_INT;" not in source
     assert "esp_sleep_enable_ext1_wakeup_io(wake_mask" in source
+    assert "static bool sleep_wake_gpio_is_active(gpio_num_t gpio)" in source
+    assert "static bool sleep_wake_mask_contains(uint64_t wake_mask, gpio_num_t gpio)" in source
+    assert "deep sleep skipped: ext0 wake gpio=%d is already active" in source
+    assert "sleep_wake_gpio_is_active(ext0_gpio)" in source
+    assert "vibe_motion_prepare_deep_sleep()" in source
     assert "vibe_motion_prepare_deep_sleep_wake()" in source
+    assert "esp_err_t vibe_motion_prepare_deep_sleep(void);" in motion_header
+    assert "write_reg(MPU6886_INT_ENABLE, 0)" in motion_source
+    assert "write_reg(MPU6886_PWR_MGMT_2, MPU6886_AXIS_STANDBY_MASK)" in motion_source
+    assert "write_reg(MPU6886_PWR_MGMT_1, MPU6886_SLEEP_MODE)" in motion_source
+    assert "read_regs(MPU6886_INT_STATUS, &reg, 1)" in motion_source
     assert "#define VIBE_BOARD_PIN_IMU_INT GPIO_NUM_35" in board_profile
-    assert "#define VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE 0" in board_profile
+    assert "#define VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE 0" in plus_profile
+    assert "#define VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL 1" in board_profile
+    assert ".disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL" in source
 
 
 def test_recording_mode_preference_survives_deep_sleep_restart() -> None:
@@ -743,6 +796,158 @@ def test_wifi_profiles_are_persisted_and_rotated() -> None:
     assert "wifi_profiles_merge_configured" in source
     assert "VIBE_STICK_WIFI_PROFILES" in source
     assert "s_wifi_profile_index = (s_wifi_profile_index + 1) % s_wifi_profile_count" in source
+
+
+def test_deep_sleep_validates_wake_gpio_before_wifi_shutdown() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    sleep = source.split("static bool enter_deep_sleep(void)", 1)[1]
+    sleep = sleep.split("static void maybe_enter_deep_sleep", 1)[0]
+
+    assert sleep.index("sleep_wake_gpio_is_active(ext0_gpio)") < sleep.index("esp_wifi_stop()")
+    assert sleep.index("sleep_wake_gpio_is_active(VIBE_BOARD_PIN_BUTTON_FRONT)") < sleep.index(
+        "esp_wifi_stop()"
+    )
+    assert "ext0_gpio = VIBE_BOARD_PIN_IMU_INT;" not in sleep
+
+
+def test_deep_sleep_retry_uses_delayed_backoff_after_active_wake_gpio() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    maybe_sleep = source.split("static void maybe_enter_deep_sleep", 1)[1]
+    maybe_sleep = maybe_sleep.split("static esp_err_t init_display", 1)[0]
+
+    assert "VIBE_STICK_DEEP_SLEEP_RETRY_MS" in source
+    assert "s_next_deep_sleep_attempt_ms" in source
+    assert "now_ms + VIBE_STICK_DEEP_SLEEP_RETRY_MS" in maybe_sleep
+    assert "now_ms < s_next_deep_sleep_attempt_ms" in maybe_sleep
+
+
+def test_s3_deep_sleep_wake_gpio_preserves_internal_button_pullups() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
+    sleep = source.split("static bool enter_deep_sleep(void)", 1)[1]
+    sleep = sleep.split("static void maybe_enter_deep_sleep", 1)[0]
+    init_button = source.split("static esp_err_t init_button", 1)[1]
+    init_button = init_button.split("static void capture_deep_sleep_front_button_intent", 1)[0]
+
+    assert "#define VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL 0" in board_profile
+    assert ".disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL" in init_button
+    assert "configure_sleep_wake_gpio(VIBE_BOARD_PIN_BUTTON_FRONT" not in sleep
+    assert "configure_sleep_wake_gpio(VIBE_BOARD_PIN_BUTTON_SIDE" not in sleep
+
+
+def test_side_button_gpio_keeps_power_save_enabled() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    init_button = source.split("static esp_err_t init_button", 1)[1]
+    init_button = init_button.split("static void capture_deep_sleep_front_button_intent", 1)[0]
+    side_gpio = init_button.split("const button_gpio_config_t side_gpio_config", 1)[1]
+    side_gpio = side_gpio.split("};", 1)[0]
+
+    assert ".enable_power_save = true" in side_gpio
+
+
+def test_ptt_recording_suspends_motion_and_lift_mode_resumes_it() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    motion_header = (ROOT / "firmware/sticks3/include/vibe_motion.h").read_text(encoding="utf-8")
+    ptt_mode = source.split("static void set_push_to_talk_trigger_mode", 1)[1]
+    ptt_mode = ptt_mode.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[0]
+    lift_mode = source.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[1]
+    lift_mode = lift_mode.split("static esp_err_t save_recording_mode_preference", 1)[0]
+
+    assert "esp_err_t vibe_motion_suspend(void);" in motion_header
+    assert "esp_err_t vibe_motion_resume(void);" in motion_header
+    assert "vibe_motion_suspend()" in ptt_mode
+    assert "vibe_motion_resume()" in lift_mode
+
+
+def test_motion_calibration_has_finite_timeout_and_fallback_baseline() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    lift_mode = source.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[1]
+    lift_mode = lift_mode.split("static esp_err_t save_recording_mode_preference", 1)[0]
+    timeout = source.split("static void maybe_timeout_motion_calibration", 1)[1]
+    timeout = timeout.split("static uint32_t state_poll_interval_ms", 1)[0]
+
+    assert "VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS 15000" in source
+    assert "s_motion_calibration_deadline_ms" in source
+    assert "VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS" in lift_mode
+    assert "lift calibration timed out; falling back to PTT" in timeout
+    assert "set_push_to_talk_trigger_mode();" in timeout
+    assert "save_recording_mode_preference()" in timeout
+
+
+def test_audio_stop_unblocks_bounded_recording_reads_before_waiting_for_task_exit() -> None:
+    source = AUDIO_C.read_text(encoding="utf-8")
+    read_chunk = source.split("static esp_err_t read_audio_chunk", 1)[1]
+    read_chunk = read_chunk.split("static void audio_task", 1)[0]
+    stop = source.split("esp_err_t vibe_audio_stop(void)", 1)[1]
+    stop = stop.split("bool vibe_audio_is_recording", 1)[0]
+
+    assert "AUDIO_READ_WAIT_MS" in source
+    assert "portMAX_DELAY" not in read_chunk
+    assert "AUDIO_READ_WAIT_MS" in read_chunk
+    assert "esp_codec_dev_read(s_codec" in read_chunk
+    assert stop.index("atomic_store(&s_running, false)") < stop.index("while (s_audio_task != NULL)")
+    assert "signal_capture_stop_locked()" in stop
+    assert "forcing bounded cleanup" in stop
+    assert "vTaskDelete(s_audio_task)" in stop
+
+
+def test_release_firmware_can_disable_serial_debug_input_task() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    serial_task = source.split("#if VIBE_STICK_SERIAL_DEBUG_ENABLED", 1)[1]
+    serial_task = serial_task.split("void app_main", 1)[0]
+    app_main = source.split("void app_main(void)", 1)[1]
+
+    assert "VIBE_STICK_SERIAL_DEBUG_ENABLED" in source
+    assert "static void serial_debug_task" in serial_task
+    assert "#if VIBE_STICK_SERIAL_DEBUG_ENABLED" in app_main
+    assert 'xTaskCreate(serial_debug_task, "serial_debug", 6144' in app_main
+
+
+def test_display_off_suspends_panel_output_and_lvgl_timer_work() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    power = source.split("static void update_power_saving", 1)[1]
+    power = power.split("static void request_motion_recording_start", 1)[0]
+    register_activity = source.split("static void register_activity(void)\n{", 1)[1]
+    register_activity = register_activity.split("static void update_power_saving", 1)[0]
+    display_suspend = source.split("static void set_display_rendering_suspended", 1)[1]
+    display_suspend = display_suspend.split("static void fade_backlight_toward", 1)[0]
+
+    assert "set_display_rendering_suspended(true)" in power
+    assert "set_display_rendering_suspended(false)" in register_activity
+    assert "esp_lcd_panel_disp_on_off(s_panel, false)" in display_suspend
+    assert "lv_timer_pause(s_pet_timer)" in display_suspend
+    assert "lv_timer_resume(s_pet_timer)" in display_suspend
+    assert "esp_lcd_panel_disp_on_off(s_panel, true)" in display_suspend
+    panel_off_index = display_suspend.index(
+        "esp_lcd_panel_disp_on_off(s_panel, false)"
+    )
+    assert "#if VIBE_BOARD_HAS_GPIO_BACKLIGHT" not in display_suspend[
+        max(0, panel_off_index - 80) : panel_off_index
+    ]
+
+
+def test_wifi_reconnect_uses_delayed_backoff_instead_of_immediate_retry() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    handler = source.split("static void wifi_event_handler", 1)[1]
+    handler = handler.split("static esp_err_t init_wifi", 1)[0]
+    disconnect = handler.split("WIFI_EVENT_STA_DISCONNECTED", 1)[1]
+    disconnect = disconnect.split("} else if (event_base == IP_EVENT", 1)[0]
+
+    assert "wifi_reconnect_delay_ms" in source
+    assert "s_wifi_reconnect_timer" in source
+    assert "schedule_wifi_reconnect();" in disconnect
+    assert "ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect())" not in disconnect
+
+
+def test_power_management_and_tickless_idle_are_enabled_by_default() -> None:
+    defaults = (ROOT / "firmware/sticks3/sdkconfig.defaults").read_text(encoding="utf-8")
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert "CONFIG_PM_ENABLE=y" in defaults
+    assert "CONFIG_PM_DFS_INIT_AUTO=n" in defaults
+    assert "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y" in defaults
+    assert "esp_pm_configure(&config)" in source
+    assert ".light_sleep_enable = true" in source
 
 
 def test_tts_playback_probe_reports_device_result() -> None:

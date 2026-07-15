@@ -25,6 +25,7 @@
 #include "esp_app_desc.h"
 #include "esp_event.h"
 #include "esp_ota_ops.h"
+#include "esp_pm.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_lcd_panel_io.h"
@@ -78,6 +79,7 @@
 #define FRONT_PTT_LONG_PRESS_MS 400
 #define OTA_READ_BUFFER_BYTES 4096
 #define OTA_PERIODIC_CHECK_MS 300000
+#define OTA_BATTERY_CHECK_MS 1800000
 #define HTTP_CLIENT_BUFFER_SIZE 2048
 #define BRIDGE_HEALTH_RESPONSE_BYTES 512
 #define TTS_AUDIO_MAX_BYTES (1024 * 1024)
@@ -89,7 +91,8 @@
 #define VIBE_STICK_FOLLOWUP_PRIORITY 6
 #define VIBE_STICK_IDLE_DIM_MS 30000
 #define VIBE_STICK_IDLE_OFF_MS 60000
-#define VIBE_STICK_DEEP_SLEEP_MS 600000
+#define VIBE_STICK_DEEP_SLEEP_MS 300000
+#define VIBE_STICK_DEEP_SLEEP_RETRY_MS 5000
 #define VIBE_STICK_POWER_STATUS_POLL_MS 2000
 #define VIBE_STICK_BATTERY_SAMPLE_COUNT 5
 #define VIBE_STICK_BATTERY_USB_UNPLUG_HOLD_MS 30000
@@ -99,11 +102,23 @@
 #define VIBE_STICK_BACKLIGHT_FADE_INTERVAL_MS 60
 #define VIBE_STICK_BACKLIGHT_FADE_STEP 5
 #define VIBE_STICK_PET_FAST_RESUME_MAX_MS 15000
+#define VIBE_STICK_PET_ACTIVE_TIMER_MS 300
+#define VIBE_STICK_PET_IDLE_TIMER_MS 1000
+#define VIBE_STICK_PET_IDLE_BOB_STEPS 16
 #define VIBE_STICK_MODE_SWITCH_VISUAL_MS 1800
 #define VIBE_STICK_MODE_SWITCH_FRAME_MS 260
 #define VIBE_STICK_CYBER_TTS_WAIT_TIMEOUT_MS 180000
+#define VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS 15000
+#define VIBE_STICK_STATE_POLL_IDLE_MS 10000
+#define VIBE_STICK_STATE_POLL_INTERACTIVE_MS 15000
+#define VIBE_STICK_APP_IDLE_WAIT_MS 1000
+#define VIBE_STICK_APP_MOTION_WAIT_MS 20
 #define VIBE_STICK_WIFI_IDLE_PS WIFI_PS_MIN_MODEM
+#define VIBE_STICK_WIFI_RECONNECT_MAX_MS 30000
 #define VIBE_STICK_ANIM_PREVIEW 0
+#ifndef VIBE_STICK_SERIAL_DEBUG_ENABLED
+#define VIBE_STICK_SERIAL_DEBUG_ENABLED 0
+#endif
 #if VIBE_STICK_ANIM_PREVIEW
 #define VIBE_STICK_OTA_ENABLED 0
 #else
@@ -365,6 +380,8 @@ static wifi_profile_t s_wifi_profiles[WIFI_PROFILE_MAX_COUNT];
 static size_t s_wifi_profile_count;
 static size_t s_wifi_profile_index;
 static int s_wifi_profile_retry_count;
+static unsigned int s_wifi_reconnect_attempt;
+static esp_timer_handle_t s_wifi_reconnect_timer;
 static SemaphoreHandle_t s_bridge_target_lock;
 static SemaphoreHandle_t s_bridge_profiles_lock;
 static SemaphoreHandle_t s_bridge_probe_lock;
@@ -399,6 +416,7 @@ static bool s_recording_overlay_visible;
 static bool s_long_press_active;
 static bool s_motion_recording_active;
 static bool s_motion_calibrating;
+static int64_t s_motion_calibration_deadline_ms;
 static bool s_motion_lift_armed;
 static bool s_motion_start_pending;
 static bool s_tap_recording_active;
@@ -425,6 +443,7 @@ static int64_t s_last_ota_check_ms;
 static int64_t s_last_activity_ms;
 static int64_t s_last_backlight_fade_ms;
 static int64_t s_last_power_status_poll_ms;
+static int64_t s_next_deep_sleep_attempt_ms;
 static uint8_t s_current_backlight = LCD_BACKLIGHT_DEFAULT;
 static display_power_state_t s_display_power_state = DISPLAY_POWER_ACTIVE;
 static recording_upload_stats_t s_recording_upload_stats;
@@ -434,6 +453,10 @@ static int64_t s_pet_next_frame_ms;
 static int s_pet_sequence_index;
 static int s_pet_sequence_key = -1;
 static int s_pet_bob_step;
+static int s_pet_idle_bob_steps_remaining;
+static int s_pet_y_offset;
+static bool s_pet_y_offset_valid;
+static lv_timer_t *s_pet_timer;
 static const vibe_stick_pet_frame_id_t *s_mode_switch_frames;
 static int s_mode_switch_frame_count;
 static int s_mode_switch_frame_index;
@@ -457,6 +480,11 @@ static volatile int64_t s_front_button_iot_single_ms;
 static volatile int64_t s_front_button_iot_up_ms;
 
 static lv_display_t *s_display;
+static esp_lcd_panel_handle_t s_panel;
+static esp_timer_handle_t s_lvgl_tick_timer;
+static TaskHandle_t s_lvgl_task;
+static atomic_bool s_display_rendering_suspended;
+static bool s_lvgl_tick_running;
 static lv_obj_t *s_wifi_label;
 static lv_obj_t *s_battery_icon;
 static lv_obj_t *s_battery_fill;
@@ -632,6 +660,7 @@ static const lv_point_precise_t s_battery_bolt_points[] = {
 static void render_state(void);
 static void copy_json_string(cJSON *root, const char *key, char *target, size_t target_len);
 static void register_activity(void);
+static void request_wifi_reconnect_now(void);
 static void cycle_bridge_profile(void);
 static bool start_bridge_discovery_task(bool show_searching);
 static void bridge_target_copy(bridge_target_t *target);
@@ -822,6 +851,7 @@ static void reset_recording_trigger_runtime_state(void)
 {
     s_motion_recording_active = false;
     s_motion_calibrating = false;
+    s_motion_calibration_deadline_ms = 0;
     s_motion_lift_armed = false;
     s_motion_start_pending = false;
 }
@@ -830,6 +860,13 @@ static void set_push_to_talk_trigger_mode(void)
 {
     s_recording_trigger_mode = RECORDING_TRIGGER_PUSH_TO_TALK;
     reset_recording_trigger_runtime_state();
+    if (vibe_motion_available()) {
+        esp_err_t err = vibe_motion_suspend();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "PTT mode IMU suspend failed: %s",
+                     esp_err_to_name(err));
+        }
+    }
 }
 
 static esp_err_t set_lift_to_talk_trigger_mode(const char *reason)
@@ -839,7 +876,14 @@ static esp_err_t set_lift_to_talk_trigger_mode(const char *reason)
         set_push_to_talk_trigger_mode();
         return ESP_ERR_NOT_SUPPORTED;
     }
-    esp_err_t err = vibe_motion_recalibrate();
+    esp_err_t err = vibe_motion_resume();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s lift recording mode IMU resume failed: %s",
+                 reason, esp_err_to_name(err));
+        set_push_to_talk_trigger_mode();
+        return err;
+    }
+    err = vibe_motion_recalibrate();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "%s lift recording mode calibration failed: %s",
                  reason, esp_err_to_name(err));
@@ -848,6 +892,9 @@ static esp_err_t set_lift_to_talk_trigger_mode(const char *reason)
     }
     s_recording_trigger_mode = RECORDING_TRIGGER_LIFT_TO_TALK;
     s_motion_calibrating = true;
+    s_motion_calibration_deadline_ms =
+        esp_timer_get_time() / 1000 +
+        VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS;
     s_motion_lift_armed = false;
     s_motion_start_pending = false;
     return ESP_OK;
@@ -1035,6 +1082,10 @@ static void lvgl_task(void *arg)
 {
     (void)arg;
     while (true) {
+        if (atomic_load(&s_display_rendering_suspended)) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
         lvgl_lock();
         uint32_t wait_ms = lv_timer_handler();
         lvgl_unlock();
@@ -1076,6 +1127,50 @@ static void set_backlight(uint8_t brightness)
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_set_lcd_brightness(brightness));
 #endif
     s_current_backlight = brightness;
+}
+
+static void set_display_rendering_suspended(bool suspended)
+{
+    if (!s_panel || !s_lvgl_tick_timer ||
+        atomic_load(&s_display_rendering_suspended) == suspended) {
+        return;
+    }
+
+    lvgl_lock();
+    if (suspended) {
+        atomic_store(&s_display_rendering_suspended, true);
+        if (s_pet_timer) {
+            lv_timer_pause(s_pet_timer);
+        }
+        if (s_lvgl_tick_running) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(s_lvgl_tick_timer));
+            s_lvgl_tick_running = false;
+        }
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(s_panel, false));
+    } else {
+#if !VIBE_BOARD_HAS_GPIO_BACKLIGHT
+        set_backlight(LCD_BACKLIGHT_DEFAULT);
+#endif
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(s_panel, true));
+        if (!s_lvgl_tick_running) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                esp_timer_start_periodic(s_lvgl_tick_timer,
+                                         LVGL_TICK_PERIOD_MS * 1000));
+            s_lvgl_tick_running = true;
+        }
+        if (s_pet_timer) {
+            lv_timer_resume(s_pet_timer);
+        }
+        atomic_store(&s_display_rendering_suspended, false);
+        if (s_display) {
+            lv_obj_invalidate(lv_display_get_screen_active(s_display));
+        }
+    }
+    lvgl_unlock();
+
+    if (!suspended && s_lvgl_task) {
+        xTaskNotifyGive(s_lvgl_task);
+    }
 }
 
 static void fade_backlight_toward(uint8_t target, int64_t now_ms)
@@ -1184,6 +1279,17 @@ static void poll_front_button_fallback(int64_t now_ms)
 static void register_activity(void)
 {
     s_last_activity_ms = esp_timer_get_time() / 1000;
+    s_next_deep_sleep_attempt_ms = 0;
+    request_wifi_reconnect_now();
+    if (atomic_load(&s_display_rendering_suspended)) {
+        set_display_rendering_suspended(false);
+    }
+    lvgl_lock();
+    s_pet_idle_bob_steps_remaining = VIBE_STICK_PET_IDLE_BOB_STEPS;
+    if (s_pet_timer) {
+        lv_timer_set_period(s_pet_timer, VIBE_STICK_PET_ACTIVE_TIMER_MS);
+    }
+    lvgl_unlock();
     if (s_display_power_state != DISPLAY_POWER_ACTIVE ||
         s_current_backlight != LCD_BACKLIGHT_DEFAULT) {
         s_display_power_state = DISPLAY_POWER_ACTIVE;
@@ -1210,6 +1316,10 @@ static void update_power_saving(int64_t now_ms)
     }
     if (target != s_current_backlight) {
         fade_backlight_toward(target, now_ms);
+    }
+    if (next_state == DISPLAY_POWER_OFF &&
+        s_current_backlight == LCD_BACKLIGHT_OFF) {
+        set_display_rendering_suspended(true);
     }
     s_display_power_state = next_state;
 }
@@ -1238,20 +1348,17 @@ static void request_motion_recording_start(void)
     }
 }
 
-static void configure_sleep_wake_gpio(gpio_num_t gpio)
+static bool sleep_wake_gpio_is_active(gpio_num_t gpio)
 {
-    if (gpio == GPIO_NUM_NC) {
-        return;
-    }
-    gpio_config_t config = {
-        .pin_bit_mask = 1ULL << gpio,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&config));
+    return gpio != GPIO_NUM_NC && gpio_get_level(gpio) == 0;
 }
+
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+static bool sleep_wake_mask_contains(uint64_t wake_mask, gpio_num_t gpio)
+{
+    return gpio != GPIO_NUM_NC && (wake_mask & (1ULL << gpio)) != 0;
+}
+#endif
 
 static uint64_t sleep_button_wake_mask(void)
 {
@@ -1262,6 +1369,12 @@ static uint64_t sleep_button_wake_mask(void)
 static bool prepare_imu_deep_sleep_wake(uint64_t *wake_mask)
 {
     if (s_recording_trigger_mode != RECORDING_TRIGGER_LIFT_TO_TALK) {
+        esp_err_t err = vibe_motion_prepare_deep_sleep();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "deep sleep skipped: IMU power-down failed: %s",
+                     esp_err_to_name(err));
+            return false;
+        }
         return true;
     }
 #if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
@@ -1270,44 +1383,75 @@ static bool prepare_imu_deep_sleep_wake(uint64_t *wake_mask)
         ESP_LOGW(TAG, "deep sleep skipped: IMU wake prep failed: %s", esp_err_to_name(err));
         return false;
     }
-    configure_sleep_wake_gpio(VIBE_BOARD_PIN_IMU_INT);
     *wake_mask |= 1ULL << VIBE_BOARD_PIN_IMU_INT;
     return true;
 #else
-    ESP_LOGI(TAG, "deep sleep skipped: %s lift mode has no verified IMU wake path",
-             VIBE_BOARD_NAME);
-    return false;
+    ESP_LOGI(TAG, "%s lift mode entering button-only deep sleep", VIBE_BOARD_NAME);
+    esp_err_t err = vibe_motion_prepare_deep_sleep();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: IMU power-down failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    return true;
 #endif
 }
 
-static void enter_deep_sleep(void)
+static bool enter_deep_sleep(void)
 {
     uint64_t wake_mask = sleep_button_wake_mask();
-    configure_sleep_wake_gpio(VIBE_BOARD_PIN_BUTTON_FRONT);
-    configure_sleep_wake_gpio(VIBE_BOARD_PIN_BUTTON_SIDE);
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
+        VIBE_BOARD_PIN_IMU_INT != GPIO_NUM_NC) {
+        wake_mask |= 1ULL << VIBE_BOARD_PIN_IMU_INT;
+    }
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;
+    wake_mask = 1ULL << ext0_gpio;
+    if (sleep_wake_gpio_is_active(ext0_gpio)) {
+        ESP_LOGW(TAG, "deep sleep skipped: ext0 wake gpio=%d is already active",
+                 (int)ext0_gpio);
+        return false;
+    }
+#else
+    if (sleep_wake_gpio_is_active(VIBE_BOARD_PIN_BUTTON_FRONT) ||
+        sleep_wake_gpio_is_active(VIBE_BOARD_PIN_BUTTON_SIDE) ||
+        (sleep_wake_mask_contains(wake_mask, VIBE_BOARD_PIN_IMU_INT) &&
+         sleep_wake_gpio_is_active(VIBE_BOARD_PIN_IMU_INT))) {
+        ESP_LOGW(TAG, "deep sleep skipped: ext1 wake gpio is already active");
+        return false;
+    }
+#endif
 
+    esp_err_t err = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: wake reset failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    err = esp_sleep_enable_ext0_wakeup(ext0_gpio, 0);
+#else
+    err = esp_sleep_enable_ext1_wakeup_io(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+#endif
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: wake source setup failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
     if (!prepare_imu_deep_sleep_wake(&wake_mask)) {
-        return;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+        return false;
     }
 
     ESP_LOGI(TAG, "entering deep sleep board=%s mode=%s wake_mask=0x%llx",
              VIBE_BOARD_NAME, recording_mode_label(), (unsigned long long)wake_mask);
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_stop());
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
-#if defined(CONFIG_IDF_TARGET_ESP32)
-    gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;
-    if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
-        VIBE_BOARD_PIN_IMU_INT != GPIO_NUM_NC) {
-        ext0_gpio = VIBE_BOARD_PIN_IMU_INT;
-    }
-    configure_sleep_wake_gpio(ext0_gpio);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_ext0_wakeup(ext0_gpio, 0));
-#else
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_ext1_wakeup_io(wake_mask,
-                                                                  ESP_EXT1_WAKEUP_ANY_LOW));
-#endif
     vTaskDelay(pdMS_TO_TICKS(50));
     esp_deep_sleep_start();
+    return true;
 }
 
 static void maybe_enter_deep_sleep(int64_t now_ms)
@@ -1320,7 +1464,14 @@ static void maybe_enter_deep_sleep(int64_t now_ms)
     if ((now_ms - s_last_activity_ms) < VIBE_STICK_DEEP_SLEEP_MS) {
         return;
     }
-    enter_deep_sleep();
+    if (s_next_deep_sleep_attempt_ms != 0 &&
+        now_ms < s_next_deep_sleep_attempt_ms) {
+        return;
+    }
+    if (!enter_deep_sleep()) {
+        s_next_deep_sleep_attempt_ms =
+            now_ms + VIBE_STICK_DEEP_SLEEP_RETRY_MS;
+    }
 }
 
 static void init_backlight(void)
@@ -1377,22 +1528,21 @@ static esp_err_t init_display(void)
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle),
                         TAG, "panel io");
 
-    esp_lcd_panel_handle_t panel = NULL;
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = VIBE_BOARD_PIN_LCD_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel), TAG, "panel");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(panel), TAG, "panel reset");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(panel), TAG, "panel init");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(panel, true), TAG, "panel invert");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_set_gap(panel, LCD_X_GAP, LCD_Y_GAP), TAG, "panel gap");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), TAG, "panel on");
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io_handle, &panel_config, &s_panel), TAG, "panel");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "panel reset");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_panel, true), TAG, "panel invert");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_set_gap(s_panel, LCD_X_GAP, LCD_Y_GAP), TAG, "panel gap");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "panel on");
 
     lv_init();
     s_display = lv_display_create(LCD_H_RES, LCD_V_RES);
-    lv_display_set_user_data(s_display, panel);
+    lv_display_set_user_data(s_display, s_panel);
     lv_display_set_flush_cb(s_display, lvgl_flush_cb);
 
     size_t buffer_size = LCD_H_RES * LVGL_DRAW_BUF_LINES * sizeof(lv_color_t);
@@ -1409,13 +1559,16 @@ static esp_err_t init_display(void)
         .callback = lvgl_tick_cb,
         .name = "lvgl_tick",
     };
-    esp_timer_handle_t tick_timer = NULL;
-    ESP_RETURN_ON_ERROR(esp_timer_create(&tick_args, &tick_timer), TAG, "tick timer");
-    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_MS * 1000), TAG, "tick start");
+    ESP_RETURN_ON_ERROR(esp_timer_create(&tick_args, &s_lvgl_tick_timer), TAG, "tick timer");
+    ESP_RETURN_ON_ERROR(
+        esp_timer_start_periodic(s_lvgl_tick_timer, LVGL_TICK_PERIOD_MS * 1000),
+        TAG, "tick start");
+    s_lvgl_tick_running = true;
 
-    xTaskCreatePinnedToCore(lvgl_task, "lvgl", LVGL_TASK_STACK_BYTES, NULL, 3, NULL,
-                            VIBE_STICK_UI_CORE);
-    return ESP_OK;
+    BaseType_t task_ok =
+        xTaskCreatePinnedToCore(lvgl_task, "lvgl", LVGL_TASK_STACK_BYTES, NULL, 3,
+                                &s_lvgl_task, VIBE_STICK_UI_CORE);
+    return task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 static lv_obj_t *make_label(lv_obj_t *parent, const char *text, const lv_font_t *font,
@@ -1569,6 +1722,24 @@ static bool set_pet_frame(vibe_stick_pet_frame_id_t frame)
     s_pet_current_frame = frame;
     lv_obj_invalidate(s_pet_image);
     return true;
+}
+
+static void set_pet_vertical_offset(int y_offset)
+{
+    if (!s_pet_image ||
+        (s_pet_y_offset_valid && s_pet_y_offset == y_offset)) {
+        return;
+    }
+    lv_obj_align(s_pet_image, LV_ALIGN_CENTER, 0, y_offset);
+    s_pet_y_offset = y_offset;
+    s_pet_y_offset_valid = true;
+}
+
+static void set_pet_timer_period(uint32_t period_ms)
+{
+    if (s_pet_timer) {
+        lv_timer_set_period(s_pet_timer, period_ms);
+    }
 }
 
 static pet_sequence_t pet_sequence_for_state(const char *status)
@@ -1847,7 +2018,8 @@ static void update_pet_visual(void)
                 (s_mode_switch_frame_index + 1) % s_mode_switch_frame_count;
             s_mode_switch_next_frame_ms = now_ms + VIBE_STICK_MODE_SWITCH_FRAME_MS;
         }
-        lv_obj_align(s_pet_image, LV_ALIGN_CENTER, 0, 24);
+        set_pet_timer_period(VIBE_STICK_PET_ACTIVE_TIMER_MS);
+        set_pet_vertical_offset(24);
         return;
     }
     if (s_mode_switch_until_ms != 0) {
@@ -1876,7 +2048,8 @@ static void update_pet_visual(void)
             s_anim_frame_index = (s_anim_frame_index + 1) % frame_count;
             s_pet_next_frame_ms = now_ms + 1000 / vibe_stick_anim_fps();
         }
-        lv_obj_align(s_pet_image, LV_ALIGN_CENTER, 0, 14);
+        set_pet_timer_period(VIBE_STICK_PET_ACTIVE_TIMER_MS);
+        set_pet_vertical_offset(14);
         return;
     }
 #endif
@@ -1899,6 +2072,9 @@ static void update_pet_visual(void)
         s_pet_sequence_index = sequence.key == 0
             ? (int)(esp_random() % (uint32_t)sequence.frame_count)
             : 0;
+        if (sequence.key == 0) {
+            s_pet_idle_bob_steps_remaining = VIBE_STICK_PET_IDLE_BOB_STEPS;
+        }
         s_pet_next_frame_ms = 0;
         should_refresh_frame = true;
     } else if (now_ms >= s_pet_next_frame_ms) {
@@ -1913,9 +2089,18 @@ static void update_pet_visual(void)
         set_pet_frame(sequence.frames[s_pet_sequence_index]);
         s_pet_next_frame_ms = now_ms + pet_frame_delay_ms(sequence);
     }
-    lv_obj_align(s_pet_image, LV_ALIGN_CENTER, 0, 14 + bob_offsets[s_pet_bob_step]);
-    s_pet_bob_step = (s_pet_bob_step + 1) %
-                     (int)(sizeof(bob_offsets) / sizeof(bob_offsets[0]));
+    if (sequence.key != 0 || s_pet_idle_bob_steps_remaining > 0) {
+        set_pet_timer_period(VIBE_STICK_PET_ACTIVE_TIMER_MS);
+        set_pet_vertical_offset(14 + bob_offsets[s_pet_bob_step]);
+        s_pet_bob_step = (s_pet_bob_step + 1) %
+                         (int)(sizeof(bob_offsets) / sizeof(bob_offsets[0]));
+        if (sequence.key == 0) {
+            s_pet_idle_bob_steps_remaining--;
+        }
+    } else {
+        set_pet_timer_period(VIBE_STICK_PET_IDLE_TIMER_MS);
+        set_pet_vertical_offset(14);
+    }
 }
 
 static void pet_timer_cb(lv_timer_t *timer)
@@ -2065,11 +2250,11 @@ static void create_ui(void)
         lv_obj_add_flag(s_pet_image, LV_OBJ_FLAG_HIDDEN);
     }
 #endif
-    lv_obj_align(s_pet_image, LV_ALIGN_CENTER, 0, 14);
+    set_pet_vertical_offset(14);
 #if VIBE_STICK_ANIM_PREVIEW
-    lv_timer_create(pet_timer_cb, 1000 / vibe_stick_anim_fps(), NULL);
+    s_pet_timer = lv_timer_create(pet_timer_cb, 1000 / vibe_stick_anim_fps(), NULL);
 #else
-    lv_timer_create(pet_timer_cb, 300, NULL);
+    s_pet_timer = lv_timer_create(pet_timer_cb, VIBE_STICK_PET_ACTIVE_TIMER_MS, NULL);
 #endif
 
     s_mode_switch_layer = lv_obj_create(screen);
@@ -3795,10 +3980,19 @@ static bool ota_manifest_is_new(const ota_manifest_t *manifest)
         return false;
     }
     int version_comparison = 0;
-    if (ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION,
-                                      &version_comparison) &&
-        version_comparison < 0) {
+    if (!ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION,
+                                       &version_comparison)) {
+        ESP_LOGW(TAG, "OTA manifest version is invalid candidate=%s current=%s",
+                 manifest->version, FIRMWARE_VERSION);
+        return false;
+    }
+    if (version_comparison < 0) {
         ESP_LOGW(TAG, "OTA manifest version is older candidate=%s current=%s",
+                 manifest->version, FIRMWARE_VERSION);
+        return false;
+    }
+    if (version_comparison == 0) {
+        ESP_LOGI(TAG, "OTA manifest version is not newer candidate=%s current=%s",
                  manifest->version, FIRMWARE_VERSION);
         return false;
     }
@@ -5150,12 +5344,62 @@ static esp_err_t wifi_apply_profile(size_t index)
     return esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
 }
 
+static uint32_t wifi_reconnect_delay_ms(unsigned int attempt)
+{
+    static const uint32_t delays_ms[] = {1000, 2000, 4000, 8000, 30000};
+    size_t index = attempt;
+    if (index >= sizeof(delays_ms) / sizeof(delays_ms[0])) {
+        index = sizeof(delays_ms) / sizeof(delays_ms[0]) - 1;
+    }
+    return delays_ms[index] > VIBE_STICK_WIFI_RECONNECT_MAX_MS
+               ? VIBE_STICK_WIFI_RECONNECT_MAX_MS
+               : delays_ms[index];
+}
+
+static void wifi_reconnect_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!wifi_connected()) {
+        ESP_LOGI(TAG, "Wi-Fi reconnect attempt=%u", s_wifi_reconnect_attempt);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+    }
+}
+
+static void schedule_wifi_reconnect(void)
+{
+    if (!s_wifi_reconnect_timer) {
+        return;
+    }
+    uint32_t delay_ms = wifi_reconnect_delay_ms(s_wifi_reconnect_attempt);
+    if (s_wifi_reconnect_attempt < UINT32_MAX) {
+        s_wifi_reconnect_attempt++;
+    }
+    if (esp_timer_is_active(s_wifi_reconnect_timer)) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(s_wifi_reconnect_timer));
+    }
+    ESP_LOGI(TAG, "Wi-Fi reconnect scheduled in %u ms", (unsigned int)delay_ms);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        esp_timer_start_once(s_wifi_reconnect_timer, (uint64_t)delay_ms * 1000));
+}
+
+static void request_wifi_reconnect_now(void)
+{
+    if (wifi_connected() || !s_wifi_reconnect_timer ||
+        !esp_timer_is_active(s_wifi_reconnect_timer)) {
+        return;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(s_wifi_reconnect_timer));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        esp_timer_start_once(s_wifi_reconnect_timer, 1));
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     (void)arg;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        s_wifi_reconnect_attempt = 0;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *disconnected =
             (const wifi_event_sta_disconnected_t *)event_data;
@@ -5174,7 +5418,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                  s_wifi_profile_retry_count,
                  (unsigned)(s_wifi_profile_index + 1),
                  (unsigned)s_wifi_profile_count);
-        esp_wifi_connect();
+        schedule_wifi_reconnect();
         render_state();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *got_ip = (const ip_event_got_ip_t *)event_data;
@@ -5184,6 +5428,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                      IPSTR, IP2STR(&got_ip->ip_info.ip));
         }
         s_wifi_profile_retry_count = 0;
+        s_wifi_reconnect_attempt = 0;
+        if (s_wifi_reconnect_timer &&
+            esp_timer_is_active(s_wifi_reconnect_timer)) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(s_wifi_reconnect_timer));
+        }
         render_state();
         queue_event(VIBE_STICK_EVENT_POLL_STATE);
         queue_event(VIBE_STICK_EVENT_OTA_CHECK);
@@ -5200,6 +5449,14 @@ static esp_err_t init_wifi(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "wifi mode");
+    const esp_timer_create_args_t reconnect_timer_args = {
+        .callback = wifi_reconnect_timer_cb,
+        .name = "wifi_reconnect",
+        .skip_unhandled_events = true,
+    };
+    ESP_RETURN_ON_ERROR(
+        esp_timer_create(&reconnect_timer_args, &s_wifi_reconnect_timer),
+        TAG, "wifi reconnect timer");
 
     ESP_RETURN_ON_ERROR(wifi_profiles_load_nvs(), TAG, "load Wi-Fi profiles");
     bool profiles_changed = wifi_profiles_merge_configured();
@@ -5459,6 +5716,7 @@ static esp_err_t init_button(void)
         .gpio_num = VIBE_BOARD_PIN_BUTTON_FRONT,
         .active_level = 0,
         .enable_power_save = true,
+        .disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL,
     };
     ESP_RETURN_ON_ERROR(iot_button_new_gpio_device(&button_config, &gpio_config, &button), TAG, "button");
     ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_PRESS_DOWN, NULL, button_press_down_cb, NULL),
@@ -5490,7 +5748,8 @@ static esp_err_t init_button(void)
     const button_gpio_config_t side_gpio_config = {
         .gpio_num = VIBE_BOARD_PIN_BUTTON_SIDE,
         .active_level = 0,
-        .enable_power_save = false,
+        .enable_power_save = true,
+        .disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL,
     };
     ESP_RETURN_ON_ERROR(iot_button_new_gpio_device(&button_config, &side_gpio_config, &side_button), TAG, "side button");
     ESP_RETURN_ON_ERROR(iot_button_register_cb(side_button, BUTTON_PRESS_UP, NULL,
@@ -5570,6 +5829,48 @@ static void bridge_control_task(void *arg)
     }
 }
 
+static void maybe_timeout_motion_calibration(int64_t now_ms)
+{
+    if (!s_motion_calibrating ||
+        s_motion_calibration_deadline_ms == 0 ||
+        now_ms < s_motion_calibration_deadline_ms) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "lift calibration timed out; falling back to PTT");
+    set_push_to_talk_trigger_mode();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(save_recording_mode_preference());
+    render_state();
+    show_mode_switch_visual("CAL FAILED", "PTT",
+                            s_mode_switch_dict_frames,
+                            sizeof(s_mode_switch_dict_frames) /
+                                sizeof(s_mode_switch_dict_frames[0]),
+                            lv_color_hex(0xfca5a5));
+}
+
+static uint32_t state_poll_interval_ms(int64_t now_ms)
+{
+    return s_last_activity_ms != 0 &&
+                   now_ms - s_last_activity_ms <
+                       VIBE_STICK_STATE_POLL_INTERACTIVE_MS
+               ? VIBE_STICK_STATE_POLL_MS
+               : VIBE_STICK_STATE_POLL_IDLE_MS;
+}
+
+static uint32_t app_task_wait_ms(void)
+{
+    if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK ||
+        (s_display_power_state == DISPLAY_POWER_ACTIVE &&
+         s_current_backlight != LCD_BACKLIGHT_DEFAULT) ||
+        (s_display_power_state == DISPLAY_POWER_DIMMED &&
+         s_current_backlight != LCD_BACKLIGHT_IDLE) ||
+        (s_display_power_state == DISPLAY_POWER_OFF &&
+         s_current_backlight != LCD_BACKLIGHT_OFF)) {
+        return VIBE_STICK_APP_MOTION_WAIT_MS;
+    }
+    return VIBE_STICK_APP_IDLE_WAIT_MS;
+}
+
 static void app_task(void *arg)
 {
     (void)arg;
@@ -5579,6 +5880,7 @@ static void app_task(void *arg)
         int64_t now_ms = esp_timer_get_time() / 1000;
         maybe_refresh_power_status(now_ms);
         maybe_timeout_cyber_tts_wait(now_ms);
+        maybe_timeout_motion_calibration(now_ms);
         update_power_saving(now_ms);
         maybe_enter_deep_sleep(now_ms);
         handle_deep_sleep_front_button_intent();
@@ -5586,12 +5888,18 @@ static void app_task(void *arg)
         const bool network_busy = recording_network_busy();
         if (s_display_power_state == DISPLAY_POWER_ACTIVE &&
             wifi_connected() && !network_busy &&
-            now_ms - last_poll >= VIBE_STICK_STATE_POLL_MS) {
+            now_ms - last_poll >= state_poll_interval_ms(now_ms)) {
             last_poll = now_ms;
             poll_state();
         }
-        if (wifi_connected() && !network_busy && !ota_in_progress() &&
-            now_ms - s_last_ota_check_ms >= OTA_PERIODIC_CHECK_MS) {
+        uint32_t ota_interval_ms =
+            external_powered() ? OTA_PERIODIC_CHECK_MS : OTA_BATTERY_CHECK_MS;
+        bool ota_power_policy_allows =
+            external_powered() ||
+            s_display_power_state == DISPLAY_POWER_ACTIVE;
+        if (ota_power_policy_allows &&
+            wifi_connected() && !network_busy && !ota_in_progress() &&
+            now_ms - s_last_ota_check_ms >= ota_interval_ms) {
             s_last_ota_check_ms = now_ms;
             queue_event(VIBE_STICK_EVENT_OTA_CHECK);
         }
@@ -5600,6 +5908,7 @@ static void app_task(void *arg)
             vibe_motion_event_t motion_event = vibe_motion_poll(now_ms);
             if (s_motion_calibrating && !vibe_motion_is_calibrating()) {
                 s_motion_calibrating = false;
+                s_motion_calibration_deadline_ms = 0;
                 s_motion_lift_armed = true;
                 s_motion_start_pending = false;
                 ESP_LOGI(TAG, "lift recording mode calibration complete");
@@ -5624,7 +5933,8 @@ static void app_task(void *arg)
                 request_motion_recording_start();
             }
         }
-        if (xQueueReceive(s_event_queue, &event, pdMS_TO_TICKS(20)) != pdTRUE) {
+        if (xQueueReceive(s_event_queue, &event,
+                          pdMS_TO_TICKS(app_task_wait_ms())) != pdTRUE) {
             continue;
         }
         switch (event.type) {
@@ -5697,6 +6007,7 @@ static void app_task(void *arg)
     }
 }
 
+#if VIBE_STICK_SERIAL_DEBUG_ENABLED
 static void serial_debug_task(void *arg)
 {
     (void)arg;
@@ -5750,6 +6061,27 @@ static void serial_debug_task(void *arg)
         }
     }
 }
+#endif
+
+static esp_err_t init_power_management(void)
+{
+#if CONFIG_PM_ENABLE
+    const esp_pm_config_t config = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_XTAL_FREQ,
+#if CONFIG_FREERTOS_USE_TICKLESS_IDLE
+        .light_sleep_enable = true,
+#else
+        .light_sleep_enable = false,
+#endif
+    };
+    ESP_RETURN_ON_ERROR(esp_pm_configure(&config), TAG, "power management");
+    ESP_LOGI(TAG, "power management max=%dMHz min=%dMHz light_sleep=%d",
+             config.max_freq_mhz, config.min_freq_mhz,
+             config.light_sleep_enable ? 1 : 0);
+#endif
+    return ESP_OK;
+}
 
 void app_main(void)
 {
@@ -5766,6 +6098,7 @@ void app_main(void)
     ESP_LOGI(TAG, "battery curve=%s", VIBE_BOARD_BATTERY_CURVE_VERSION);
     ESP_LOGI(TAG, "wake cause=%d ext1_status=0x%llx",
              wake_cause, (unsigned long long)ext1_wake_status);
+    ESP_ERROR_CHECK(init_power_management());
     esp_err_t nvs = nvs_flash_init();
     if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -5784,7 +6117,9 @@ void app_main(void)
     s_bridge_target_lock = xSemaphoreCreateMutex();
     s_bridge_profiles_lock = xSemaphoreCreateMutex();
     s_bridge_probe_lock = xSemaphoreCreateMutex();
+#if VIBE_STICK_SERIAL_DEBUG_ENABLED
     xTaskCreate(serial_debug_task, "serial_debug", 6144, NULL, 2, NULL);
+#endif
     ESP_ERROR_CHECK(init_wifi());
     ESP_ERROR_CHECK(init_display());
     register_activity();
@@ -5797,6 +6132,7 @@ void app_main(void)
     if (motion_err != ESP_OK && motion_err != ESP_ERR_NOT_SUPPORTED) {
         ESP_LOGW(TAG, "motion init failed: %s", esp_err_to_name(motion_err));
     }
+    set_push_to_talk_trigger_mode();
     ESP_ERROR_CHECK_WITHOUT_ABORT(restore_recording_mode_preference());
     render_state();
     BaseType_t bridge_control_ok =

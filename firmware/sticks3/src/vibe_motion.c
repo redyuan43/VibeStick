@@ -30,6 +30,7 @@
 #define MPU6886_ACCEL_WOM_Z_THR 0x22
 #define MPU6886_INT_PIN_CFG 0x37
 #define MPU6886_INT_ENABLE 0x38
+#define MPU6886_INT_STATUS 0x3a
 #define MPU6886_ACCEL_INTEL_CTRL 0x69
 #define MPU6886_ACCEL_XOUT_H 0x3b
 
@@ -54,6 +55,8 @@
 #define BMI270_CONFIG_CHUNK_BYTES 32
 #define BMI270_DATA_READY_MASK 0xc0
 #define BMI270_INIT_OK 0x01
+#define BMI270_PWR_CTRL_ALL_SENSORS_OFF 0x00
+#define BMI270_PWR_CTRL_ACCEL_GYRO_TEMP_ON 0x0e
 
 #define MOTION_SAMPLE_INTERVAL_MS 20
 #define MOTION_CALIBRATION_SAMPLES 50
@@ -77,6 +80,8 @@
 #define MPU6886_WAKE_ACCEL_RANGE_16G 0x18
 #define MPU6886_WAKE_THRESHOLD_LSB 10
 #define MPU6886_WAKE_SAMPLE_DIV 19
+#define MPU6886_AXIS_STANDBY_MASK 0x3f
+#define MPU6886_SLEEP_MODE 0x40
 #define BMI270_ACCEL_SCALE_G (32768.0f / 2.0f)
 #define BMI270_GYRO_SCALE_DPS (32768.0f / 2000.0f)
 
@@ -104,6 +109,7 @@ static bool s_available;
 #if VIBE_BOARD_HAS_LIFT_TO_TALK
 static i2c_master_dev_handle_t s_imu_dev;
 static motion_chip_t s_motion_chip = MOTION_CHIP_NONE;
+static bool s_suspended;
 static motion_state_t s_state = MOTION_STATE_CALIBRATING;
 static int64_t s_last_sample_ms;
 static int64_t s_candidate_since_ms = -1;
@@ -281,13 +287,9 @@ static void reset_runtime_state(void)
 }
 
 #if VIBE_BOARD_HAS_MPU6886
-static esp_err_t init_mpu6886(void)
+static esp_err_t configure_mpu6886_active(void)
 {
-    ESP_RETURN_ON_ERROR(add_imu_device(MPU6886_ADDR), TAG, "add mpu6886");
-    uint8_t who = 0;
-    ESP_RETURN_ON_ERROR(read_regs(MPU6886_WHO_AM_I, &who, 1), TAG, "whoami mpu6886");
-    ESP_RETURN_ON_FALSE(who == MPU6886_WHO_AM_I_VALUE, ESP_ERR_NOT_FOUND, TAG, "unexpected mpu6886 whoami");
-
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_INT_ENABLE, 0), TAG, "disable mpu6886 interrupts");
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_1, 0x00), TAG, "wake mpu6886");
     vTaskDelay(pdMS_TO_TICKS(10));
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_1, 0x01), TAG, "mpu6886 clock");
@@ -296,7 +298,16 @@ static esp_err_t init_mpu6886(void)
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_CONFIG, 0x03), TAG, "mpu6886 gyro dlpf");
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_CONFIG, 0x08), TAG, "mpu6886 accel range");
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_CONFIG2, 0x04), TAG, "mpu6886 accel dlpf");
+    return ESP_OK;
+}
 
+static esp_err_t init_mpu6886(void)
+{
+    ESP_RETURN_ON_ERROR(add_imu_device(MPU6886_ADDR), TAG, "add mpu6886");
+    uint8_t who = 0;
+    ESP_RETURN_ON_ERROR(read_regs(MPU6886_WHO_AM_I, &who, 1), TAG, "whoami mpu6886");
+    ESP_RETURN_ON_FALSE(who == MPU6886_WHO_AM_I_VALUE, ESP_ERR_NOT_FOUND, TAG, "unexpected mpu6886 whoami");
+    ESP_RETURN_ON_ERROR(configure_mpu6886_active(), TAG, "configure mpu6886");
     s_motion_chip = MOTION_CHIP_MPU6886;
     ESP_LOGI(TAG, "MPU6886 ready");
     return ESP_OK;
@@ -334,6 +345,19 @@ static esp_err_t bmi270_write_config_file(void)
     return ESP_OK;
 }
 
+static esp_err_t configure_bmi270_active(void)
+{
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_ACC_CONF, 0xa9), TAG, "bmi270 accel conf");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_ACC_RANGE, 0x00), TAG, "bmi270 accel range");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_GYR_CONF, 0xe9), TAG, "bmi270 gyro conf");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_GYR_RANGE, 0x00), TAG, "bmi270 gyro range");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_INT_MAP_DATA, 0xc0), TAG, "bmi270 data ready map");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_PWR_CTRL, BMI270_PWR_CTRL_ACCEL_GYRO_TEMP_ON),
+                        TAG, "bmi270 power ctrl");
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return ESP_OK;
+}
+
 static esp_err_t init_bmi270(void)
 {
     ESP_RETURN_ON_ERROR(add_imu_device(BMI270_ADDR), TAG, "add bmi270");
@@ -345,13 +369,7 @@ static esp_err_t init_bmi270(void)
     ESP_RETURN_ON_ERROR(write_reg(BMI270_CMD, BMI270_SOFT_RESET), TAG, "bmi270 reset");
     vTaskDelay(pdMS_TO_TICKS(10));
     ESP_RETURN_ON_ERROR(bmi270_write_config_file(), TAG, "bmi270 config");
-    ESP_RETURN_ON_ERROR(write_reg(BMI270_ACC_CONF, 0xa9), TAG, "bmi270 accel conf");
-    ESP_RETURN_ON_ERROR(write_reg(BMI270_ACC_RANGE, 0x00), TAG, "bmi270 accel range");
-    ESP_RETURN_ON_ERROR(write_reg(BMI270_GYR_CONF, 0xe9), TAG, "bmi270 gyro conf");
-    ESP_RETURN_ON_ERROR(write_reg(BMI270_GYR_RANGE, 0x00), TAG, "bmi270 gyro range");
-    ESP_RETURN_ON_ERROR(write_reg(BMI270_INT_MAP_DATA, 0xc0), TAG, "bmi270 data ready map");
-    ESP_RETURN_ON_ERROR(write_reg(BMI270_PWR_CTRL, 0x0e), TAG, "bmi270 power ctrl");
-    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_RETURN_ON_ERROR(configure_bmi270_active(), TAG, "configure bmi270");
 
     s_motion_chip = MOTION_CHIP_BMI270;
     ESP_LOGI(TAG, "BMI270 ready");
@@ -379,6 +397,7 @@ esp_err_t vibe_motion_init(void)
     }
 
     reset_runtime_state();
+    s_suspended = false;
     s_available = true;
     return ESP_OK;
 #else
@@ -391,11 +410,145 @@ bool vibe_motion_available(void)
     return s_available;
 }
 
+esp_err_t vibe_motion_suspend(void)
+{
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    ESP_RETURN_ON_FALSE(s_available, ESP_ERR_INVALID_STATE, TAG, "motion unavailable");
+    if (s_suspended) {
+        return ESP_OK;
+    }
+
+#if VIBE_BOARD_HAS_MPU6886
+    if (s_motion_chip == MOTION_CHIP_MPU6886) {
+        ESP_RETURN_ON_ERROR(write_reg(MPU6886_INT_ENABLE, 0), TAG, "disable mpu6886 interrupts");
+        ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_2, MPU6886_AXIS_STANDBY_MASK),
+                            TAG, "standby mpu6886 axes");
+        ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_1, MPU6886_SLEEP_MODE),
+                            TAG, "sleep mpu6886");
+        s_suspended = true;
+        ESP_LOGI(TAG, "MPU6886 suspended");
+        return ESP_OK;
+    }
+#endif
+
+#if VIBE_BOARD_HAS_BMI270
+    if (s_motion_chip == MOTION_CHIP_BMI270) {
+        ESP_RETURN_ON_ERROR(write_reg(BMI270_PWR_CTRL, BMI270_PWR_CTRL_ALL_SENSORS_OFF),
+                            TAG, "suspend bmi270 sensors");
+        s_suspended = true;
+        ESP_LOGI(TAG, "BMI270 suspended");
+        return ESP_OK;
+    }
+#endif
+
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t vibe_motion_resume(void)
+{
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    ESP_RETURN_ON_FALSE(s_available, ESP_ERR_INVALID_STATE, TAG, "motion unavailable");
+    if (!s_suspended) {
+        return ESP_OK;
+    }
+
+#if VIBE_BOARD_HAS_MPU6886
+    if (s_motion_chip == MOTION_CHIP_MPU6886) {
+        ESP_RETURN_ON_ERROR(configure_mpu6886_active(), TAG, "resume mpu6886");
+        reset_runtime_state();
+        s_suspended = false;
+        ESP_LOGI(TAG, "MPU6886 resumed; recalibration started");
+        return ESP_OK;
+    }
+#endif
+
+#if VIBE_BOARD_HAS_BMI270
+    if (s_motion_chip == MOTION_CHIP_BMI270) {
+        ESP_RETURN_ON_ERROR(configure_bmi270_active(), TAG, "resume bmi270");
+        reset_runtime_state();
+        s_suspended = false;
+        ESP_LOGI(TAG, "BMI270 resumed; recalibration started");
+        return ESP_OK;
+    }
+#endif
+
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+bool vibe_motion_suspended(void)
+{
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    return s_available && s_suspended;
+#else
+    return false;
+#endif
+}
+
+esp_err_t vibe_motion_clear_wake_status(void)
+{
+#if VIBE_BOARD_HAS_MPU6886 && VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    ESP_RETURN_ON_FALSE(s_available && s_motion_chip == MOTION_CHIP_MPU6886,
+                        ESP_ERR_INVALID_STATE, TAG, "mpu6886 unavailable");
+    uint8_t status = 0;
+    ESP_RETURN_ON_ERROR(read_regs(MPU6886_INT_STATUS, &status, 1),
+                        TAG, "clear mpu6886 wake status");
+    return ESP_OK;
+#else
+    return ESP_OK;
+#endif
+}
+
+esp_err_t vibe_motion_prepare_deep_sleep(void)
+{
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    if (!s_available) {
+        return ESP_OK;
+    }
+
+#if VIBE_BOARD_HAS_MPU6886
+    if (s_motion_chip == MOTION_CHIP_MPU6886) {
+        ESP_RETURN_ON_ERROR(write_reg(MPU6886_INT_ENABLE, 0), TAG, "disable mpu6886 interrupts");
+        ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_2, MPU6886_AXIS_STANDBY_MASK),
+                            TAG, "standby mpu6886 axes");
+        ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_1, MPU6886_SLEEP_MODE),
+                            TAG, "sleep mpu6886");
+        s_suspended = true;
+        ESP_LOGI(TAG, "MPU6886 powered down for deep sleep");
+        return ESP_OK;
+    }
+#endif
+
+#if VIBE_BOARD_HAS_BMI270
+    if (s_motion_chip == MOTION_CHIP_BMI270) {
+        ESP_RETURN_ON_ERROR(write_reg(BMI270_PWR_CTRL, BMI270_PWR_CTRL_ALL_SENSORS_OFF),
+                            TAG, "deep sleep bmi270 sensors");
+        s_suspended = true;
+        ESP_LOGI(TAG, "BMI270 accel/gyro powered down for deep sleep");
+        return ESP_OK;
+    }
+#endif
+
+    return ESP_OK;
+#else
+    return ESP_OK;
+#endif
+}
+
 esp_err_t vibe_motion_prepare_deep_sleep_wake(void)
 {
 #if VIBE_BOARD_HAS_MPU6886 && VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
     ESP_RETURN_ON_FALSE(s_available && s_motion_chip == MOTION_CHIP_MPU6886,
                         ESP_ERR_INVALID_STATE, TAG, "mpu6886 unavailable");
+    if (s_suspended) {
+        ESP_RETURN_ON_ERROR(configure_mpu6886_active(), TAG, "resume mpu6886 for wake prep");
+        s_suspended = false;
+    }
 
     uint8_t reg = MPU6886_WAKE_ACCEL_RANGE_16G;
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_CONFIG, reg), TAG, "mpu6886 wake accel range");
@@ -420,6 +573,7 @@ esp_err_t vibe_motion_prepare_deep_sleep_wake(void)
 
     ESP_RETURN_ON_ERROR(read_regs(MPU6886_PWR_MGMT_1, &reg, 1), TAG, "read mpu6886 pwr1 cycle");
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_1, reg | 0x20), TAG, "mpu6886 wake cycle");
+    ESP_RETURN_ON_ERROR(read_regs(MPU6886_INT_STATUS, &reg, 1), TAG, "clear mpu6886 wake status");
     ESP_LOGI(TAG, "MPU6886 wake-on-motion prepared");
     return ESP_OK;
 #else
@@ -442,7 +596,7 @@ esp_err_t vibe_motion_recalibrate(void)
 bool vibe_motion_is_calibrating(void)
 {
 #if VIBE_BOARD_HAS_LIFT_TO_TALK
-    return s_available && s_state == MOTION_STATE_CALIBRATING;
+    return s_available && !s_suspended && s_state == MOTION_STATE_CALIBRATING;
 #else
     return false;
 #endif
@@ -451,7 +605,7 @@ bool vibe_motion_is_calibrating(void)
 vibe_motion_event_t vibe_motion_poll(int64_t now_ms)
 {
 #if VIBE_BOARD_HAS_LIFT_TO_TALK
-    if (!s_available || (now_ms - s_last_sample_ms) < MOTION_SAMPLE_INTERVAL_MS) {
+    if (!s_available || s_suspended || (now_ms - s_last_sample_ms) < MOTION_SAMPLE_INTERVAL_MS) {
         return VIBE_MOTION_EVENT_NONE;
     }
     s_last_sample_ms = now_ms;
