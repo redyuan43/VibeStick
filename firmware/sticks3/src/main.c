@@ -485,6 +485,10 @@ static esp_timer_handle_t s_lvgl_tick_timer;
 static TaskHandle_t s_lvgl_task;
 static atomic_bool s_display_rendering_suspended;
 static bool s_lvgl_tick_running;
+#if CONFIG_PM_ENABLE && VIBE_BOARD_HAS_GPIO_BACKLIGHT
+static esp_pm_lock_handle_t s_display_no_light_sleep_lock;
+static bool s_display_no_light_sleep_lock_held;
+#endif
 static lv_obj_t *s_wifi_label;
 static lv_obj_t *s_battery_icon;
 static lv_obj_t *s_battery_fill;
@@ -1136,6 +1140,17 @@ static void set_display_rendering_suspended(bool suspended)
         return;
     }
 
+#if CONFIG_PM_ENABLE && VIBE_BOARD_HAS_GPIO_BACKLIGHT
+    if (!suspended && s_display_no_light_sleep_lock &&
+        !s_display_no_light_sleep_lock_held) {
+        if (esp_pm_lock_acquire(s_display_no_light_sleep_lock) == ESP_OK) {
+            s_display_no_light_sleep_lock_held = true;
+        } else {
+            ESP_LOGW(TAG, "display wake could not block automatic light sleep");
+        }
+    }
+#endif
+
     lvgl_lock();
     if (suspended) {
         atomic_store(&s_display_rendering_suspended, true);
@@ -1167,6 +1182,17 @@ static void set_display_rendering_suspended(bool suspended)
         }
     }
     lvgl_unlock();
+
+#if CONFIG_PM_ENABLE && VIBE_BOARD_HAS_GPIO_BACKLIGHT
+    if (suspended && s_display_no_light_sleep_lock &&
+        s_display_no_light_sleep_lock_held) {
+        if (esp_pm_lock_release(s_display_no_light_sleep_lock) == ESP_OK) {
+            s_display_no_light_sleep_lock_held = false;
+        } else {
+            ESP_LOGW(TAG, "display suspend could not allow automatic light sleep");
+        }
+    }
+#endif
 
     if (!suspended && s_lvgl_task) {
         xTaskNotifyGive(s_lvgl_task);
@@ -6079,6 +6105,16 @@ static esp_err_t init_power_management(void)
     ESP_LOGI(TAG, "power management max=%dMHz min=%dMHz light_sleep=%d",
              config.max_freq_mhz, config.min_freq_mhz,
              config.light_sleep_enable ? 1 : 0);
+#if VIBE_BOARD_HAS_GPIO_BACKLIGHT
+    ESP_RETURN_ON_ERROR(
+        esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "display_active",
+                           &s_display_no_light_sleep_lock),
+        TAG, "display light sleep lock");
+    ESP_RETURN_ON_ERROR(esp_pm_lock_acquire(s_display_no_light_sleep_lock),
+                        TAG, "hold display light sleep lock");
+    s_display_no_light_sleep_lock_held = true;
+    ESP_LOGI(TAG, "automatic light sleep blocked while display is active");
+#endif
 #endif
     return ESP_OK;
 }

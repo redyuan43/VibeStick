@@ -84,13 +84,17 @@ def firmware_build_id(image: Path, fallback: str) -> str:
     return matches[-1].decode("ascii")
 
 
-def firmware_version() -> str:
+def firmware_version(board: str) -> str:
     config_path = repo_root() / "firmware" / "sticks3" / "include" / "vibe_stick_config.h"
     try:
         text = config_path.read_text()
     except OSError:
         return ""
-    match = re.search(r'#define\s+FIRMWARE_VERSION\s+"([^"]+)"', text)
+    macro = {
+        "sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3",
+        "stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS",
+    }[board]
+    match = re.search(rf'#define\s+{macro}\s+"([^"]+)"', text)
     return match.group(1) if match else ""
 
 
@@ -111,7 +115,7 @@ def publish(board: str, image: Path) -> Path:
     compile_time = info.get("compile_time", "")
     build_id = firmware_build_id(target_image, compile_time)
     elf_sha256 = info.get("elf_file_sha256", "").split()[0]
-    version = firmware_version() or info.get("app_version", "")
+    version = firmware_version(board) or info.get("app_version", "")
 
     manifest = {
         "available": True,

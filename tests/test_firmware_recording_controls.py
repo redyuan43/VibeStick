@@ -924,6 +924,33 @@ def test_display_off_suspends_panel_output_and_lvgl_timer_work() -> None:
     assert "#if VIBE_BOARD_HAS_GPIO_BACKLIGHT" not in display_suspend[
         max(0, panel_off_index - 80) : panel_off_index
     ]
+    assert "esp_pm_lock_acquire(s_display_no_light_sleep_lock)" in display_suspend
+    assert "esp_pm_lock_release(s_display_no_light_sleep_lock)" in display_suspend
+
+
+def test_s3_blocks_automatic_light_sleep_while_the_display_is_active() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    power_init = source.split("static esp_err_t init_power_management", 1)[1]
+    power_init = power_init.split("void app_main", 1)[0]
+
+    assert "ESP_PM_NO_LIGHT_SLEEP" in power_init
+    assert '"display_active"' in power_init
+    assert "esp_pm_lock_acquire(s_display_no_light_sleep_lock)" in power_init
+    assert "#if VIBE_BOARD_HAS_GPIO_BACKLIGHT" in power_init
+    assert "automatic light sleep blocked while display is active" in power_init
+
+
+def test_board_firmware_versions_remain_independent() -> None:
+    config = (
+        ROOT / "firmware" / "sticks3" / "include" / "vibe_stick_config.h"
+    ).read_text(encoding="utf-8")
+    publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
+
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.24"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.23"' in config
+    assert 'firmware_version(board)' in publisher
+    assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
+    assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
 
 
 def test_wifi_reconnect_uses_delayed_backoff_instead_of_immediate_retry() -> None:
