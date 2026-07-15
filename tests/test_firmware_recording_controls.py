@@ -70,6 +70,21 @@ def test_ptt_release_followup_short_click_sends_enter_before_tap_toggle() -> Non
     assert "queue_event(VIBE_STICK_EVENT_PTT_FOLLOWUP_ENTER)" not in button_single_click
 
 
+def test_ptt_followup_timeout_does_not_consume_the_next_single_click() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    button_single_click = source.split("static void button_single_click_cb", 1)[1]
+    button_single_click = button_single_click.split("static void button_double_click_cb", 1)[0]
+
+    assert "if (consume_ptt_followup_enter_window())" in button_single_click
+    assert "else if (ptt_followup_enter_window_present() || recording_finalize_active())" in button_single_click
+    assert "else if (followup_window_present || recording_finalize_active())" not in button_single_click
+    assert button_single_click.index(
+        "consume_ptt_followup_enter_window()"
+    ) < button_single_click.index(
+        "ptt_followup_enter_window_present() || recording_finalize_active()"
+    )
+
+
 def test_ptt_release_followup_double_click_requests_current_dictation_cancellation() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     button_double_click = source.split("static void button_double_click_cb", 1)[1]
@@ -1046,7 +1061,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.31"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.32"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.23"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher

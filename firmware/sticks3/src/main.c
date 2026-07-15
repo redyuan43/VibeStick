@@ -5714,7 +5714,6 @@ static void button_single_click_cb(void *button_handle, void *usr_data)
         return;
     }
 #endif
-    const bool followup_window_present = ptt_followup_enter_window_present();
     if (recording_intent_is_cyber()) {
         clear_ptt_followup_enter_window();
     } else if (consume_ptt_followup_enter_window()) {
@@ -5723,7 +5722,7 @@ static void button_single_click_cb(void *button_handle, void *usr_data)
             clear_ptt_followup_enter_window();
         }
         return;
-    } else if (followup_window_present || recording_finalize_active()) {
+    } else if (ptt_followup_enter_window_present() || recording_finalize_active()) {
         ESP_LOGI(TAG, "front single click ignored after dictation stop");
         return;
     }
@@ -5747,14 +5746,13 @@ static void button_double_click_cb(void *button_handle, void *usr_data)
         return;
     }
 #endif
-    const bool followup_window_present = ptt_followup_enter_window_present();
     if (consume_ptt_followup_enter_window()) {
         if (!start_ptt_followup_key_dispatch("button_followup_escape",
                                              VIBE_STICK_SOUND_FOLLOWUP_ESCAPE)) {
             clear_ptt_followup_enter_window();
         }
         return;
-    } else if (followup_window_present || recording_finalize_active()) {
+    } else if (ptt_followup_enter_window_present() || recording_finalize_active()) {
         ESP_LOGI(TAG, "front double click ignored after dictation stop");
         return;
     }
@@ -5804,7 +5802,6 @@ static void button_long_start_cb(void *button_handle, void *usr_data)
         return;
     }
 #endif
-    const bool followup_window_present = ptt_followup_enter_window_present();
     if (consume_ptt_followup_enter_window()) {
         s_long_press_active = false;
         if (!start_ptt_followup_key_dispatch("button_followup_enter",
@@ -5813,7 +5810,7 @@ static void button_long_start_cb(void *button_handle, void *usr_data)
         }
         ESP_LOGI(TAG, "front long press accepted as dictation confirmation");
         return;
-    } else if (followup_window_present || recording_finalize_active()) {
+    } else if (ptt_followup_enter_window_present() || recording_finalize_active()) {
         s_long_press_active = false;
         ESP_LOGI(TAG, "front long press ignored after dictation stop");
         return;
