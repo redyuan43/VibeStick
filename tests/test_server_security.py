@@ -72,6 +72,31 @@ class ServerSecurityTests(unittest.TestCase):
         self.assertIn("Model Reply", body)
         self.assertIn("agx_tts", body)
 
+    def test_device_row_renders_boot_wake_diagnostics(self) -> None:
+        row = app._device_row(
+            {
+                "device_id": "stick-s3",
+                "device_ip": "192.168.100.177",
+                "board": "sticks3",
+                "firmware_name": "vibestick",
+                "firmware_version": "0.1.27",
+                "reset_reason": "deep_sleep",
+                "wake_cause": "ext0",
+                "boot_count": "4",
+                "pmic_wake": "0x00",
+                "pmic_irq": "00/00/00",
+                "pmic_timer": "00/0",
+                "wifi_ssid": "HANYUAN",
+                "wifi_rssi": -42,
+                "last_seen_text": "2026-07-15 16:00:00",
+                "path": "/health",
+            }
+        )
+
+        self.assertIn(
+            "deep_sleep/ext0 #4 PMIC:0x00 IRQ:00/00/00 Timer:00/0", row
+        )
+
     def test_device_recording_result_is_small_and_keeps_tts_signal(self) -> None:
         payload = app._device_recording_result(
             {

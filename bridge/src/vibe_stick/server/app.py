@@ -122,6 +122,15 @@ class BridgeStateStore:
                 "wifi_ssid": str(headers.get("X-Vibe-Stick-Wifi-Ssid") or ""),
                 "wifi_bssid": str(headers.get("X-Vibe-Stick-Wifi-Bssid") or ""),
                 "wifi_rssi": _int_header(headers.get("X-Vibe-Stick-Wifi-Rssi"), previous.get("wifi_rssi", 0)),
+                "wake_cause": str(headers.get("X-Vibe-Stick-Wake-Cause") or ""),
+                "wake_cause_code": str(headers.get("X-Vibe-Stick-Wake-Cause-Code") or ""),
+                "wake_ext1": str(headers.get("X-Vibe-Stick-Wake-Ext1") or ""),
+                "reset_reason": str(headers.get("X-Vibe-Stick-Reset-Reason") or ""),
+                "reset_reason_code": str(headers.get("X-Vibe-Stick-Reset-Reason-Code") or ""),
+                "boot_count": str(headers.get("X-Vibe-Stick-Boot-Count") or ""),
+                "pmic_wake": str(headers.get("X-Vibe-Stick-Pmic-Wake") or ""),
+                "pmic_irq": str(headers.get("X-Vibe-Stick-Pmic-Irq") or ""),
+                "pmic_timer": str(headers.get("X-Vibe-Stick-Pmic-Timer") or ""),
             }
 
     def devices(self) -> list[dict[str, Any]]:
@@ -1190,7 +1199,7 @@ def _dashboard_html(
     bridge = snapshot["bridge"]
     rows = "\n".join(_device_row(device) for device in devices)
     if not rows:
-        rows = "<tr><td colspan=\"8\" class=\"empty\">No VibeStick devices seen yet.</td></tr>"
+        rows = "<tr><td colspan=\"9\" class=\"empty\">No VibeStick devices seen yet.</td></tr>"
     event_rows = "\n".join(_event_row(event) for event in events)
     if not event_rows:
         event_rows = "<tr><td colspan=\"4\" class=\"empty\">No events yet.</td></tr>"
@@ -1265,7 +1274,7 @@ td:first-child {{ width: 150px; color: #9ca3af; }}
 <h2>Devices</h2>
 <table>
 <thead>
-<tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Last Path</th></tr>
+<tr><th>Device</th><th>IP</th><th>Board</th><th>Firmware</th><th>Wake</th><th>WiFi</th><th>RSSI</th><th>Last Seen</th><th>Last Path</th></tr>
 </thead>
 <tbody>
 {rows}
@@ -1313,12 +1322,26 @@ def _device_row(device: dict[str, Any]) -> str:
             str(device.get("firmware_version") or ""),
         ] if part
     )
+    wake_parts = [
+        str(device.get("reset_reason") or ""),
+        str(device.get("wake_cause") or ""),
+    ]
+    wake_text = "/".join(part for part in wake_parts if part)
+    if device.get("boot_count"):
+        wake_text = f"{wake_text or '-'} #{device['boot_count']}"
+    if device.get("pmic_wake"):
+        wake_text += f" PMIC:{device['pmic_wake']}"
+    if device.get("pmic_irq"):
+        wake_text += f" IRQ:{device['pmic_irq']}"
+    if device.get("pmic_timer"):
+        wake_text += f" Timer:{device['pmic_timer']}"
     return (
         "<tr>"
         f"<td>{html.escape(str(device.get('device_id') or ''))}</td>"
         f"<td>{html.escape(str(device.get('device_ip') or device.get('client_ip') or ''))}</td>"
         f"<td>{html.escape(str(device.get('board') or ''))}</td>"
         f"<td>{html.escape(firmware)}</td>"
+        f"<td>{html.escape(wake_text or '-')}</td>"
         f"<td>{html.escape(str(device.get('wifi_ssid') or ''))}</td>"
         f"<td class=\"{rssi_class}\">{rssi}</td>"
         f"<td>{html.escape(str(device.get('last_seen_text') or ''))}</td>"
