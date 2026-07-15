@@ -6220,9 +6220,11 @@ static esp_err_t init_power_management(void)
 #if CONFIG_PM_ENABLE
     const esp_pm_config_t config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-        .min_freq_mhz = CONFIG_XTAL_FREQ,
+        .min_freq_mhz = VIBE_BOARD_ALLOW_DYNAMIC_FREQUENCY
+                            ? CONFIG_XTAL_FREQ
+                            : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
 #if CONFIG_FREERTOS_USE_TICKLESS_IDLE
-        .light_sleep_enable = true,
+        .light_sleep_enable = VIBE_BOARD_ALLOW_AUTOMATIC_LIGHT_SLEEP,
 #else
         .light_sleep_enable = false,
 #endif

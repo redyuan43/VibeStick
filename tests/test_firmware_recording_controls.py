@@ -1033,7 +1033,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.28"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.29"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.23"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
@@ -1053,15 +1053,21 @@ def test_wifi_reconnect_uses_delayed_backoff_instead_of_immediate_retry() -> Non
     assert "ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect())" not in disconnect
 
 
-def test_power_management_and_tickless_idle_are_enabled_by_default() -> None:
+def test_power_management_is_board_specific_after_s3_brownout() -> None:
     defaults = (ROOT / "firmware/sticks3/sdkconfig.defaults").read_text(encoding="utf-8")
     source = MAIN_C.read_text(encoding="utf-8")
+    profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
 
     assert "CONFIG_PM_ENABLE=y" in defaults
     assert "CONFIG_PM_DFS_INIT_AUTO=n" in defaults
     assert "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y" in defaults
     assert "esp_pm_configure(&config)" in source
-    assert ".light_sleep_enable = true" in source
+    assert "VIBE_BOARD_ALLOW_DYNAMIC_FREQUENCY" in source
+    assert "VIBE_BOARD_ALLOW_AUTOMATIC_LIGHT_SLEEP" in source
+    assert "#define VIBE_BOARD_ALLOW_DYNAMIC_FREQUENCY 1" in profile
+    assert "#define VIBE_BOARD_ALLOW_AUTOMATIC_LIGHT_SLEEP 1" in profile
+    assert "#define VIBE_BOARD_ALLOW_DYNAMIC_FREQUENCY 0" in profile
+    assert "#define VIBE_BOARD_ALLOW_AUTOMATIC_LIGHT_SLEEP 0" in profile
 
 
 def test_tts_playback_probe_reports_device_result() -> None:
