@@ -1062,7 +1062,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.32"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.23"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.24"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
