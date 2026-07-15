@@ -940,13 +940,22 @@ def test_s3_blocks_automatic_light_sleep_while_the_display_is_active() -> None:
     assert "automatic light sleep blocked while display is active" in power_init
 
 
+def test_s3_backlight_pwm_uses_a_clock_stable_across_cpu_frequency_changes() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    backlight = source.split("static void init_backlight(void)", 1)[1]
+    backlight = backlight.split("static esp_err_t init_display", 1)[0]
+
+    assert ".clk_cfg = LEDC_USE_XTAL_CLK" in backlight
+    assert "LEDC_AUTO_CLK" not in backlight
+
+
 def test_board_firmware_versions_remain_independent() -> None:
     config = (
         ROOT / "firmware" / "sticks3" / "include" / "vibe_stick_config.h"
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.24"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.25"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.23"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher

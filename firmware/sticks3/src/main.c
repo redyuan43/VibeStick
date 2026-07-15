@@ -1508,7 +1508,7 @@ static void init_backlight(void)
         .timer_num = LEDC_TIMER_0,
         .duty_resolution = LEDC_TIMER_8_BIT,
         .freq_hz = LCD_BACKLIGHT_PWM_HZ,
-        .clk_cfg = LEDC_AUTO_CLK,
+        .clk_cfg = LEDC_USE_XTAL_CLK,
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer));
     ledc_channel_config_t channel = {
