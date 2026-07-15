@@ -131,6 +131,7 @@ class BridgeStateStore:
                 "pmic_wake": str(headers.get("X-Vibe-Stick-Pmic-Wake") or ""),
                 "pmic_irq": str(headers.get("X-Vibe-Stick-Pmic-Irq") or ""),
                 "pmic_timer": str(headers.get("X-Vibe-Stick-Pmic-Timer") or ""),
+                "pmic_gpio_wake": str(headers.get("X-Vibe-Stick-Pmic-Gpio-Wake") or ""),
             }
 
     def devices(self) -> list[dict[str, Any]]:
@@ -1335,6 +1336,8 @@ def _device_row(device: dict[str, Any]) -> str:
         wake_text += f" IRQ:{device['pmic_irq']}"
     if device.get("pmic_timer"):
         wake_text += f" Timer:{device['pmic_timer']}"
+    if device.get("pmic_gpio_wake"):
+        wake_text += f" GPIO:{device['pmic_gpio_wake']}"
     return (
         "<tr>"
         f"<td>{html.escape(str(device.get('device_id') or ''))}</td>"

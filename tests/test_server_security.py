@@ -86,6 +86,7 @@ class ServerSecurityTests(unittest.TestCase):
                 "pmic_wake": "0x00",
                 "pmic_irq": "00/00/00",
                 "pmic_timer": "00/0",
+                "pmic_gpio_wake": "00/00",
                 "wifi_ssid": "HANYUAN",
                 "wifi_rssi": -42,
                 "last_seen_text": "2026-07-15 16:00:00",
@@ -94,7 +95,8 @@ class ServerSecurityTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "deep_sleep/ext0 #4 PMIC:0x00 IRQ:00/00/00 Timer:00/0", row
+            "deep_sleep/ext0 #4 PMIC:0x00 IRQ:00/00/00 Timer:00/0 GPIO:00/00",
+            row,
         )
 
     def test_device_recording_result_is_small_and_keeps_tts_signal(self) -> None:
