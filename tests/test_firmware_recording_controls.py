@@ -831,8 +831,13 @@ def test_s3_deep_sleep_wake_gpio_preserves_internal_button_pullups() -> None:
 
     assert "#define VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL 0" in board_profile
     assert ".disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL" in init_button
-    assert "configure_sleep_wake_gpio(VIBE_BOARD_PIN_BUTTON_FRONT" not in sleep
-    assert "configure_sleep_wake_gpio(VIBE_BOARD_PIN_BUTTON_SIDE" not in sleep
+    assert "rtc_gpio_pullup_en(VIBE_BOARD_PIN_BUTTON_FRONT)" in source
+    assert "rtc_gpio_pulldown_dis(VIBE_BOARD_PIN_BUTTON_FRONT)" in source
+    assert "configure_deep_sleep_button_pullups(wake_mask)" in sleep
+    assert "1ULL << VIBE_BOARD_PIN_BUTTON_FRONT" in source
+    assert "1ULL << VIBE_BOARD_PIN_BUTTON_SIDE" not in source.split(
+        "static uint64_t sleep_button_wake_mask", 1
+    )[1].split("static esp_err_t configure_deep_sleep_button_pullups", 1)[0]
 
 
 def test_side_button_gpio_keeps_power_save_enabled() -> None:
@@ -955,7 +960,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.25"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.26"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.23"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher

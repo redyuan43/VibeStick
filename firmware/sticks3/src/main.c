@@ -18,6 +18,7 @@
 #include "cJSON.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "driver/rtc_io.h"
 #include "driver/spi_master.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_attr.h"
@@ -1388,9 +1389,21 @@ static bool sleep_wake_mask_contains(uint64_t wake_mask, gpio_num_t gpio)
 
 static uint64_t sleep_button_wake_mask(void)
 {
-    return (1ULL << VIBE_BOARD_PIN_BUTTON_FRONT) |
-           (1ULL << VIBE_BOARD_PIN_BUTTON_SIDE);
+    return 1ULL << VIBE_BOARD_PIN_BUTTON_FRONT;
 }
+
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+static esp_err_t configure_deep_sleep_button_pullups(uint64_t wake_mask)
+{
+    if ((wake_mask & (1ULL << VIBE_BOARD_PIN_BUTTON_FRONT)) != 0) {
+        ESP_RETURN_ON_ERROR(rtc_gpio_pullup_en(VIBE_BOARD_PIN_BUTTON_FRONT),
+                            TAG, "front wake pull-up");
+        ESP_RETURN_ON_ERROR(rtc_gpio_pulldown_dis(VIBE_BOARD_PIN_BUTTON_FRONT),
+                            TAG, "front wake pull-down");
+    }
+    return ESP_OK;
+}
+#endif
 
 static bool prepare_imu_deep_sleep_wake(uint64_t *wake_mask)
 {
@@ -1441,8 +1454,14 @@ static bool enter_deep_sleep(void)
         return false;
     }
 #else
+    esp_err_t pull_err = configure_deep_sleep_button_pullups(wake_mask);
+    if (pull_err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: wake pull-up setup failed: %s",
+                 esp_err_to_name(pull_err));
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
     if (sleep_wake_gpio_is_active(VIBE_BOARD_PIN_BUTTON_FRONT) ||
-        sleep_wake_gpio_is_active(VIBE_BOARD_PIN_BUTTON_SIDE) ||
         (sleep_wake_mask_contains(wake_mask, VIBE_BOARD_PIN_IMU_INT) &&
          sleep_wake_gpio_is_active(VIBE_BOARD_PIN_IMU_INT))) {
         ESP_LOGW(TAG, "deep sleep skipped: ext1 wake gpio is already active");
