@@ -30,13 +30,40 @@
 #define AUDIO_CHUNK_BYTES (AUDIO_FRAME_SAMPLES * VIBE_STICK_AUDIO_CHANNELS * \
                            (VIBE_STICK_AUDIO_BITS_PER_SAMPLE / 8))
 #define AUDIO_QUEUE_DEPTH 12
-#define TASK_EXIT_WAIT_MS 800
-#define VIBE_STICK_SOUND_VOLUME 0.40f
+#define AUDIO_READ_WAIT_MS (AUDIO_FRAME_MS + 50)
+#define TASK_EXIT_WAIT_MS 1200
 #define VIBE_STICK_SOUND_FRAME_SAMPLES 160
 #define VIBE_STICK_SOUND_FADE_MS 8
-#define VIBE_STICK_SOUND_OUTPUT_VOLUME 85
 #define VIBE_STICK_TWO_PI 6.28318530717958647692f
 #define VIBE_STICK_TONE_DUTY ((1 << 9) - 1)
+#define VIBE_STICK_AUDIO_CORE 1
+
+#if VIBE_BOARD_HAS_ES8311
+/* The StickS3's amplified speaker needs a softer profile than the Plus buzzer. */
+#define VIBE_STICK_SOUND_VOLUME 0.28f
+#define VIBE_STICK_SOUND_OUTPUT_VOLUME 70
+#define VIBE_STICK_BEEP_MS 90
+#define VIBE_STICK_RECORDING_CHIRP_MS 65
+#define VIBE_STICK_RECORDING_CHIRP_GAP_MS 16
+#define VIBE_STICK_FOLLOWUP_BUZZ_MS 42
+#define VIBE_STICK_FOLLOWUP_BUZZ_GAP_MS 20
+#define VIBE_STICK_ESCAPE_GLITCH_SHORT_MS 40
+#define VIBE_STICK_ESCAPE_GLITCH_LONG_MS 80
+#define VIBE_STICK_ESCAPE_GLITCH_GAP_MS 24
+#define VIBE_STICK_DONE_LOW_HZ 700
+#define VIBE_STICK_DONE_HIGH_HZ 1000
+#define VIBE_STICK_APPROVAL_LOW_HZ 520
+#define VIBE_STICK_APPROVAL_HIGH_HZ 700
+#define VIBE_STICK_RECORDING_START_HIGH_HZ 1800
+#define VIBE_STICK_RECORDING_START_LOW_HZ 1200
+#define VIBE_STICK_RECORDING_STOP_HZ 1500
+#define VIBE_STICK_FOLLOWUP_ENTER_LOW_HZ 1400
+#define VIBE_STICK_FOLLOWUP_ENTER_HIGH_HZ 1700
+#define VIBE_STICK_FOLLOWUP_ESCAPE_HIGH_HZ 1700
+#define VIBE_STICK_FOLLOWUP_ESCAPE_MID_HZ 1450
+#else
+#define VIBE_STICK_SOUND_VOLUME 0.40f
+#define VIBE_STICK_SOUND_OUTPUT_VOLUME 85
 #define VIBE_STICK_BEEP_MS 200
 #define VIBE_STICK_RECORDING_CHIRP_MS 90
 #define VIBE_STICK_RECORDING_CHIRP_GAP_MS 18
@@ -45,7 +72,18 @@
 #define VIBE_STICK_ESCAPE_GLITCH_SHORT_MS 45
 #define VIBE_STICK_ESCAPE_GLITCH_LONG_MS 105
 #define VIBE_STICK_ESCAPE_GLITCH_GAP_MS 28
-#define VIBE_STICK_AUDIO_CORE 1
+#define VIBE_STICK_DONE_LOW_HZ 880
+#define VIBE_STICK_DONE_HIGH_HZ 1320
+#define VIBE_STICK_APPROVAL_LOW_HZ 600
+#define VIBE_STICK_APPROVAL_HIGH_HZ 800
+#define VIBE_STICK_RECORDING_START_HIGH_HZ 3600
+#define VIBE_STICK_RECORDING_START_LOW_HZ 1800
+#define VIBE_STICK_RECORDING_STOP_HZ 4000
+#define VIBE_STICK_FOLLOWUP_ENTER_LOW_HZ 2600
+#define VIBE_STICK_FOLLOWUP_ENTER_HIGH_HZ 3200
+#define VIBE_STICK_FOLLOWUP_ESCAPE_HIGH_HZ 3600
+#define VIBE_STICK_FOLLOWUP_ESCAPE_MID_HZ 3200
+#endif
 
 typedef struct {
     size_t len;
@@ -277,6 +315,18 @@ static void release_session_resources(void)
     deinit_i2s();
 }
 
+static void signal_capture_stop_locked(void)
+{
+    if (s_rx_handle && s_rx_enabled) {
+        esp_err_t err = i2s_channel_disable(s_rx_handle);
+        if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+            s_rx_enabled = false;
+        } else {
+            ESP_LOGW(TAG, "stop i2s rx failed: %s", esp_err_to_name(err));
+        }
+    }
+}
+
 typedef struct {
     int freq_hz;
     int duration_ms;
@@ -425,9 +475,9 @@ static esp_err_t play_tone_segments(const sound_segment_t *segments, size_t coun
 static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *count)
 {
     static const sound_segment_t done[] = {
-        {.freq_hz = 880, .duration_ms = VIBE_STICK_BEEP_MS},
+        {.freq_hz = VIBE_STICK_DONE_LOW_HZ, .duration_ms = VIBE_STICK_BEEP_MS},
         {.freq_hz = 0, .duration_ms = 40},
-        {.freq_hz = 1320, .duration_ms = VIBE_STICK_BEEP_MS},
+        {.freq_hz = VIBE_STICK_DONE_HIGH_HZ, .duration_ms = VIBE_STICK_BEEP_MS},
     };
     static const sound_segment_t error[] = {
         {.freq_hz = 240, .duration_ms = VIBE_STICK_BEEP_MS},
@@ -437,29 +487,35 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
         {.freq_hz = 240, .duration_ms = VIBE_STICK_BEEP_MS},
     };
     static const sound_segment_t approval[] = {
-        {.freq_hz = 600, .duration_ms = VIBE_STICK_BEEP_MS},
+        {.freq_hz = VIBE_STICK_APPROVAL_LOW_HZ, .duration_ms = VIBE_STICK_BEEP_MS},
         {.freq_hz = 0, .duration_ms = 60},
-        {.freq_hz = 800, .duration_ms = VIBE_STICK_BEEP_MS},
+        {.freq_hz = VIBE_STICK_APPROVAL_HIGH_HZ, .duration_ms = VIBE_STICK_BEEP_MS},
     };
     static const sound_segment_t recording_start[] = {
-        {.freq_hz = 3600, .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS},
+        {.freq_hz = VIBE_STICK_RECORDING_START_HIGH_HZ,
+         .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS},
         {.freq_hz = 0, .duration_ms = VIBE_STICK_RECORDING_CHIRP_GAP_MS},
-        {.freq_hz = 1800, .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS},
+        {.freq_hz = VIBE_STICK_RECORDING_START_LOW_HZ,
+         .duration_ms = VIBE_STICK_RECORDING_CHIRP_MS},
     };
     static const sound_segment_t recording_stop[] = {
-        {.freq_hz = 4000, .duration_ms = VIBE_STICK_BEEP_MS},
+        {.freq_hz = VIBE_STICK_RECORDING_STOP_HZ, .duration_ms = VIBE_STICK_BEEP_MS},
     };
     static const sound_segment_t followup_enter[] = {
-        {.freq_hz = 2600, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
+        {.freq_hz = VIBE_STICK_FOLLOWUP_ENTER_LOW_HZ,
+         .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
         {.freq_hz = 0, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_GAP_MS},
-        {.freq_hz = 3200, .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
+        {.freq_hz = VIBE_STICK_FOLLOWUP_ENTER_HIGH_HZ,
+         .duration_ms = VIBE_STICK_FOLLOWUP_BUZZ_MS},
     };
     static const sound_segment_t followup_escape[] = {
-        {.freq_hz = 3600, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS},
+        {.freq_hz = VIBE_STICK_FOLLOWUP_ESCAPE_HIGH_HZ,
+         .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS},
         {.freq_hz = 0, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_GAP_MS},
         {.freq_hz = 760, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS},
         {.freq_hz = 0, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_GAP_MS},
-        {.freq_hz = 3200, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS},
+        {.freq_hz = VIBE_STICK_FOLLOWUP_ESCAPE_MID_HZ,
+         .duration_ms = VIBE_STICK_ESCAPE_GLITCH_SHORT_MS},
         {.freq_hz = 0, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_GAP_MS},
         {.freq_hz = 520, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS},
     };
@@ -496,14 +552,24 @@ static esp_err_t read_audio_chunk(audio_chunk_t *chunk)
 {
 #if VIBE_BOARD_HAS_ES8311
     chunk->len = AUDIO_CHUNK_BYTES;
-    ESP_RETURN_ON_FALSE(esp_codec_dev_read(s_codec, chunk->data, (int)chunk->len) == ESP_CODEC_DEV_OK,
-                        ESP_FAIL, TAG, "codec read");
+    if (esp_codec_dev_read(s_codec, chunk->data, (int)chunk->len) !=
+        ESP_CODEC_DEV_OK) {
+        if (!atomic_load(&s_running)) {
+            chunk->len = 0;
+            return ESP_OK;
+        }
+        return ESP_FAIL;
+    }
     return ESP_OK;
 #else
     size_t bytes_read = 0;
-    ESP_RETURN_ON_ERROR(i2s_channel_read(s_rx_handle, chunk->data, sizeof(chunk->data),
-                                         &bytes_read, portMAX_DELAY),
-                        TAG, "pdm read");
+    esp_err_t err = i2s_channel_read(s_rx_handle, chunk->data, sizeof(chunk->data),
+                                     &bytes_read, pdMS_TO_TICKS(AUDIO_READ_WAIT_MS));
+    if (err == ESP_ERR_TIMEOUT) {
+        chunk->len = 0;
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "audio read");
     chunk->len = bytes_read;
     return ESP_OK;
 #endif
@@ -517,7 +583,9 @@ static void audio_task(void *arg)
     while (atomic_load(&s_running)) {
         esp_err_t err = read_audio_chunk(&chunk);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "audio read failed: %s", esp_err_to_name(err));
+            if (atomic_load(&s_running)) {
+                ESP_LOGW(TAG, "audio read failed: %s", esp_err_to_name(err));
+            }
             continue;
         }
         if (chunk.len == 0) {
@@ -540,8 +608,14 @@ static void audio_task(void *arg)
              (unsigned)s_audio_stats.chunks_dropped,
              (unsigned)s_audio_stats.bytes_dropped,
              (unsigned)uxQueueMessagesWaiting(s_audio_queue));
-    release_session_resources();
-    s_audio_task = NULL;
+    if (s_audio_mutex && xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(250)) == pdTRUE) {
+        release_session_resources();
+        s_audio_task = NULL;
+        xSemaphoreGive(s_audio_mutex);
+    } else {
+        release_session_resources();
+        s_audio_task = NULL;
+    }
     vTaskDelete(NULL);
 }
 
@@ -610,14 +684,30 @@ esp_err_t vibe_audio_start(void)
 
 esp_err_t vibe_audio_stop(void)
 {
-    if (!atomic_load(&s_running)) {
+    if (!atomic_load(&s_running) && s_audio_task == NULL) {
         return ESP_OK;
     }
     atomic_store(&s_running, false);
+    if (s_audio_mutex && xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(250)) == pdTRUE) {
+        signal_capture_stop_locked();
+        xSemaphoreGive(s_audio_mutex);
+    } else {
+        ESP_LOGW(TAG, "audio stop could not lock resources for initial unblock");
+    }
+
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(TASK_EXIT_WAIT_MS);
     while (s_audio_task != NULL) {
         if (xTaskGetTickCount() >= deadline) {
-            ESP_LOGW(TAG, "audio task stop timeout");
+            ESP_LOGE(TAG, "audio task stop timed out; forcing bounded cleanup");
+            if (s_audio_mutex &&
+                xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(250)) == pdTRUE) {
+                if (s_audio_task != NULL) {
+                    vTaskDelete(s_audio_task);
+                    s_audio_task = NULL;
+                }
+                release_session_resources();
+                xSemaphoreGive(s_audio_mutex);
+            }
             return ESP_ERR_TIMEOUT;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
