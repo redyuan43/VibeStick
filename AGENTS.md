@@ -1,5 +1,10 @@
 # Project Instructions
 
+## Serial Flashing Rule
+
+- For every serial firmware flash, use `115200` baud for both StickS3 and
+  M5StickC Plus 1.1. Do not use a higher baud rate for any board.
+
 ## Firmware And OTA Release Invariant
 
 - A firmware version or binary change is not complete until the matching OTA

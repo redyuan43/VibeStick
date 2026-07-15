@@ -149,7 +149,7 @@ Build and publish an OTA image for a board:
 ./scripts/ota_publish.sh sticks3
 ```
 
-For M5StickC Plus, replace `sticks3` with `stickc_plus`. Published files are written to `firmware/sticks3/ota/`; the bridge serves them through `/ota/manifest?board=...` and `/ota/bin?board=...`. Once the device is on Wi-Fi, it checks for a different build id, downloads the image to the inactive OTA slot, switches boot partitions, and restarts.
+For M5StickC Plus, replace `sticks3` with `stickc_plus`. Published files are written to `firmware/sticks3/ota/`; the bridge serves them through `/ota/manifest?board=...` and `/ota/bin?board=...`. Once the device is on Wi-Fi, it installs an image only when the manifest has a strictly higher semantic version than the running firmware. Equal or lower versions are rejected even when their build IDs or hashes differ. Accepted images are downloaded to the inactive OTA slot before the device switches boot partitions and restarts.
 
 ## Troubleshooting
 
