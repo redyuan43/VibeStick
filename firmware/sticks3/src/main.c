@@ -505,6 +505,10 @@ static lv_obj_t *s_mode_switch_title;
 static lv_obj_t *s_mode_switch_hint;
 static bool s_ui_ready;
 static bool s_woke_from_deep_sleep;
+static esp_sleep_wakeup_cause_t s_boot_wake_cause;
+static esp_reset_reason_t s_boot_reset_reason;
+static uint64_t s_boot_ext1_wake_status;
+static vibe_board_boot_power_status_t s_boot_power_status;
 static bool s_wake_front_button_pending;
 static bool s_pet_fast_resume_pending;
 static int64_t s_pet_animation_resume_ms;
@@ -519,6 +523,7 @@ static int s_battery_raw_level = -1;
 static int s_battery_voltage_mv = -1;
 RTC_DATA_ATTR static uint32_t s_retained_battery_magic;
 RTC_DATA_ATTR static int s_retained_battery_display_level = -1;
+RTC_DATA_ATTR static uint32_t s_retained_boot_count;
 static lv_obj_t *s_recording_overlay;
 static lv_obj_t *s_recording_wave_group;
 static lv_obj_t *s_recording_wave_bars[5];
@@ -1134,6 +1139,30 @@ static void set_backlight(uint8_t brightness)
     s_current_backlight = brightness;
 }
 
+#if CONFIG_PM_ENABLE && VIBE_BOARD_HAS_GPIO_BACKLIGHT
+static void update_display_light_sleep_lock(bool display_active)
+{
+    if (!s_display_no_light_sleep_lock) {
+        return;
+    }
+    const bool should_hold =
+        display_active || s_state.battery_charging || s_state.usb_powered;
+    if (should_hold && !s_display_no_light_sleep_lock_held) {
+        if (esp_pm_lock_acquire(s_display_no_light_sleep_lock) == ESP_OK) {
+            s_display_no_light_sleep_lock_held = true;
+        } else {
+            ESP_LOGW(TAG, "could not block automatic light sleep");
+        }
+    } else if (!should_hold && s_display_no_light_sleep_lock_held) {
+        if (esp_pm_lock_release(s_display_no_light_sleep_lock) == ESP_OK) {
+            s_display_no_light_sleep_lock_held = false;
+        } else {
+            ESP_LOGW(TAG, "could not allow automatic light sleep");
+        }
+    }
+}
+#endif
+
 static void set_display_rendering_suspended(bool suspended)
 {
     if (!s_panel || !s_lvgl_tick_timer ||
@@ -1142,13 +1171,8 @@ static void set_display_rendering_suspended(bool suspended)
     }
 
 #if CONFIG_PM_ENABLE && VIBE_BOARD_HAS_GPIO_BACKLIGHT
-    if (!suspended && s_display_no_light_sleep_lock &&
-        !s_display_no_light_sleep_lock_held) {
-        if (esp_pm_lock_acquire(s_display_no_light_sleep_lock) == ESP_OK) {
-            s_display_no_light_sleep_lock_held = true;
-        } else {
-            ESP_LOGW(TAG, "display wake could not block automatic light sleep");
-        }
+    if (!suspended) {
+        update_display_light_sleep_lock(true);
     }
 #endif
 
@@ -1185,13 +1209,8 @@ static void set_display_rendering_suspended(bool suspended)
     lvgl_unlock();
 
 #if CONFIG_PM_ENABLE && VIBE_BOARD_HAS_GPIO_BACKLIGHT
-    if (suspended && s_display_no_light_sleep_lock &&
-        s_display_no_light_sleep_lock_held) {
-        if (esp_pm_lock_release(s_display_no_light_sleep_lock) == ESP_OK) {
-            s_display_no_light_sleep_lock_held = false;
-        } else {
-            ESP_LOGW(TAG, "display suspend could not allow automatic light sleep");
-        }
+    if (suspended) {
+        update_display_light_sleep_lock(false);
     }
 #endif
 
@@ -1229,7 +1248,7 @@ static bool external_powered(void)
 
 static bool display_should_stay_active(void)
 {
-    return external_powered() ||
+    const bool active_work =
            s_recording_overlay_visible ||
            vibe_audio_is_recording() ||
            s_recording_session_id[0] != '\0' ||
@@ -1237,11 +1256,17 @@ static bool display_should_stay_active(void)
            s_motion_recording_active ||
            s_motion_calibrating ||
            recording_finalize_active();
+#if VIBE_BOARD_HAS_GPIO_BACKLIGHT
+    return active_work;
+#else
+    return external_powered() || active_work;
+#endif
 }
 
 static bool deep_sleep_should_stay_awake(void)
 {
-    return display_should_stay_active() || ota_in_progress();
+    return external_powered() || display_should_stay_active() ||
+           ota_in_progress();
 }
 
 static bool front_button_is_pressed(void)
@@ -1380,13 +1405,6 @@ static bool sleep_wake_gpio_is_active(gpio_num_t gpio)
     return gpio != GPIO_NUM_NC && gpio_get_level(gpio) == 0;
 }
 
-#if !defined(CONFIG_IDF_TARGET_ESP32)
-static bool sleep_wake_mask_contains(uint64_t wake_mask, gpio_num_t gpio)
-{
-    return gpio != GPIO_NUM_NC && (wake_mask & (1ULL << gpio)) != 0;
-}
-#endif
-
 static uint64_t sleep_button_wake_mask(void)
 {
     return 1ULL << VIBE_BOARD_PIN_BUTTON_FRONT;
@@ -1445,15 +1463,8 @@ static bool enter_deep_sleep(void)
         wake_mask |= 1ULL << VIBE_BOARD_PIN_IMU_INT;
     }
 #endif
-#if defined(CONFIG_IDF_TARGET_ESP32)
     gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;
-    wake_mask = 1ULL << ext0_gpio;
-    if (sleep_wake_gpio_is_active(ext0_gpio)) {
-        ESP_LOGW(TAG, "deep sleep skipped: ext0 wake gpio=%d is already active",
-                 (int)ext0_gpio);
-        return false;
-    }
-#else
+#if !defined(CONFIG_IDF_TARGET_ESP32)
     esp_err_t pull_err = configure_deep_sleep_button_pullups(wake_mask);
     if (pull_err != ESP_OK) {
         ESP_LOGW(TAG, "deep sleep skipped: wake pull-up setup failed: %s",
@@ -1461,13 +1472,12 @@ static bool enter_deep_sleep(void)
         return false;
     }
     vTaskDelay(pdMS_TO_TICKS(1));
-    if (sleep_wake_gpio_is_active(VIBE_BOARD_PIN_BUTTON_FRONT) ||
-        (sleep_wake_mask_contains(wake_mask, VIBE_BOARD_PIN_IMU_INT) &&
-         sleep_wake_gpio_is_active(VIBE_BOARD_PIN_IMU_INT))) {
-        ESP_LOGW(TAG, "deep sleep skipped: ext1 wake gpio is already active");
+#endif
+    if (sleep_wake_gpio_is_active(ext0_gpio)) {
+        ESP_LOGW(TAG, "deep sleep skipped: ext0 wake gpio=%d is already active",
+                 (int)ext0_gpio);
         return false;
     }
-#endif
 
     esp_err_t err = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     if (err != ESP_OK) {
@@ -1475,11 +1485,7 @@ static bool enter_deep_sleep(void)
                  esp_err_to_name(err));
         return false;
     }
-#if defined(CONFIG_IDF_TARGET_ESP32)
     err = esp_sleep_enable_ext0_wakeup(ext0_gpio, 0);
-#else
-    err = esp_sleep_enable_ext1_wakeup_io(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
-#endif
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "deep sleep skipped: wake source setup failed: %s",
                  esp_err_to_name(err));
@@ -1516,6 +1522,59 @@ static void maybe_enter_deep_sleep(int64_t now_ms)
     if (!enter_deep_sleep()) {
         s_next_deep_sleep_attempt_ms =
             now_ms + VIBE_STICK_DEEP_SLEEP_RETRY_MS;
+    }
+}
+
+static const char *wake_cause_label(esp_sleep_wakeup_cause_t cause)
+{
+    switch (cause) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+        return "ext0";
+    case ESP_SLEEP_WAKEUP_EXT1:
+        return "ext1";
+    case ESP_SLEEP_WAKEUP_TIMER:
+        return "timer";
+    case ESP_SLEEP_WAKEUP_TOUCHPAD:
+        return "touch";
+    case ESP_SLEEP_WAKEUP_ULP:
+        return "ulp";
+    case ESP_SLEEP_WAKEUP_GPIO:
+        return "gpio";
+    case ESP_SLEEP_WAKEUP_UART:
+        return "uart";
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+        return "undefined";
+    default:
+        return "other";
+    }
+}
+
+static const char *reset_reason_label(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_POWERON:
+        return "poweron";
+    case ESP_RST_EXT:
+        return "external";
+    case ESP_RST_SW:
+        return "software";
+    case ESP_RST_PANIC:
+        return "panic";
+    case ESP_RST_INT_WDT:
+        return "interrupt_watchdog";
+    case ESP_RST_TASK_WDT:
+        return "task_watchdog";
+    case ESP_RST_WDT:
+        return "watchdog";
+    case ESP_RST_DEEPSLEEP:
+        return "deep_sleep";
+    case ESP_RST_BROWNOUT:
+        return "brownout";
+    case ESP_RST_SDIO:
+        return "sdio";
+    case ESP_RST_UNKNOWN:
+    default:
+        return "unknown";
     }
 }
 
@@ -3050,14 +3109,49 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
     char ssid[WIFI_PROFILE_SSID_LEN] = {0};
     char bssid[18] = {0};
     char rssi[8] = {0};
+    char wake_code[12] = {0};
+    char wake_ext1[20] = {0};
+    char reset_code[12] = {0};
+    char boot_count[12] = {0};
+    char pmic_wake[8] = {0};
+    char pmic_irq[24] = {0};
+    char pmic_timer[24] = {0};
     device_id(id, sizeof(id));
     current_wifi_ssid(ssid, sizeof(ssid));
     current_wifi_bssid(bssid, sizeof(bssid));
     snprintf(rssi, sizeof(rssi), "%d", current_wifi_rssi());
+    snprintf(wake_code, sizeof(wake_code), "%d", (int)s_boot_wake_cause);
+    snprintf(wake_ext1, sizeof(wake_ext1), "0x%llx",
+             (unsigned long long)s_boot_ext1_wake_status);
+    snprintf(reset_code, sizeof(reset_code), "%d", (int)s_boot_reset_reason);
+    snprintf(boot_count, sizeof(boot_count), "%lu",
+             (unsigned long)s_retained_boot_count);
+    snprintf(pmic_wake, sizeof(pmic_wake), "0x%02x",
+             s_boot_power_status.wake_source);
+    snprintf(pmic_irq, sizeof(pmic_irq), "%02x/%02x/%02x",
+             s_boot_power_status.irq_status_gpio,
+             s_boot_power_status.irq_status_power,
+             s_boot_power_status.irq_status_button);
+    snprintf(pmic_timer, sizeof(pmic_timer), "%02x/%lu",
+             s_boot_power_status.timer_config,
+             (unsigned long)s_boot_power_status.timer_seconds);
     esp_http_client_set_header(client, "X-Vibe-Stick-Device-Id", id);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Ssid", ssid);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Bssid", bssid);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Rssi", rssi);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Wake-Cause",
+                               wake_cause_label(s_boot_wake_cause));
+    esp_http_client_set_header(client, "X-Vibe-Stick-Wake-Cause-Code", wake_code);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Wake-Ext1", wake_ext1);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Reset-Reason",
+                               reset_reason_label(s_boot_reset_reason));
+    esp_http_client_set_header(client, "X-Vibe-Stick-Reset-Reason-Code", reset_code);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Boot-Count", boot_count);
+    if (s_boot_power_status.available) {
+        esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Wake", pmic_wake);
+        esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Irq", pmic_irq);
+        esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Timer", pmic_timer);
+    }
     if (token && token[0] != '\0') {
         esp_http_client_set_header(client, "X-Vibe-Stick-Token", token);
     }
@@ -4531,10 +4625,15 @@ static void refresh_power_status(bool force_log)
         power_read_ok = true;
     }
     if (power_read_ok && was_external_powered && !external_powered()) {
-        ESP_LOGI(TAG, "external power removed; reset idle timer");
+        ESP_LOGI(TAG, "external power removed");
         s_external_power_removed_ms = now_ms;
-        register_activity();
     }
+#if CONFIG_PM_ENABLE && VIBE_BOARD_HAS_GPIO_BACKLIGHT
+    if (power_read_ok) {
+        update_display_light_sleep_lock(
+            !atomic_load(&s_display_rendering_suspended));
+    }
+#endif
     if (battery_read_ok) {
         update_battery_display_level(battery_level, now_ms);
     }
@@ -6140,9 +6239,16 @@ static esp_err_t init_power_management(void)
 
 void app_main(void)
 {
-    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
-    uint64_t ext1_wake_status = esp_sleep_get_ext1_wakeup_status();
-    s_woke_from_deep_sleep = wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED;
+    s_boot_wake_cause = esp_sleep_get_wakeup_cause();
+    s_boot_reset_reason = esp_reset_reason();
+    s_boot_ext1_wake_status = esp_sleep_get_ext1_wakeup_status();
+    s_retained_boot_count++;
+    s_woke_from_deep_sleep =
+        s_boot_wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED;
+    if (s_woke_from_deep_sleep) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_FRONT));
+    }
     if (s_woke_from_deep_sleep) {
         s_deep_sleep_wake_ms = esp_timer_get_time() / 1000;
         s_pet_fast_resume_pending = true;
@@ -6151,8 +6257,12 @@ void app_main(void)
     ESP_LOGI(TAG, "boot %s board=%s version=%s build=%s transport=%s",
              FIRMWARE_NAME, VIBE_BOARD_NAME, FIRMWARE_VERSION, FIRMWARE_BUILD_ID, TRANSPORT);
     ESP_LOGI(TAG, "battery curve=%s", VIBE_BOARD_BATTERY_CURVE_VERSION);
-    ESP_LOGI(TAG, "wake cause=%d ext1_status=0x%llx",
-             wake_cause, (unsigned long long)ext1_wake_status);
+    ESP_LOGI(TAG,
+             "boot diagnostics wake=%s(%d) ext1=0x%llx reset=%s(%d) boot_count=%lu",
+             wake_cause_label(s_boot_wake_cause), (int)s_boot_wake_cause,
+             (unsigned long long)s_boot_ext1_wake_status,
+             reset_reason_label(s_boot_reset_reason), (int)s_boot_reset_reason,
+             (unsigned long)s_retained_boot_count);
     ESP_ERROR_CHECK(init_power_management());
     esp_err_t nvs = nvs_flash_init();
     if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -6163,6 +6273,7 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_init_power());
+    s_boot_power_status = vibe_board_boot_power_status();
     s_event_queue = xQueueCreate(16, sizeof(agent_event_t));
     s_bridge_control_queue =
         xQueueCreate(8, sizeof(bridge_control_command_t));

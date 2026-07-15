@@ -14,12 +14,14 @@
 static const char *TAG = "vibe_board";
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_pmic_dev;
+static vibe_board_boot_power_status_t s_boot_power_status;
 
 #if VIBE_BOARD_HAS_ES8311
 
 #define M5PM1_ADDR 0x6e
 #define M5PM1_I2C_FREQ_HZ 100000
 #define M5PM1_REG_DEVICE_ID 0x00
+#define M5PM1_REG_WAKE_SRC 0x05
 #define M5PM1_REG_PWR_CFG 0x06
 #define M5PM1_REG_HOLD_CFG 0x07
 #define M5PM1_REG_I2C_CFG 0x09
@@ -36,6 +38,10 @@ static i2c_master_dev_handle_t s_pmic_dev;
 #define M5PM1_REG_IRQ_MASK1 0x43
 #define M5PM1_REG_IRQ_MASK2 0x44
 #define M5PM1_REG_IRQ_MASK3 0x45
+#define M5PM1_REG_TIMER_COUNT0 0x38
+#define M5PM1_REG_TIMER_CONFIG 0x3c
+#define M5PM1_REG_TIMER_KEY 0x3d
+#define M5PM1_TIMER_RELOAD_KEY 0xa5
 #define M5PM1_REG_AW8737A_PULSE 0x53
 
 #define M5PM1_PWR_CFG_LDO_EN BIT(2)
@@ -214,6 +220,36 @@ esp_err_t vibe_board_init_power(void)
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(init_i2c(), TAG, "init i2c");
+
+    uint8_t timer_data[5] = {0};
+    s_boot_power_status.available =
+        read_reg(M5PM1_REG_WAKE_SRC, &s_boot_power_status.wake_source) == ESP_OK &&
+        read_reg(M5PM1_REG_IRQ_STATUS1, &s_boot_power_status.irq_status_gpio) == ESP_OK &&
+        read_reg(M5PM1_REG_IRQ_STATUS2, &s_boot_power_status.irq_status_power) == ESP_OK &&
+        read_reg(M5PM1_REG_IRQ_STATUS3, &s_boot_power_status.irq_status_button) == ESP_OK &&
+        read_regs(M5PM1_REG_TIMER_COUNT0, timer_data, sizeof(timer_data)) == ESP_OK;
+    if (s_boot_power_status.available) {
+        s_boot_power_status.timer_seconds =
+            (uint32_t)timer_data[0] |
+            ((uint32_t)timer_data[1] << 8) |
+            ((uint32_t)timer_data[2] << 16) |
+            ((uint32_t)(timer_data[3] & 0x7f) << 24);
+        s_boot_power_status.timer_config = timer_data[4];
+        ESP_LOGI(TAG,
+                 "boot power status wake=0x%02x irq_gpio=0x%02x irq_power=0x%02x irq_button=0x%02x timer_cfg=0x%02x timer_seconds=%lu",
+                 s_boot_power_status.wake_source,
+                 s_boot_power_status.irq_status_gpio,
+                 s_boot_power_status.irq_status_power,
+                 s_boot_power_status.irq_status_button,
+                 s_boot_power_status.timer_config,
+                 (unsigned long)s_boot_power_status.timer_seconds);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_WAKE_SRC, 0x00));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(write_reg(M5PM1_REG_TIMER_CONFIG, 0x00));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            write_reg(M5PM1_REG_TIMER_KEY, M5PM1_TIMER_RELOAD_KEY));
+    } else {
+        ESP_LOGW(TAG, "boot power status unavailable");
+    }
 
     uint8_t pwr_cfg = 0;
     uint8_t hold_cfg = 0;
@@ -460,6 +496,11 @@ esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
 }
 
 #endif
+
+vibe_board_boot_power_status_t vibe_board_boot_power_status(void)
+{
+    return s_boot_power_status;
+}
 
 #if VIBE_BOARD_HAS_ES8311
 i2c_master_bus_handle_t vibe_board_i2c_bus(void)
