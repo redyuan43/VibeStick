@@ -140,6 +140,10 @@
 #define DEVICE_PREF_RECORDING_MODE_KEY "rec_mode"
 #define DEVICE_PREF_RECORDING_TRIGGER_KEY "rec_trig"
 #define DEVICE_PREF_RECORDING_INTENT_KEY "rec_intent"
+#define DEEP_SLEEP_NAMESPACE "vibe_sleep"
+#define DEEP_SLEEP_RECORD_KEY "last_entry"
+#define DEEP_SLEEP_RECORD_MAGIC 0x56534c50u
+#define DEEP_SLEEP_RECORD_VERSION 1
 #define BRIDGE_TARGET_NAMESPACE "vibe_bridge"
 #define BRIDGE_TARGET_HOST_KEY "host"
 #define BRIDGE_TARGET_PORT_KEY "port"
@@ -228,6 +232,22 @@ typedef struct {
     char ssid[WIFI_PROFILE_SSID_LEN];
     bridge_discovered_profile_t profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
 } bridge_profile_store_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint32_t entry_count;
+    uint32_t boot_count;
+    uint64_t wake_mask;
+    int64_t uptime_ms;
+    int32_t battery_mv;
+    int16_t battery_percent;
+    uint8_t charging;
+    uint8_t usb_powered;
+    uint8_t recording_trigger;
+    uint8_t reserved;
+} deep_sleep_record_t;
 
 typedef enum {
     VIBE_STICK_EVENT_POLL_STATE,
@@ -385,6 +405,7 @@ static size_t s_wifi_profile_index;
 static int s_wifi_profile_retry_count;
 static unsigned int s_wifi_reconnect_attempt;
 static esp_timer_handle_t s_wifi_reconnect_timer;
+static atomic_bool s_deep_sleep_committed;
 static SemaphoreHandle_t s_bridge_target_lock;
 static SemaphoreHandle_t s_bridge_profiles_lock;
 static SemaphoreHandle_t s_bridge_probe_lock;
@@ -524,6 +545,8 @@ static bool s_battery_full_latched;
 static int s_battery_display_level;
 static int s_battery_raw_level = -1;
 static int s_battery_voltage_mv = -1;
+static deep_sleep_record_t s_last_deep_sleep_record;
+static bool s_last_deep_sleep_record_valid;
 RTC_DATA_ATTR static uint32_t s_retained_battery_magic;
 RTC_DATA_ATTR static int s_retained_battery_display_level = -1;
 RTC_DATA_ATTR static uint32_t s_retained_boot_magic;
@@ -674,6 +697,7 @@ static const lv_point_precise_t s_battery_bolt_points[] = {
 static void render_state(void);
 static void copy_json_string(cJSON *root, const char *key, char *target, size_t target_len);
 static void register_activity(void);
+static bool external_powered(void);
 static void request_wifi_reconnect_now(void);
 static void cycle_bridge_profile(void);
 static bool start_bridge_discovery_task(bool show_searching);
@@ -1149,8 +1173,7 @@ static void update_display_light_sleep_lock(bool display_active)
     if (!s_display_no_light_sleep_lock) {
         return;
     }
-    const bool should_hold =
-        display_active || s_state.battery_charging || s_state.usb_powered;
+    const bool should_hold = display_active || external_powered();
     if (should_hold && !s_display_no_light_sleep_lock_held) {
         if (esp_pm_lock_acquire(s_display_no_light_sleep_lock) == ESP_OK) {
             s_display_no_light_sleep_lock_held = true;
@@ -1260,17 +1283,12 @@ static bool display_should_stay_active(void)
            s_motion_recording_active ||
            s_motion_calibrating ||
            recording_finalize_active();
-#if VIBE_BOARD_HAS_GPIO_BACKLIGHT
     return active_work;
-#else
-    return external_powered() || active_work;
-#endif
 }
 
 static bool deep_sleep_should_stay_awake(void)
 {
-    return external_powered() || display_should_stay_active() ||
-           ota_in_progress();
+    return display_should_stay_active() || ota_in_progress();
 }
 
 static bool front_button_is_pressed(void)
@@ -1458,6 +1476,87 @@ static bool prepare_imu_deep_sleep_wake(uint64_t *wake_mask)
 #endif
 }
 
+static esp_err_t load_deep_sleep_record(void)
+{
+    memset(&s_last_deep_sleep_record, 0, sizeof(s_last_deep_sleep_record));
+    s_last_deep_sleep_record_valid = false;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DEEP_SLEEP_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "open deep sleep record");
+
+    size_t size = sizeof(s_last_deep_sleep_record);
+    err = nvs_get_blob(handle, DEEP_SLEEP_RECORD_KEY,
+                       &s_last_deep_sleep_record, &size);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "read deep sleep record");
+    if (size != sizeof(s_last_deep_sleep_record) ||
+        s_last_deep_sleep_record.magic != DEEP_SLEEP_RECORD_MAGIC ||
+        s_last_deep_sleep_record.version != DEEP_SLEEP_RECORD_VERSION ||
+        s_last_deep_sleep_record.size != sizeof(s_last_deep_sleep_record)) {
+        ESP_LOGW(TAG, "ignored incompatible deep sleep record size=%u",
+                 (unsigned)size);
+        memset(&s_last_deep_sleep_record, 0, sizeof(s_last_deep_sleep_record));
+        return ESP_OK;
+    }
+
+    s_last_deep_sleep_record_valid = true;
+    ESP_LOGI(TAG,
+             "deep sleep record entries=%lu boot=%lu uptime_ms=%lld wake_mask=0x%llx battery=%dmV/%d%% charging=%u usb=%u trigger=%u",
+             (unsigned long)s_last_deep_sleep_record.entry_count,
+             (unsigned long)s_last_deep_sleep_record.boot_count,
+             (long long)s_last_deep_sleep_record.uptime_ms,
+             (unsigned long long)s_last_deep_sleep_record.wake_mask,
+             (int)s_last_deep_sleep_record.battery_mv,
+             (int)s_last_deep_sleep_record.battery_percent,
+             (unsigned)s_last_deep_sleep_record.charging,
+             (unsigned)s_last_deep_sleep_record.usb_powered,
+             (unsigned)s_last_deep_sleep_record.recording_trigger);
+    return ESP_OK;
+}
+
+static esp_err_t save_deep_sleep_record(uint64_t wake_mask)
+{
+    deep_sleep_record_t record = {
+        .magic = DEEP_SLEEP_RECORD_MAGIC,
+        .version = DEEP_SLEEP_RECORD_VERSION,
+        .size = sizeof(deep_sleep_record_t),
+        .entry_count = s_last_deep_sleep_record_valid
+                           ? s_last_deep_sleep_record.entry_count + 1
+                           : 1,
+        .boot_count = s_retained_boot_count,
+        .wake_mask = wake_mask,
+        .uptime_ms = esp_timer_get_time() / 1000,
+        .battery_mv = s_battery_voltage_mv,
+        .battery_percent = s_battery_raw_level,
+        .charging = s_state.battery_charging ? 1 : 0,
+        .usb_powered = s_state.usb_powered ? 1 : 0,
+        .recording_trigger = (uint8_t)s_recording_trigger_mode,
+    };
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DEEP_SLEEP_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "open deep sleep record for write");
+    err = nvs_set_blob(handle, DEEP_SLEEP_RECORD_KEY, &record, sizeof(record));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "commit deep sleep record");
+
+    s_last_deep_sleep_record = record;
+    s_last_deep_sleep_record_valid = true;
+    ESP_LOGI(TAG, "deep sleep entry persisted count=%lu",
+             (unsigned long)record.entry_count);
+    return ESP_OK;
+}
+
 static bool enter_deep_sleep(void)
 {
     uint64_t wake_mask = sleep_button_wake_mask();
@@ -1483,28 +1582,52 @@ static bool enter_deep_sleep(void)
         return false;
     }
 
-    esp_err_t err = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "deep sleep skipped: wake reset failed: %s",
-                 esp_err_to_name(err));
-        return false;
-    }
-    err = esp_sleep_enable_ext0_wakeup(ext0_gpio, 0);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "deep sleep skipped: wake source setup failed: %s",
-                 esp_err_to_name(err));
-        return false;
-    }
     if (!prepare_imu_deep_sleep_wake(&wake_mask)) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
         return false;
     }
 
+    esp_err_t err = save_deep_sleep_record(wake_mask);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: persistent record failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    err = vibe_audio_prepare_deep_sleep();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: audio power-down failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    set_display_rendering_suspended(true);
+    set_backlight(LCD_BACKLIGHT_OFF);
+
     ESP_LOGI(TAG, "entering deep sleep board=%s mode=%s wake_mask=0x%llx",
              VIBE_BOARD_NAME, recording_mode_label(), (unsigned long long)wake_mask);
+    atomic_store(&s_deep_sleep_committed, true);
+    if (s_wifi_reconnect_timer &&
+        esp_timer_is_active(s_wifi_reconnect_timer)) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(s_wifi_reconnect_timer));
+    }
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_stop());
     vTaskDelay(pdMS_TO_TICKS(50));
+    err = vibe_board_prepare_deep_sleep();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "board peripheral power-down incomplete; entering deep sleep: %s",
+                 esp_err_to_name(err));
+    }
+
+    err = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "final wake reset failed; restarting instead of sleeping: %s",
+                 esp_err_to_name(err));
+        esp_restart();
+    }
+    err = esp_sleep_enable_ext0_wakeup(ext0_gpio, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "final wake source setup failed; restarting instead of sleeping: %s",
+                 esp_err_to_name(err));
+        esp_restart();
+    }
     esp_deep_sleep_start();
     return true;
 }
@@ -5569,6 +5692,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             (const wifi_event_sta_disconnected_t *)event_data;
         set_wifi_connected(false);
         s_state.wifi_ip[0] = '\0';
+        if (atomic_load(&s_deep_sleep_committed)) {
+            ESP_LOGI(TAG, "Wi-Fi stopped for deep sleep reason=%d",
+                     disconnected ? disconnected->reason : -1);
+            return;
+        }
         if (s_wifi_profile_count > 1) {
             s_wifi_profile_retry_count++;
             if (s_wifi_profile_retry_count >= WIFI_PROFILE_RETRY_LIMIT) {
@@ -6300,6 +6428,7 @@ void app_main(void)
     } else {
         ESP_ERROR_CHECK(nvs);
     }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(load_deep_sleep_record());
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_init_power());
     s_boot_power_status = vibe_board_boot_power_status();

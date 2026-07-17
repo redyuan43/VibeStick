@@ -73,6 +73,7 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 #define AXP192_REG_VBUS_VOLTAGE 0x5a
 #define AXP192_REG_BAT_VOLTAGE 0x78
 #define AXP192_OUTPUT_CTRL_LDO2 BIT(2)
+#define AXP192_OUTPUT_CTRL_LDO3 BIT(3)
 #define AXP192_INPUT_STATUS_VBUS_PRESENT BIT(5)
 #define AXP192_INPUT_STATUS_VBUS_VALID BIT(4)
 
@@ -378,6 +379,18 @@ esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
     return ESP_OK;
 }
 
+esp_err_t vibe_board_prepare_deep_sleep(void)
+{
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    ESP_RETURN_ON_ERROR(vibe_board_speaker_set_enabled(false),
+                        TAG, "disable speaker");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_OUT,
+                                   M5PM1_GPIO2_L3B_POWER_EN, 0),
+                        TAG, "disable L3B peripherals");
+    ESP_LOGI(TAG, "deep sleep power rails off: L3B");
+    return ESP_OK;
+}
+
 #else
 
 static uint16_t read_12bit_adc(uint8_t reg)
@@ -507,6 +520,19 @@ esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
                                   (reg & 0x0f) | ((uint8_t)encoded << 4)),
                         TAG, "write ldo23");
     return update_reg(AXP192_REG_OUTPUT_CTRL, 0, AXP192_OUTPUT_CTRL_LDO2);
+}
+
+esp_err_t vibe_board_prepare_deep_sleep(void)
+{
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    ESP_RETURN_ON_ERROR(
+        update_reg(AXP192_REG_OUTPUT_CTRL,
+                   AXP192_OUTPUT_CTRL_LDO2 | AXP192_OUTPUT_CTRL_LDO3, 0),
+        TAG, "disable LCD rails");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_GPIO0_CTRL, 0x07),
+                        TAG, "disable microphone rail");
+    ESP_LOGI(TAG, "deep sleep power rails off: LCD LDO2/LDO3 and microphone LDOio0");
+    return ESP_OK;
 }
 
 #endif

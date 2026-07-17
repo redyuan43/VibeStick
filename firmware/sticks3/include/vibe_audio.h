@@ -30,6 +30,7 @@ typedef struct {
 } vibe_audio_stats_t;
 
 esp_err_t vibe_audio_init(void);
+esp_err_t vibe_audio_prepare_deep_sleep(void);
 esp_err_t vibe_audio_start(void);
 esp_err_t vibe_audio_stop(void);
 esp_err_t vibe_audio_play_sound(agent_sound_t sound);

@@ -545,15 +545,17 @@ def test_idle_backlight_has_dim_and_off_states() -> None:
     assert "#define VIBE_BOARD_LCD_BACKLIGHT_IDLE 45" in board_profile
 
 
-def test_plus_usb_power_keeps_display_active_and_blocks_deep_sleep() -> None:
+def test_external_power_allows_idle_display_off_and_deep_sleep() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 
     assert "static bool external_powered(void)" in source
     assert "return s_state.battery_charging || s_state.usb_powered;" in source
     display_guard = source.split("static bool display_should_stay_active(void)", 1)[1]
     display_guard = display_guard.split("static bool deep_sleep_should_stay_awake", 1)[0]
-    assert "#if VIBE_BOARD_HAS_GPIO_BACKLIGHT" in display_guard
-    assert "return external_powered() || active_work;" in display_guard
+    assert "return active_work;" in display_guard
+    sleep_guard = source.split("static bool deep_sleep_should_stay_awake(void)", 1)[1]
+    sleep_guard = sleep_guard.split("static bool front_button_is_pressed", 1)[0]
+    assert "external_powered()" not in sleep_guard
     assert "deep_sleep_should_stay_awake() ||" in source
 
 
@@ -632,7 +634,7 @@ def test_ota_check_blocks_sleep_without_waking_display() -> None:
 
     assert "ota_in_progress()" not in display_guard
     assert "static bool deep_sleep_should_stay_awake(void)" in source
-    assert "external_powered() || display_should_stay_active()" in source
+    assert "return display_should_stay_active() || ota_in_progress();" in source
     assert "ota_in_progress();" in source
     assert "deep_sleep_should_stay_awake() ||" in source
 
@@ -703,6 +705,8 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     assert "sleep_wake_gpio_is_active(ext0_gpio)" in source
     assert "vibe_motion_prepare_deep_sleep()" in source
     assert "vibe_motion_prepare_deep_sleep_wake()" in source
+    assert "vibe_audio_prepare_deep_sleep()" in source
+    assert "vibe_board_prepare_deep_sleep()" in source
     assert "esp_err_t vibe_motion_prepare_deep_sleep(void);" in motion_header
     assert "write_reg(MPU6886_INT_ENABLE, 0)" in motion_source
     assert "write_reg(MPU6886_PWR_MGMT_2, MPU6886_AXIS_STANDBY_MASK)" in motion_source
@@ -838,6 +842,17 @@ def test_deep_sleep_validates_wake_gpio_before_wifi_shutdown() -> None:
 
     assert sleep.index("sleep_wake_gpio_is_active(ext0_gpio)") < sleep.index("esp_wifi_stop()")
     assert "ext0_gpio = VIBE_BOARD_PIN_IMU_INT;" not in sleep
+    assert sleep.index("esp_wifi_stop()") < sleep.index(
+        "esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL)"
+    )
+    assert sleep.index("esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL)") < sleep.index(
+        "esp_sleep_enable_ext0_wakeup(ext0_gpio, 0)"
+    )
+    assert sleep.index("esp_sleep_enable_ext0_wakeup(ext0_gpio, 0)") < sleep.index(
+        "esp_deep_sleep_start()"
+    )
+    assert "atomic_store(&s_deep_sleep_committed, true)" in sleep
+    assert "esp_timer_stop(s_wifi_reconnect_timer)" in sleep
 
 
 def test_deep_sleep_retry_uses_delayed_backoff_after_active_wake_gpio() -> None:
@@ -912,6 +927,30 @@ def test_boot_diagnostics_survive_sleep_and_are_reported_to_bridge() -> None:
     wake_clear = board_source.index("write_reg(M5PM1_REG_WAKE_SRC, 0x00)")
     assert irq_restore < wake_clear
     assert "rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_FRONT)" in source
+    assert "DEEP_SLEEP_NAMESPACE" in source
+    assert "nvs_set_blob(handle, DEEP_SLEEP_RECORD_KEY" in source
+    assert "nvs_commit(handle)" in source
+    assert "deep sleep entry persisted count=%lu" in source
+    assert "deep sleep record entries=%lu" in source
+
+
+def test_board_power_rails_are_disabled_before_deep_sleep() -> None:
+    board_source = BOARD_C.read_text(encoding="utf-8")
+    board_header = BOARD_H.read_text(encoding="utf-8")
+    audio_source = (ROOT / "firmware/sticks3/src/vibe_audio.c").read_text(
+        encoding="utf-8"
+    )
+    audio_header = (ROOT / "firmware/sticks3/include/vibe_audio.h").read_text(
+        encoding="utf-8"
+    )
+
+    assert "esp_err_t vibe_board_prepare_deep_sleep(void);" in board_header
+    assert "M5PM1_GPIO2_L3B_POWER_EN, 0" in board_source
+    assert "AXP192_OUTPUT_CTRL_LDO2 | AXP192_OUTPUT_CTRL_LDO3" in board_source
+    assert "write_reg(AXP192_REG_GPIO0_CTRL, 0x07)" in board_source
+    assert "esp_err_t vibe_audio_prepare_deep_sleep(void);" in audio_header
+    assert "release_session_resources();" in audio_source
+    assert "audio peripherals prepared for deep sleep" in audio_source
 
 
 def test_side_button_gpio_keeps_power_save_enabled() -> None:
@@ -1019,7 +1058,7 @@ def test_s3_blocks_automatic_light_sleep_while_the_display_is_active() -> None:
     assert "automatic light sleep blocked while display is active" in power_init
 
 
-def test_external_power_keeps_serial_awake_without_forcing_the_screen_on() -> None:
+def test_external_power_allows_deep_sleep_but_keeps_s3_serial_monitorable() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     display_guard = source.split("static bool display_should_stay_active(void)", 1)[1]
     display_guard = display_guard.split("static bool deep_sleep_should_stay_awake", 1)[0]
@@ -1030,14 +1069,9 @@ def test_external_power_keeps_serial_awake_without_forcing_the_screen_on() -> No
     power_refresh = source.split("static void refresh_power_status", 1)[1]
     power_refresh = power_refresh.split("static void maybe_refresh_power_status", 1)[0]
 
-    assert (
-        "#if VIBE_BOARD_HAS_GPIO_BACKLIGHT\n"
-        "    return active_work;\n"
-        "#else\n"
-        "    return external_powered() || active_work;"
-    ) in display_guard
-    assert "external_powered()" in sleep_guard
-    assert "s_state.battery_charging || s_state.usb_powered" in lock_policy
+    assert "return active_work;" in display_guard
+    assert "external_powered()" not in sleep_guard
+    assert "display_active || external_powered()" in lock_policy
     assert "update_display_light_sleep_lock(" in power_refresh
     removed = power_refresh.split(
         "was_external_powered && !external_powered()", 1
@@ -1061,8 +1095,8 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.32"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.24"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.34"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.26"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher

@@ -636,6 +636,30 @@ esp_err_t vibe_audio_init(void)
     return ESP_OK;
 }
 
+esp_err_t vibe_audio_prepare_deep_sleep(void)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "not initialized");
+    ESP_RETURN_ON_FALSE(!vibe_audio_is_recording(), ESP_ERR_INVALID_STATE,
+                        TAG, "recording active");
+    ESP_RETURN_ON_FALSE(s_audio_mutex != NULL, ESP_ERR_INVALID_STATE,
+                        TAG, "audio mutex missing");
+    ESP_RETURN_ON_FALSE(
+        xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(250)) == pdTRUE,
+        ESP_ERR_TIMEOUT, TAG, "audio busy");
+
+    release_session_resources();
+#if VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+    esp_err_t err = mute_tone_output();
+#else
+    esp_err_t err = vibe_board_speaker_set_enabled(false);
+#endif
+    xSemaphoreGive(s_audio_mutex);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "audio peripherals prepared for deep sleep");
+    }
+    return err;
+}
+
 esp_err_t vibe_audio_start(void)
 {
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "not initialized");
