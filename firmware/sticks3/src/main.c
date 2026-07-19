@@ -1636,7 +1636,7 @@ static bool sleep_wake_gpio_is_active(gpio_num_t gpio)
     return gpio != GPIO_NUM_NC && gpio_get_level(gpio) == 0;
 }
 
-#if VIBE_BOARD_HAS_MPU6886 && VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
 static bool wait_for_motion_wake_idle(void)
 {
     const int64_t started_ms = esp_timer_get_time() / 1000;
@@ -1862,7 +1862,7 @@ static bool enter_deep_sleep(void)
     if (!prepare_imu_deep_sleep_wake(&wake_mask)) {
         return false;
     }
-#if VIBE_BOARD_HAS_MPU6886 && VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
     if (!wait_for_motion_wake_idle()) {
         cancel_imu_deep_sleep_wake();
         return false;
