@@ -1463,8 +1463,6 @@ static bool deep_sleep_should_stay_awake(void)
     return display_should_stay_active() ||
            external_power_blocks_deep_sleep() ||
            s_motion_start_pending ||
-           (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
-            vibe_motion_is_lifted()) ||
            ota_in_progress();
 }
 

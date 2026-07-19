@@ -562,6 +562,7 @@ def test_external_power_allows_idle_display_off_and_s3_deep_sleep() -> None:
     sleep_guard = source.split("static bool deep_sleep_should_stay_awake(void)", 1)[1]
     sleep_guard = sleep_guard.split("static bool front_button_is_pressed", 1)[0]
     assert "external_power_blocks_deep_sleep() ||" in sleep_guard
+    assert "vibe_motion_is_lifted()" not in sleep_guard
     assert "deep_sleep_should_stay_awake() ||" in source
 
 
@@ -1247,7 +1248,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.40"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.41"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.34"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
