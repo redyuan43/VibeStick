@@ -708,8 +708,16 @@ def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 
     assert "s_motion_start_pending" in source
+    assert "s_motion_wake_network_pending" in source
+    assert "VIBE_STICK_MOTION_WAKE_NETWORK_TIMEOUT_MS 15000" in source
     assert "request_motion_recording_start()" in source
     assert "motion lift start deferred while recording network is busy" in source
+    assert "motion lift waiting up to %dms for Wi-Fi" in source
+    assert "motion lift Wi-Fi ready; starting recording" in source
+    assert "motion lift cancelled: Wi-Fi did not connect within %dms" in source
+    assert "motion lift Wi-Fi wait cancelled by flat posture" in source
+    assert 'show_recording_overlay("CONNECTING", "", true);' in source
+    assert "request_wifi_reconnect_now();" in source
     assert "motion lift start deferred request cancelled by flat posture" in source
     assert "queue_event(VIBE_STICK_EVENT_MOTION_START)" in source
 
@@ -718,6 +726,7 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     motion_source = (ROOT / "firmware/sticks3/src/vibe_motion.c").read_text(encoding="utf-8")
     motion_header = (ROOT / "firmware/sticks3/include/vibe_motion.h").read_text(encoding="utf-8")
+    board_source = BOARD_C.read_text(encoding="utf-8")
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
     plus_profile = board_profile.split("#else", 1)[0]
 
@@ -740,6 +749,38 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     assert "write_reg(MPU6886_PWR_MGMT_2, MPU6886_AXIS_STANDBY_MASK)" in motion_source
     assert "write_reg(MPU6886_PWR_MGMT_1, MPU6886_SLEEP_MODE)" in motion_source
     assert "read_regs(MPU6886_INT_STATUS, &reg, 1)" in motion_source
+    assert "mpu6886 active-low push-pull pulse int" in motion_source
+    assert "VIBE_STICK_MOTION_WAKE_QUIET_MS 5000" in source
+    assert "VIBE_STICK_MOTION_WAKE_SETTLE_TIMEOUT_MS 15000" in source
+    assert "static bool wait_for_motion_wake_idle(void)" in source
+    assert "vibe_motion_clear_wake_status()" in source
+    assert "if (!wait_for_motion_wake_idle())" in source
+    assert "static esp_err_t configure_motion_wake_gpio_input(void)" in source
+    assert ".pin_bit_mask = 1ULL << VIBE_BOARD_PIN_MOTION_WAKE" in source
+    assert ".mode = GPIO_MODE_INPUT" in source
+    assert "motion wake gpio input enabled gpio=%d level=%d" in source
+    assert "AXP192 IRQ before motion wake=" in board_source
+    assert "shared SYS_INT cleared for MPU6886 wake" in board_source
+    assert "#define BM8563_ADDR 0x51" in board_source
+    assert "BM8563_REG_CONTROL_STATUS2" in board_source
+    assert "i2c_master_bus_add_device(s_i2c_bus, &rtc_config, &s_rtc_dev)" in board_source
+    assert "clear bm8563 irq" in board_source
+    for irq_register in (
+        "AXP192_REG_IRQ_ENABLE1",
+        "AXP192_REG_IRQ_ENABLE2",
+        "AXP192_REG_IRQ_ENABLE3",
+        "AXP192_REG_IRQ_ENABLE4",
+        "AXP192_REG_IRQ_ENABLE5",
+    ):
+        assert f"write_reg({irq_register}, 0x00)" in board_source
+    for irq_register in (
+        "AXP192_REG_IRQ_STATUS1",
+        "AXP192_REG_IRQ_STATUS2",
+        "AXP192_REG_IRQ_STATUS3",
+        "AXP192_REG_IRQ_STATUS4",
+        "AXP192_REG_IRQ_STATUS5",
+    ):
+        assert f"write_reg({irq_register}, 0xff)" in board_source
     assert "#define VIBE_BOARD_PIN_IMU_INT GPIO_NUM_35" in board_profile
     assert "#define VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE 1" in plus_profile
     assert "#define VIBE_BOARD_PIN_MOTION_WAKE GPIO_NUM_35" in plus_profile
@@ -1208,8 +1249,8 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.37"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.29"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.38"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.34"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher

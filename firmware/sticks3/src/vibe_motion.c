@@ -588,8 +588,9 @@ esp_err_t vibe_motion_prepare_deep_sleep_wake(void)
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_CONFIG2, 0x21), TAG, "mpu6886 wake dlpf");
 
     ESP_RETURN_ON_ERROR(read_regs(MPU6886_INT_PIN_CFG, &reg, 1), TAG, "read mpu6886 int pin");
-    reg = (reg | 0x80) & (uint8_t)~0x20;
-    ESP_RETURN_ON_ERROR(write_reg(MPU6886_INT_PIN_CFG, reg), TAG, "mpu6886 active-low int");
+    reg = (reg | 0x80) & (uint8_t)~0x60;
+    ESP_RETURN_ON_ERROR(write_reg(MPU6886_INT_PIN_CFG, reg),
+                        TAG, "mpu6886 active-low push-pull pulse int");
 
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_INT_ENABLE, 0xe0), TAG, "mpu6886 wake int enable");
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_ACCEL_WOM_X_THR, MPU6886_WAKE_THRESHOLD_LSB), TAG, "mpu6886 wom x");

@@ -14,6 +14,9 @@
 static const char *TAG = "vibe_board";
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_pmic_dev;
+#if !VIBE_BOARD_HAS_ES8311
+static i2c_master_dev_handle_t s_rtc_dev;
+#endif
 static vibe_board_boot_power_status_t s_boot_power_status;
 
 #if VIBE_BOARD_HAS_ES8311
@@ -68,12 +71,25 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 #define AXP192_REG_BACKUP_CHARGE_CTRL 0x35
 #define AXP192_REG_PEK 0x36
 #define AXP192_REG_TEMP_PROTECT 0x39
+#define AXP192_REG_IRQ_ENABLE1 0x40
+#define AXP192_REG_IRQ_ENABLE2 0x41
+#define AXP192_REG_IRQ_ENABLE3 0x42
+#define AXP192_REG_IRQ_ENABLE4 0x43
+#define AXP192_REG_IRQ_STATUS1 0x44
+#define AXP192_REG_IRQ_STATUS2 0x45
+#define AXP192_REG_IRQ_STATUS3 0x46
+#define AXP192_REG_IRQ_STATUS4 0x47
+#define AXP192_REG_IRQ_ENABLE5 0x4a
+#define AXP192_REG_IRQ_STATUS5 0x4d
 #define AXP192_REG_ADC_ENABLE1 0x82
 #define AXP192_REG_GPIO0_CTRL 0x90
 #define AXP192_REG_GPIO0_LDO_VOLT 0x91
 #define AXP192_REG_LDO23_VOLT 0x28
 #define AXP192_REG_VBUS_VOLTAGE 0x5a
 #define AXP192_REG_BAT_VOLTAGE 0x78
+#define BM8563_ADDR 0x51
+#define BM8563_REG_CONTROL_STATUS1 0x00
+#define BM8563_REG_CONTROL_STATUS2 0x01
 #define AXP192_OUTPUT_CTRL_LDO2 BIT(2)
 #define AXP192_OUTPUT_CTRL_LDO3 BIT(3)
 #define AXP192_INPUT_STATUS_VBUS_PRESENT BIT(5)
@@ -112,6 +128,9 @@ static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, ui
         i2c_del_master_bus(s_i2c_bus);
         s_i2c_bus = NULL;
         s_pmic_dev = NULL;
+#if !VIBE_BOARD_HAS_ES8311
+        s_rtc_dev = NULL;
+#endif
     }
 
     i2c_master_bus_config_t bus_config = {
@@ -467,6 +486,14 @@ static esp_err_t init_i2c(void)
     uint8_t status = 0;
     ESP_RETURN_ON_ERROR(read_reg(AXP192_REG_INPUT_STATUS, &status), TAG, "read axp192");
     ESP_LOGI(TAG, "AXP192 found input_status=0x%02x", status);
+
+    i2c_device_config_t rtc_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BM8563_ADDR,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_i2c_bus, &rtc_config, &s_rtc_dev),
+                        TAG, "add bm8563");
     return ESP_OK;
 }
 
@@ -579,6 +606,58 @@ esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
 
 esp_err_t vibe_board_prepare_motion_wake(void)
 {
+    /*
+     * GPIO35 is the shared active-low SYS_INT line for the MPU6886 and
+     * AXP192. Leave only the IMU able to pull it low while asleep.
+     */
+    uint8_t axp_irq[5] = {0};
+    ESP_ERROR_CHECK_WITHOUT_ABORT(read_reg(AXP192_REG_IRQ_STATUS1, &axp_irq[0]));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(read_reg(AXP192_REG_IRQ_STATUS2, &axp_irq[1]));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(read_reg(AXP192_REG_IRQ_STATUS3, &axp_irq[2]));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(read_reg(AXP192_REG_IRQ_STATUS4, &axp_irq[3]));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(read_reg(AXP192_REG_IRQ_STATUS5, &axp_irq[4]));
+    ESP_LOGI(TAG, "AXP192 IRQ before motion wake=%02x/%02x/%02x/%02x/%02x",
+             axp_irq[0], axp_irq[1], axp_irq[2], axp_irq[3], axp_irq[4]);
+
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_ENABLE1, 0x00),
+                        TAG, "disable axp192 irq1");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_ENABLE2, 0x00),
+                        TAG, "disable axp192 irq2");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_ENABLE3, 0x00),
+                        TAG, "disable axp192 irq3");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_ENABLE4, 0x00),
+                        TAG, "disable axp192 irq4");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_ENABLE5, 0x00),
+                        TAG, "disable axp192 irq5");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_STATUS1, 0xff),
+                        TAG, "clear axp192 irq1");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_STATUS2, 0xff),
+                        TAG, "clear axp192 irq2");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_STATUS3, 0xff),
+                        TAG, "clear axp192 irq3");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_STATUS4, 0xff),
+                        TAG, "clear axp192 irq4");
+    ESP_RETURN_ON_ERROR(write_reg(AXP192_REG_IRQ_STATUS5, 0xff),
+                        TAG, "clear axp192 irq5");
+
+    ESP_RETURN_ON_FALSE(s_rtc_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "bm8563 missing");
+    uint8_t rtc_status2 = 0;
+    const uint8_t rtc_status2_reg = BM8563_REG_CONTROL_STATUS2;
+    ESP_RETURN_ON_ERROR(
+        i2c_master_transmit_receive(s_rtc_dev, &rtc_status2_reg, 1,
+                                    &rtc_status2, 1, 100),
+        TAG, "read bm8563 status2");
+    const uint8_t rtc_reset[] = {
+        BM8563_REG_CONTROL_STATUS1,
+        0x00,
+        0x00,
+    };
+    ESP_RETURN_ON_ERROR(
+        i2c_master_transmit(s_rtc_dev, rtc_reset, sizeof(rtc_reset), 100),
+        TAG, "clear bm8563 irq");
+    ESP_LOGI(TAG,
+             "shared SYS_INT cleared for MPU6886 wake axp=disabled rtc_status2=0x%02x",
+             rtc_status2);
     return ESP_OK;
 }
 

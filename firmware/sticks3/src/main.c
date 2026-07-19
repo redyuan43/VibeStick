@@ -96,6 +96,9 @@
 #define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_DEEP_SLEEP_MS 300000
 #define VIBE_STICK_DEEP_SLEEP_RETRY_MS 5000
+#define VIBE_STICK_MOTION_WAKE_QUIET_MS 5000
+#define VIBE_STICK_MOTION_WAKE_SETTLE_TIMEOUT_MS 15000
+#define VIBE_STICK_MOTION_WAKE_NETWORK_TIMEOUT_MS 15000
 #define VIBE_STICK_POWER_STATUS_POLL_MS 2000
 #define VIBE_STICK_BATTERY_SAMPLE_COUNT 5
 #define VIBE_STICK_BATTERY_FULL_LATCH_PERCENT 99
@@ -465,6 +468,8 @@ static bool s_motion_lift_armed;
 static bool s_motion_start_pending;
 static bool s_motion_wake_confirm_pending;
 static int64_t s_motion_wake_confirm_deadline_ms;
+static bool s_motion_wake_network_pending;
+static int64_t s_motion_wake_network_deadline_ms;
 static int64_t s_motion_false_wake_sleep_deadline_ms;
 static bool s_tap_recording_active;
 static char s_last_alert_event_id[56];
@@ -736,6 +741,7 @@ static void maybe_enter_deep_sleep(int64_t now_ms);
 static void build_bridge_url(const char *path_or_url, char *url, size_t url_len);
 static void clear_ptt_followup_enter_window(void);
 static bool start_ptt_followup_key_dispatch(const char *event_name, agent_sound_t sound);
+static void show_recording_overlay(const char *title, const char *hint, bool visible);
 
 static bool queue_event(agent_event_type_t type)
 {
@@ -920,6 +926,8 @@ static void reset_recording_trigger_runtime_state(void)
     s_motion_start_pending = false;
     s_motion_wake_confirm_pending = false;
     s_motion_wake_confirm_deadline_ms = 0;
+    s_motion_wake_network_pending = false;
+    s_motion_wake_network_deadline_ms = 0;
     s_motion_false_wake_sleep_deadline_ms = 0;
 }
 
@@ -1026,6 +1034,8 @@ static esp_err_t begin_motion_calibration(const char *reason)
     s_motion_start_pending = false;
     s_motion_wake_confirm_pending = false;
     s_motion_wake_confirm_deadline_ms = 0;
+    s_motion_wake_network_pending = false;
+    s_motion_wake_network_deadline_ms = 0;
     s_motion_false_wake_sleep_deadline_ms = 0;
     ESP_LOGI(TAG, "%s motion calibration started previous=%d",
              reason, s_motion_calibration_had_previous ? 1 : 0);
@@ -1438,6 +1448,7 @@ static bool display_should_stay_active(void)
            s_motion_recording_active ||
            s_motion_calibrating ||
            s_motion_wake_confirm_pending ||
+           s_motion_wake_network_pending ||
            recording_finalize_active();
     return active_work;
 }
@@ -1594,6 +1605,26 @@ static void request_motion_recording_start(void)
         s_motion_lift_armed = false;
         return;
     }
+    if (!wifi_connected()) {
+        if (!s_motion_wake_network_pending) {
+            s_motion_wake_network_pending = true;
+            s_motion_wake_network_deadline_ms =
+                esp_timer_get_time() / 1000 +
+                VIBE_STICK_MOTION_WAKE_NETWORK_TIMEOUT_MS;
+            ESP_LOGI(TAG, "motion lift waiting up to %dms for Wi-Fi",
+                     VIBE_STICK_MOTION_WAKE_NETWORK_TIMEOUT_MS);
+            show_recording_overlay("CONNECTING", "", true);
+            request_wifi_reconnect_now();
+        }
+        s_motion_start_pending = true;
+        s_motion_lift_armed = false;
+        return;
+    }
+    if (s_motion_wake_network_pending) {
+        s_motion_wake_network_pending = false;
+        s_motion_wake_network_deadline_ms = 0;
+        ESP_LOGI(TAG, "motion lift Wi-Fi ready; starting recording");
+    }
     if (queue_event(VIBE_STICK_EVENT_MOTION_START)) {
         s_motion_start_pending = false;
         s_motion_lift_armed = false;
@@ -1609,10 +1640,57 @@ static bool sleep_wake_gpio_is_active(gpio_num_t gpio)
     return gpio != GPIO_NUM_NC && gpio_get_level(gpio) == 0;
 }
 
+#if VIBE_BOARD_HAS_MPU6886 && VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+static bool wait_for_motion_wake_idle(void)
+{
+    const int64_t started_ms = esp_timer_get_time() / 1000;
+    int64_t quiet_since_ms = 0;
+    ESP_LOGI(TAG, "motion wake settle start gpio=%d level=%d",
+             (int)VIBE_BOARD_PIN_MOTION_WAKE,
+             gpio_get_level(VIBE_BOARD_PIN_MOTION_WAKE));
+
+    while ((esp_timer_get_time() / 1000) - started_ms <
+           VIBE_STICK_MOTION_WAKE_SETTLE_TIMEOUT_MS) {
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        const bool active =
+            sleep_wake_gpio_is_active(VIBE_BOARD_PIN_MOTION_WAKE);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_motion_clear_wake_status());
+        if (active) {
+            quiet_since_ms = 0;
+        } else if (quiet_since_ms == 0) {
+            quiet_since_ms = now_ms;
+        } else if (now_ms - quiet_since_ms >= VIBE_STICK_MOTION_WAKE_QUIET_MS) {
+            ESP_LOGI(TAG, "motion wake gpio idle for %dms",
+                     VIBE_STICK_MOTION_WAKE_QUIET_MS);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    ESP_LOGW(TAG, "motion wake gpio did not settle within %dms",
+             VIBE_STICK_MOTION_WAKE_SETTLE_TIMEOUT_MS);
+    return false;
+}
+#endif
+
 static uint64_t sleep_button_wake_mask(void)
 {
     return 1ULL << VIBE_BOARD_PIN_BUTTON_FRONT;
 }
+
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+static esp_err_t configure_motion_wake_gpio_input(void)
+{
+    gpio_config_t config = {
+        .pin_bit_mask = 1ULL << VIBE_BOARD_PIN_MOTION_WAKE,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&config);
+}
+#endif
 
 #if !defined(CONFIG_IDF_TARGET_ESP32)
 static esp_err_t configure_deep_sleep_button_pullups(uint64_t wake_mask)
@@ -1659,6 +1737,17 @@ static bool prepare_imu_deep_sleep_wake(uint64_t *wake_mask)
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_motion_resume());
         return false;
     }
+    err = configure_motion_wake_gpio_input();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: motion wake gpio input failed: %s",
+                 esp_err_to_name(err));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_cancel_motion_wake());
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_motion_resume());
+        return false;
+    }
+    ESP_LOGI(TAG, "motion wake gpio input enabled gpio=%d level=%d",
+             (int)VIBE_BOARD_PIN_MOTION_WAKE,
+             gpio_get_level(VIBE_BOARD_PIN_MOTION_WAKE));
     *wake_mask |= 1ULL << VIBE_BOARD_PIN_MOTION_WAKE;
     return true;
 #else
@@ -1777,6 +1866,12 @@ static bool enter_deep_sleep(void)
     if (!prepare_imu_deep_sleep_wake(&wake_mask)) {
         return false;
     }
+#if VIBE_BOARD_HAS_MPU6886 && VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    if (!wait_for_motion_wake_idle()) {
+        cancel_imu_deep_sleep_wake();
+        return false;
+    }
+#endif
 #if !defined(CONFIG_IDF_TARGET_ESP32)
     esp_err_t pull_err = configure_deep_sleep_button_pullups(wake_mask);
     if (pull_err != ESP_OK) {
@@ -6388,6 +6483,8 @@ static void capture_deep_sleep_motion_intent(void)
         esp_timer_get_time() / 1000 + VIBE_STICK_MOTION_WAKE_CONFIRM_MS;
     s_motion_lift_armed = false;
     s_motion_start_pending = false;
+    s_motion_wake_network_pending = false;
+    s_motion_wake_network_deadline_ms = 0;
     ESP_LOGI(TAG, "motion deep-sleep wake pending %dms posture confirmation",
              VIBE_STICK_MOTION_WAKE_CONFIRM_MS);
 #endif
@@ -6534,6 +6631,18 @@ static void app_task(void *arg)
             s_last_ota_check_ms = now_ms;
             queue_event(VIBE_STICK_EVENT_OTA_CHECK);
         }
+        if (s_motion_wake_network_pending &&
+            now_ms >= s_motion_wake_network_deadline_ms) {
+            ESP_LOGW(TAG, "motion lift cancelled: Wi-Fi did not connect within %dms",
+                     VIBE_STICK_MOTION_WAKE_NETWORK_TIMEOUT_MS);
+            s_motion_wake_network_pending = false;
+            s_motion_wake_network_deadline_ms = 0;
+            s_motion_start_pending = false;
+            s_motion_lift_armed = true;
+            show_recording_overlay("CONNECT FAILED", "", true);
+            vTaskDelay(pdMS_TO_TICKS(700));
+            show_recording_overlay(NULL, NULL, false);
+        }
         if (vibe_motion_available() &&
             s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK) {
             vibe_motion_event_t motion_event = vibe_motion_poll(now_ms);
@@ -6571,6 +6680,12 @@ static void app_task(void *arg)
                 if (s_motion_start_pending) {
                     ESP_LOGI(TAG, "motion lift start deferred request cancelled by flat posture");
                     s_motion_start_pending = false;
+                }
+                if (s_motion_wake_network_pending) {
+                    ESP_LOGI(TAG, "motion lift Wi-Fi wait cancelled by flat posture");
+                    s_motion_wake_network_pending = false;
+                    s_motion_wake_network_deadline_ms = 0;
+                    show_recording_overlay(NULL, NULL, false);
                 }
                 if (s_motion_recording_active) {
                     (void)queue_event(VIBE_STICK_EVENT_MOTION_STOP);
