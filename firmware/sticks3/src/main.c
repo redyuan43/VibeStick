@@ -96,6 +96,7 @@
 #define VIBE_STICK_IDLE_OFF_MS 60000
 #define VIBE_STICK_DEEP_SLEEP_MS 300000
 #define VIBE_STICK_DEEP_SLEEP_RETRY_MS 5000
+#define VIBE_STICK_DEEP_SLEEP_DIAGNOSTIC_REPORT_MS 30000
 #define VIBE_STICK_MOTION_WAKE_QUIET_MS 5000
 #define VIBE_STICK_MOTION_WAKE_SETTLE_TIMEOUT_MS 15000
 #define VIBE_STICK_MOTION_WAKE_NETWORK_TIMEOUT_MS 15000
@@ -496,6 +497,8 @@ static int64_t s_last_activity_ms;
 static int64_t s_last_backlight_fade_ms;
 static int64_t s_last_power_status_poll_ms;
 static int64_t s_next_deep_sleep_attempt_ms;
+static int64_t s_last_deep_sleep_diagnostic_report_ms;
+static const char *s_deep_sleep_block_reason = "boot";
 static uint8_t s_current_backlight = LCD_BACKLIGHT_DEFAULT;
 static display_power_state_t s_display_power_state = DISPLAY_POWER_ACTIVE;
 static recording_upload_stats_t s_recording_upload_stats;
@@ -742,6 +745,7 @@ static void build_bridge_url(const char *path_or_url, char *url, size_t url_len)
 static void clear_ptt_followup_enter_window(void);
 static bool start_ptt_followup_key_dispatch(const char *event_name, agent_sound_t sound);
 static void show_recording_overlay(const char *title, const char *hint, bool visible);
+static void post_deep_sleep_diagnostic(const char *reason);
 
 static bool queue_event(agent_event_type_t type)
 {
@@ -1853,16 +1857,19 @@ static bool enter_deep_sleep(void)
     uint64_t wake_mask = sleep_button_wake_mask();
     gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;
     if (sleep_wake_gpio_is_active(ext0_gpio)) {
+        s_deep_sleep_block_reason = "front_gpio_low";
         ESP_LOGW(TAG, "deep sleep skipped: ext0 wake gpio=%d is already active",
                  (int)ext0_gpio);
         return false;
     }
 
     if (!prepare_imu_deep_sleep_wake(&wake_mask)) {
+        s_deep_sleep_block_reason = "imu_prepare";
         return false;
     }
 #if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
     if (!wait_for_motion_wake_idle()) {
+        s_deep_sleep_block_reason = "motion_gpio_unsettled";
         cancel_imu_deep_sleep_wake();
         return false;
     }
@@ -1870,6 +1877,7 @@ static bool enter_deep_sleep(void)
 #if !defined(CONFIG_IDF_TARGET_ESP32)
     esp_err_t pull_err = configure_deep_sleep_button_pullups(wake_mask);
     if (pull_err != ESP_OK) {
+        s_deep_sleep_block_reason = "wake_pullup";
         ESP_LOGW(TAG, "deep sleep skipped: wake pull-up setup failed: %s",
                  esp_err_to_name(pull_err));
         cancel_imu_deep_sleep_wake();
@@ -1883,6 +1891,7 @@ static bool enter_deep_sleep(void)
         VIBE_BOARD_PIN_MOTION_WAKE != GPIO_NUM_NC;
     if (motion_wake_enabled &&
         sleep_wake_gpio_is_active(VIBE_BOARD_PIN_MOTION_WAKE)) {
+        s_deep_sleep_block_reason = "motion_gpio_low";
         ESP_LOGW(TAG, "deep sleep skipped: motion wake gpio=%d is already active",
                  (int)VIBE_BOARD_PIN_MOTION_WAKE);
         cancel_imu_deep_sleep_wake();
@@ -1894,6 +1903,7 @@ static bool enter_deep_sleep(void)
 
     esp_err_t err = save_deep_sleep_record(wake_mask);
     if (err != ESP_OK) {
+        s_deep_sleep_block_reason = "nvs_record";
         ESP_LOGW(TAG, "deep sleep skipped: persistent record failed: %s",
                  esp_err_to_name(err));
         cancel_imu_deep_sleep_wake();
@@ -1901,6 +1911,7 @@ static bool enter_deep_sleep(void)
     }
     err = vibe_audio_prepare_deep_sleep();
     if (err != ESP_OK) {
+        s_deep_sleep_block_reason = "audio_prepare";
         ESP_LOGW(TAG, "deep sleep skipped: audio power-down failed: %s",
                  esp_err_to_name(err));
         cancel_imu_deep_sleep_wake();
@@ -1961,13 +1972,37 @@ static void maybe_enter_deep_sleep(int64_t now_ms)
     const bool false_wake_sleep_due =
         s_motion_false_wake_sleep_deadline_ms != 0 &&
         now_ms >= s_motion_false_wake_sleep_deadline_ms;
-    if (s_last_activity_ms == 0 ||
-        deep_sleep_should_stay_awake() ||
-        s_current_backlight != LCD_BACKLIGHT_OFF) {
+    if (s_last_activity_ms == 0) {
         return;
     }
     if (!false_wake_sleep_due &&
         (now_ms - s_last_activity_ms) < VIBE_STICK_DEEP_SLEEP_MS) {
+        return;
+    }
+    if (deep_sleep_should_stay_awake()) {
+        if (display_should_stay_active()) {
+            s_deep_sleep_block_reason = "active_work";
+        } else if (s_motion_start_pending) {
+            s_deep_sleep_block_reason = "motion_start_pending";
+        } else if (ota_in_progress()) {
+            s_deep_sleep_block_reason = "ota_in_progress";
+        } else {
+            s_deep_sleep_block_reason = "stay_awake";
+        }
+        if (now_ms - s_last_deep_sleep_diagnostic_report_ms >=
+            VIBE_STICK_DEEP_SLEEP_DIAGNOSTIC_REPORT_MS) {
+            s_last_deep_sleep_diagnostic_report_ms = now_ms;
+            post_deep_sleep_diagnostic(s_deep_sleep_block_reason);
+        }
+        return;
+    }
+    if (s_current_backlight != LCD_BACKLIGHT_OFF) {
+        s_deep_sleep_block_reason = "backlight_not_off";
+        if (now_ms - s_last_deep_sleep_diagnostic_report_ms >=
+            VIBE_STICK_DEEP_SLEEP_DIAGNOSTIC_REPORT_MS) {
+            s_last_deep_sleep_diagnostic_report_ms = now_ms;
+            post_deep_sleep_diagnostic(s_deep_sleep_block_reason);
+        }
         return;
     }
     if (s_next_deep_sleep_attempt_ms != 0 &&
@@ -1977,6 +2012,11 @@ static void maybe_enter_deep_sleep(int64_t now_ms)
     if (!enter_deep_sleep()) {
         s_next_deep_sleep_attempt_ms =
             now_ms + VIBE_STICK_DEEP_SLEEP_RETRY_MS;
+        if (now_ms - s_last_deep_sleep_diagnostic_report_ms >=
+            VIBE_STICK_DEEP_SLEEP_DIAGNOSTIC_REPORT_MS) {
+            s_last_deep_sleep_diagnostic_report_ms = now_ms;
+            post_deep_sleep_diagnostic(s_deep_sleep_block_reason);
+        }
     }
 }
 
@@ -5205,6 +5245,18 @@ static void post_simple_event(const char *event_name, const char *path)
         complete_pet_fast_resume();
         render_state();
     }
+}
+
+static void post_deep_sleep_diagnostic(const char *reason)
+{
+    char body[160];
+    snprintf(body, sizeof(body),
+             "{\"event\":\"deep_sleep_blocked\",\"source\":\"%s\","
+             "\"status\":\"%s\"}",
+             VIBE_BOARD_EVENT_SOURCE, reason ? reason : "unknown");
+    char response[512] = {0};
+    (void)http_request_timeout("POST", VIBE_STICK_EVENT_PATH, body, response,
+                               sizeof(response), 1200);
 }
 
 static void post_recording_playback_event(const char *event_name, esp_err_t playback_err)
