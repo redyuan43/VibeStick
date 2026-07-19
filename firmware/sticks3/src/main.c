@@ -8,12 +8,16 @@
 #include <string.h>
 
 #include "vibe_audio.h"
-#include "vibe_stick_anim_assets.h"
 #include "vibe_board.h"
 #include "vibe_board_profile.h"
+#include "vibe_bridge_profile_policy.h"
 #include "vibe_motion.h"
-#include "vibe_stick_pet_assets.h"
+#include "vibe_ota_policy.h"
+#include "vibe_power_policy.h"
+#include "vibe_recording_policy.h"
+#include "vibe_stick_anim_assets.h"
 #include "vibe_stick_config.h"
+#include "vibe_stick_pet_assets.h"
 #include "button_gpio.h"
 #include "cJSON.h"
 #include "driver/gpio.h"
@@ -484,8 +488,7 @@ static atomic_bool s_recording_upload_failed;
 static TaskHandle_t s_recording_finalize_task;
 static atomic_bool s_recording_finalize_active;
 static char s_recording_finalize_event_name[32];
-static char s_ptt_followup_session_id[40];
-static int64_t s_ptt_followup_enter_deadline_ms;
+static vibe_recording_followup_window_t s_ptt_followup;
 static atomic_bool s_ptt_followup_dispatch_active;
 static char s_last_tts_playback_request_id[56];
 static bool s_cyber_tts_waiting;
@@ -1556,23 +1559,24 @@ static void update_power_saving(int64_t now_ms)
     if (s_last_activity_ms == 0) {
         s_last_activity_ms = now_ms;
     }
-    display_power_state_t next_state = DISPLAY_POWER_ACTIVE;
-    uint8_t target = LCD_BACKLIGHT_DEFAULT;
     const bool false_wake_sleep_due =
         s_motion_false_wake_sleep_deadline_ms != 0 &&
         now_ms >= s_motion_false_wake_sleep_deadline_ms;
-    if (false_wake_sleep_due) {
-        next_state = DISPLAY_POWER_OFF;
+    vibe_power_policy_input_t policy_input = {
+        .active_work = display_should_stay_active(),
+        .false_wake_sleep_due = false_wake_sleep_due,
+        .now_ms = now_ms,
+        .last_activity_ms = s_last_activity_ms,
+        .dim_after_ms = VIBE_STICK_IDLE_DIM_MS,
+        .off_after_ms = VIBE_STICK_IDLE_OFF_MS,
+    };
+    display_power_state_t next_state =
+        (display_power_state_t)vibe_power_policy_display_state(&policy_input);
+    uint8_t target = LCD_BACKLIGHT_DEFAULT;
+    if (next_state == DISPLAY_POWER_DIMMED) {
+        target = LCD_BACKLIGHT_IDLE;
+    } else if (next_state == DISPLAY_POWER_OFF) {
         target = LCD_BACKLIGHT_OFF;
-    } else if (!display_should_stay_active()) {
-        const int64_t idle_ms = now_ms - s_last_activity_ms;
-        if (idle_ms >= VIBE_STICK_IDLE_OFF_MS) {
-            next_state = DISPLAY_POWER_OFF;
-            target = LCD_BACKLIGHT_OFF;
-        } else if (idle_ms >= VIBE_STICK_IDLE_DIM_MS) {
-            next_state = DISPLAY_POWER_DIMMED;
-            target = LCD_BACKLIGHT_IDLE;
-        }
     }
     if (target != s_current_backlight) {
         if (false_wake_sleep_due) {
@@ -3697,27 +3701,6 @@ static esp_err_t http_request_target(const char *method, const char *host, int p
     return err;
 }
 
-static bool bridge_health_name_valid(const cJSON *bridge_name)
-{
-    return cJSON_IsString(bridge_name) &&
-           (strcmp(bridge_name->valuestring, "vibestick-bridge") == 0 ||
-            strcmp(bridge_name->valuestring, "capswriter-m5-voice-bridge") == 0);
-}
-
-static void bridge_discovery_fallback_id(const char *host, char *id, size_t id_len)
-{
-    if (!id || id_len == 0) {
-        return;
-    }
-    strlcpy(id, "lan-", id_len);
-    strlcat(id, host && host[0] != '\0' ? host : "bridge", id_len);
-    for (char *cursor = id; *cursor != '\0'; cursor++) {
-        if (*cursor == '.') {
-            *cursor = '-';
-        }
-    }
-}
-
 static bool bridge_parse_discovered_health(const char *response, const char *host, int port,
                                            const char *token,
                                            bridge_discovered_profile_t *profile)
@@ -3734,7 +3717,8 @@ static bool bridge_parse_discovered_health(const char *response, const char *hos
     cJSON *bridge_id = cJSON_GetObjectItemCaseSensitive(root, "bridge_id");
     cJSON *bridge_label = cJSON_GetObjectItemCaseSensitive(root, "bridge_label");
     bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok) &&
-                   bridge_health_name_valid(bridge_name);
+                   cJSON_IsString(bridge_name) &&
+                   vibe_bridge_health_name_supported(bridge_name->valuestring);
     if (!healthy) {
         cJSON_Delete(root);
         return false;
@@ -3745,21 +3729,16 @@ static bool bridge_parse_discovered_health(const char *response, const char *hos
     profile->port = port;
     strlcpy(profile->token, token ? token : "", sizeof(profile->token));
 
-    bool generic_id = !cJSON_IsString(bridge_id) ||
-                      bridge_id->valuestring[0] == '\0' ||
-                      strcmp(bridge_id->valuestring, "capswriter-m5-voice-bridge") == 0 ||
-                      strcmp(bridge_id->valuestring, "vibestick-bridge") == 0;
+    bool generic_id = vibe_bridge_identity_is_generic(
+        cJSON_IsString(bridge_id) ? bridge_id->valuestring : NULL);
     if (generic_id) {
-        bridge_discovery_fallback_id(host, profile->id, sizeof(profile->id));
+        vibe_bridge_fallback_id(host, profile->id, sizeof(profile->id));
     } else {
         strlcpy(profile->id, bridge_id->valuestring, sizeof(profile->id));
     }
 
-    bool generic_label = !cJSON_IsString(bridge_label) ||
-                         bridge_label->valuestring[0] == '\0' ||
-                         strcmp(bridge_label->valuestring,
-                                "capswriter-m5-voice-bridge") == 0 ||
-                         strcmp(bridge_label->valuestring, "vibestick-bridge") == 0;
+    bool generic_label = vibe_bridge_identity_is_generic(
+        cJSON_IsString(bridge_label) ? bridge_label->valuestring : NULL);
     strlcpy(profile->label,
             generic_label ? host : bridge_label->valuestring,
             sizeof(profile->label));
@@ -3828,7 +3807,8 @@ static bool bridge_probe_profile(const bridge_profile_config_t *profile, int tim
     cJSON *bridge_id = cJSON_GetObjectItemCaseSensitive(root, "bridge_id");
     bool generic_profile_id = strncmp(profile->id, "lan-", 4) == 0;
     bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok) &&
-                   bridge_health_name_valid(bridge_name) &&
+                   cJSON_IsString(bridge_name) &&
+                   vibe_bridge_health_name_supported(bridge_name->valuestring) &&
                    (generic_profile_id ||
                     (cJSON_IsString(bridge_id) &&
                      strcmp(bridge_id->valuestring, profile->id) == 0));
@@ -4554,61 +4534,6 @@ static void build_bridge_url(const char *path_or_url, char *url, size_t url_len)
     snprintf(url, url_len, "http://%s:%d%s", target.host, target.port, path_or_url);
 }
 
-static bool ota_parse_semantic_version(const char *raw, uint32_t version[3])
-{
-    if (!raw || !version) {
-        return false;
-    }
-
-    const char *cursor = raw;
-    if (*cursor == 'v' || *cursor == 'V') {
-        cursor++;
-    }
-    for (size_t index = 0; index < 3; index++) {
-        errno = 0;
-        char *end = NULL;
-        unsigned long value = strtoul(cursor, &end, 10);
-        if (errno != 0 || end == cursor || value > UINT32_MAX) {
-            return false;
-        }
-        version[index] = (uint32_t)value;
-        if (index < 2) {
-            if (*end != '.') {
-                return false;
-            }
-            cursor = end + 1;
-        } else if (*end != '\0' && *end != '-' && *end != '+') {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool ota_compare_semantic_versions(const char *candidate,
-                                          const char *current,
-                                          int *comparison)
-{
-    uint32_t candidate_version[3] = {0};
-    uint32_t current_version[3] = {0};
-    if (!comparison ||
-        !ota_parse_semantic_version(candidate, candidate_version) ||
-        !ota_parse_semantic_version(current, current_version)) {
-        return false;
-    }
-    for (size_t index = 0; index < 3; index++) {
-        if (candidate_version[index] < current_version[index]) {
-            *comparison = -1;
-            return true;
-        }
-        if (candidate_version[index] > current_version[index]) {
-            *comparison = 1;
-            return true;
-        }
-    }
-    *comparison = 0;
-    return true;
-}
-
 static bool ota_manifest_is_new(const ota_manifest_t *manifest)
 {
     if (!manifest || !manifest->available) {
@@ -4620,8 +4545,8 @@ static bool ota_manifest_is_new(const ota_manifest_t *manifest)
         return false;
     }
     int version_comparison = 0;
-    if (!ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION,
-                                       &version_comparison)) {
+    if (!vibe_ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION,
+                                            &version_comparison)) {
         ESP_LOGW(TAG, "OTA manifest version is invalid candidate=%s current=%s",
                  manifest->version, FIRMWARE_VERSION);
         return false;
@@ -5282,42 +5207,28 @@ static void post_recording_playback_event(const char *event_name, esp_err_t play
 
 static void clear_ptt_followup_enter_window(void)
 {
-    s_ptt_followup_session_id[0] = '\0';
-    s_ptt_followup_enter_deadline_ms = 0;
+    vibe_recording_followup_clear(&s_ptt_followup);
 }
 
 static void arm_ptt_followup_enter_window(void)
 {
-    if (s_recording_session_id[0] == '\0') {
-        clear_ptt_followup_enter_window();
-        return;
-    }
-    strlcpy(s_ptt_followup_session_id, s_recording_session_id,
-            sizeof(s_ptt_followup_session_id));
-    s_ptt_followup_enter_deadline_ms = (esp_timer_get_time() / 1000) + PTT_ENTER_GRACE_MS;
+    (void)vibe_recording_followup_arm(&s_ptt_followup,
+                                      s_recording_session_id,
+                                      esp_timer_get_time() / 1000,
+                                      PTT_ENTER_GRACE_MS);
 }
 
 static bool consume_ptt_followup_enter_window(void)
 {
-    if (s_recording_trigger_mode != RECORDING_TRIGGER_PUSH_TO_TALK ||
-        s_ptt_followup_session_id[0] == '\0' ||
-        s_ptt_followup_enter_deadline_ms <= 0) {
-        clear_ptt_followup_enter_window();
-        return false;
-    }
-
-    int64_t now_ms = esp_timer_get_time() / 1000;
-    if (now_ms > s_ptt_followup_enter_deadline_ms) {
-        clear_ptt_followup_enter_window();
-        return false;
-    }
-    return true;
+    return vibe_recording_followup_consume(
+        &s_ptt_followup,
+        s_recording_trigger_mode == RECORDING_TRIGGER_PUSH_TO_TALK,
+        esp_timer_get_time() / 1000);
 }
 
 static bool ptt_followup_enter_window_present(void)
 {
-    return s_ptt_followup_session_id[0] != '\0' &&
-           s_ptt_followup_enter_deadline_ms > 0;
+    return vibe_recording_followup_present(&s_ptt_followup);
 }
 
 typedef struct {
@@ -5384,7 +5295,7 @@ static void ptt_followup_key_dispatch_task(void *arg)
 
 static bool start_ptt_followup_key_dispatch(const char *event_name, agent_sound_t sound)
 {
-    if (!event_name || s_ptt_followup_session_id[0] == '\0' ||
+    if (!event_name || s_ptt_followup.session_id[0] == '\0' ||
         atomic_exchange(&s_ptt_followup_dispatch_active, true)) {
         ESP_LOGW(TAG, "PTT follow-up key dispatch ignored event=%s",
                  event_name ? event_name : "-");
@@ -5397,7 +5308,7 @@ static bool start_ptt_followup_key_dispatch(const char *event_name, agent_sound_
         ESP_LOGW(TAG, "PTT follow-up key dispatch allocation failed");
         return false;
     }
-    strlcpy(dispatch->session_id, s_ptt_followup_session_id, sizeof(dispatch->session_id));
+    strlcpy(dispatch->session_id, s_ptt_followup.session_id, sizeof(dispatch->session_id));
     dispatch->event_name = event_name;
     dispatch->sound = sound;
     clear_ptt_followup_enter_window();

@@ -1,0 +1,87 @@
+#include "vibe_bridge_profile_policy.h"
+#include "vibe_ota_policy.h"
+#include "vibe_power_policy.h"
+#include "vibe_recording_policy.h"
+
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+static void test_ota_versions(void)
+{
+    int comparison = 0;
+    assert(vibe_ota_compare_semantic_versions("v1.2.3", "1.2.2", &comparison));
+    assert(comparison > 0);
+    assert(vibe_ota_compare_semantic_versions("1.2.3", "1.2.3", &comparison));
+    assert(comparison == 0);
+    assert(vibe_ota_compare_semantic_versions("1.2.2", "1.2.3", &comparison));
+    assert(comparison < 0);
+    assert(vibe_ota_version_is_newer("1.2.4-rc1", "1.2.3"));
+    assert(!vibe_ota_version_is_newer("1.2.3", "1.2.3"));
+    assert(!vibe_ota_parse_semantic_version("1.2", (uint32_t[3]){0}));
+    assert(!vibe_ota_parse_semantic_version("1.2.x", (uint32_t[3]){0}));
+}
+
+static void test_followup_window(void)
+{
+    vibe_recording_followup_window_t window = {0};
+    assert(vibe_recording_followup_arm(&window, "session-1", 100, 3000));
+    assert(vibe_recording_followup_present(&window));
+    assert(vibe_recording_followup_consume(&window, true, 3100));
+    assert(vibe_recording_followup_present(&window));
+    assert(!vibe_recording_followup_consume(&window, true, 3101));
+    assert(!vibe_recording_followup_present(&window));
+    assert(vibe_recording_followup_arm(&window, "session-2", 100, 3000));
+    assert(!vibe_recording_followup_consume(&window, false, 200));
+    assert(!vibe_recording_followup_present(&window));
+}
+
+static void test_power_policy(void)
+{
+    vibe_power_policy_input_t input = {
+        .now_ms = 10,
+        .last_activity_ms = 0,
+        .dim_after_ms = 30,
+        .off_after_ms = 60,
+    };
+    assert(vibe_power_policy_display_state(&input) ==
+           VIBE_POWER_POLICY_DISPLAY_ACTIVE);
+    input.now_ms = 30;
+    assert(vibe_power_policy_display_state(&input) ==
+           VIBE_POWER_POLICY_DISPLAY_DIMMED);
+    input.now_ms = 60;
+    assert(vibe_power_policy_display_state(&input) ==
+           VIBE_POWER_POLICY_DISPLAY_OFF);
+    input.active_work = true;
+    assert(vibe_power_policy_display_state(&input) ==
+           VIBE_POWER_POLICY_DISPLAY_ACTIVE);
+    assert(vibe_power_policy_should_attempt_deep_sleep(false, false, false,
+                                                        300, 0, 300) == false);
+    assert(vibe_power_policy_should_attempt_deep_sleep(false, false, false,
+                                                        300, 1, 299));
+    assert(!vibe_power_policy_should_attempt_deep_sleep(true, false, false,
+                                                         300, 1, 299));
+}
+
+static void test_bridge_identity_policy(void)
+{
+    char fallback[24] = {0};
+    assert(vibe_bridge_health_name_supported("vibestick-bridge"));
+    assert(vibe_bridge_health_name_supported("capswriter-m5-voice-bridge"));
+    assert(!vibe_bridge_health_name_supported("other"));
+    assert(vibe_bridge_identity_is_generic(""));
+    assert(vibe_bridge_identity_is_generic("capswriter-m5-voice-bridge"));
+    assert(!vibe_bridge_identity_is_generic("desk-a"));
+    vibe_bridge_fallback_id("192.168.100.142", fallback, sizeof(fallback));
+    assert(strcmp(fallback, "lan-192-168-100-142") == 0);
+}
+
+int main(void)
+{
+    test_ota_versions();
+    test_followup_window();
+    test_power_policy();
+    test_bridge_identity_policy();
+    puts("vibestick policy tests passed");
+    return 0;
+}

@@ -196,13 +196,21 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
 
 
 def test_bridge_discovery_fallback_id_is_bounded() -> None:
-    source = MAIN_C.read_text(encoding="utf-8")
-    fallback = source.split("static void bridge_discovery_fallback_id", 1)[1]
-    fallback = fallback.split("static bool bridge_parse_discovered_health", 1)[0]
+    source = (ROOT / "firmware/sticks3/src/vibe_bridge_profile_policy.c").read_text(
+        encoding="utf-8"
+    )
 
-    assert 'strlcpy(id, "lan-", id_len);' in fallback
-    assert 'strlcat(id, host && host[0] != \'\\0\' ? host : "bridge", id_len);' in fallback
-    assert "snprintf(id, id_len" not in fallback
+    assert 'const char *source = host && host[0] != \'\\0\' ? host : "bridge";' in source
+    assert (
+        "for (size_t index = 0; index < sizeof(prefix) - 1 && used + 1 < id_len;"
+        in source
+    )
+    assert (
+        "for (size_t index = 0; source[index] != '\\0' && used + 1 < id_len;"
+        in source
+    )
+    assert "id[used] = '\\0';" in source
+    assert "snprintf(id, id_len" not in source
 
 
 def test_battery_curves_are_board_specific_and_calibrated() -> None:
@@ -429,6 +437,9 @@ def test_bridge_background_scan_pauses_for_recording_and_does_not_auto_switch_cu
 
 def test_discovery_supports_legacy_and_generic_bridge_identity() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    policy = (ROOT / "firmware/sticks3/src/vibe_bridge_profile_policy.c").read_text(
+        encoding="utf-8"
+    )
     parser = source.split("static bool bridge_parse_discovered_health", 1)[1]
     parser = parser.split("static bool bridge_probe_discovered", 1)[0]
     discovery_probe = source.split("static bool bridge_probe_discovered", 1)[1]
@@ -439,8 +450,10 @@ def test_discovery_supports_legacy_and_generic_bridge_identity() -> None:
     assert "#define BRIDGE_HEALTH_RESPONSE_BYTES 512" in source
     assert 'cJSON_GetObjectItemCaseSensitive(root, "bridge_name")' in parser
     assert 'cJSON_GetObjectItemCaseSensitive(root, "bridge_id")' in parser
-    assert '"capswriter-m5-voice-bridge"' in parser
-    assert "bridge_discovery_fallback_id(host" in parser
+    assert 'vibe_bridge_health_name_supported(bridge_name->valuestring)' in parser
+    assert "vibe_bridge_fallback_id(host" in parser
+    assert '"capswriter-m5-voice-bridge"' in policy
+    assert '"vibestick-bridge"' in policy
     assert "char response[BRIDGE_HEALTH_RESPONSE_BYTES] = {0};" in discovery_probe
     assert "char response[BRIDGE_HEALTH_RESPONSE_BYTES] = {0};" in profile_probe
     assert "char response[160]" not in profile_probe
@@ -687,12 +700,19 @@ def test_ota_download_has_bounded_waits_and_always_clears_overlay() -> None:
 
 def test_ota_rejects_lower_semantic_versions_before_hash_comparison() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    policy = (ROOT / "firmware/sticks3/src/vibe_ota_policy.c").read_text(
+        encoding="utf-8"
+    )
     ota_check = source.split("static bool ota_manifest_is_new", 1)[1]
     ota_check = ota_check.split("static esp_err_t perform_ota_update", 1)[0]
 
-    assert "static bool ota_parse_semantic_version" in source
-    assert "static bool ota_compare_semantic_versions" in source
-    assert "ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION" in ota_check
+    assert '#include "vibe_ota_policy.h"' in source
+    assert "bool vibe_ota_parse_semantic_version" in policy
+    assert "bool vibe_ota_compare_semantic_versions" in policy
+    assert (
+        "vibe_ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION"
+        in ota_check
+    )
     assert "version_comparison < 0" in ota_check
     assert "OTA manifest version is older" in ota_check
     assert "version_comparison == 0" in ota_check
