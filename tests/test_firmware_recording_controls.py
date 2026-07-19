@@ -547,7 +547,7 @@ def test_idle_backlight_has_dim_and_off_states() -> None:
     assert "#define VIBE_BOARD_LCD_BACKLIGHT_IDLE 45" in board_profile
 
 
-def test_external_power_allows_idle_display_off_but_blocks_s3_deep_sleep() -> None:
+def test_external_power_allows_idle_display_off_and_s3_deep_sleep() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 
     assert "static bool external_powered(void)" in source
@@ -558,8 +558,6 @@ def test_external_power_allows_idle_display_off_but_blocks_s3_deep_sleep() -> No
     external_power_guard = source.split(
         "static bool external_power_blocks_deep_sleep(void)", 1
     )[1].split("static bool deep_sleep_should_stay_awake", 1)[0]
-    assert "#if defined(VIBE_BOARD_STICKS3)" in external_power_guard
-    assert "return external_powered();" in external_power_guard
     assert "return false;" in external_power_guard
     sleep_guard = source.split("static bool deep_sleep_should_stay_awake(void)", 1)[1]
     sleep_guard = sleep_guard.split("static bool front_button_is_pressed", 1)[0]
@@ -1207,7 +1205,7 @@ def test_s3_blocks_automatic_light_sleep_while_the_display_is_active() -> None:
     assert "automatic light sleep blocked while display is active" in power_init
 
 
-def test_external_power_keeps_s3_serial_monitorable_without_forcing_display_on() -> None:
+def test_external_power_does_not_prevent_s3_deep_sleep() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     display_guard = source.split("static bool display_should_stay_active(void)", 1)[1]
     display_guard = display_guard.split("static bool external_power_blocks_deep_sleep", 1)[0]
@@ -1222,8 +1220,7 @@ def test_external_power_keeps_s3_serial_monitorable_without_forcing_display_on()
     power_refresh = power_refresh.split("static void maybe_refresh_power_status", 1)[0]
 
     assert "return active_work;" in display_guard
-    assert "#if defined(VIBE_BOARD_STICKS3)" in external_power_guard
-    assert "return external_powered();" in external_power_guard
+    assert "return false;" in external_power_guard
     assert "external_power_blocks_deep_sleep() ||" in sleep_guard
     assert "display_active || external_powered()" in lock_policy
     assert "update_display_light_sleep_lock(" in power_refresh
@@ -1249,7 +1246,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.38"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.39"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.34"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher

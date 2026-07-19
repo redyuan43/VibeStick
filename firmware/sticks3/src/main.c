@@ -1455,11 +1455,7 @@ static bool display_should_stay_active(void)
 
 static bool external_power_blocks_deep_sleep(void)
 {
-#if defined(VIBE_BOARD_STICKS3)
-    return external_powered();
-#else
     return false;
-#endif
 }
 
 static bool deep_sleep_should_stay_awake(void)
