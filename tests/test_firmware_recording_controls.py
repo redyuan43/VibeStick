@@ -8,6 +8,8 @@ AUDIO_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_audio.c"
 BOARD_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_board.c"
 BOARD_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board.h"
 BOARD_PROFILE_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board_profile.h"
+MOTION_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_motion.c"
+MOTION_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_motion.h"
 
 
 def test_front_single_click_toggles_device_recording() -> None:
@@ -545,17 +547,23 @@ def test_idle_backlight_has_dim_and_off_states() -> None:
     assert "#define VIBE_BOARD_LCD_BACKLIGHT_IDLE 45" in board_profile
 
 
-def test_external_power_allows_idle_display_off_and_deep_sleep() -> None:
+def test_external_power_allows_idle_display_off_but_blocks_s3_deep_sleep() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
 
     assert "static bool external_powered(void)" in source
     assert "return s_state.battery_charging || s_state.usb_powered;" in source
     display_guard = source.split("static bool display_should_stay_active(void)", 1)[1]
-    display_guard = display_guard.split("static bool deep_sleep_should_stay_awake", 1)[0]
+    display_guard = display_guard.split("static bool external_power_blocks_deep_sleep", 1)[0]
     assert "return active_work;" in display_guard
+    external_power_guard = source.split(
+        "static bool external_power_blocks_deep_sleep(void)", 1
+    )[1].split("static bool deep_sleep_should_stay_awake", 1)[0]
+    assert "#if defined(VIBE_BOARD_STICKS3)" in external_power_guard
+    assert "return external_powered();" in external_power_guard
+    assert "return false;" in external_power_guard
     sleep_guard = source.split("static bool deep_sleep_should_stay_awake(void)", 1)[1]
     sleep_guard = sleep_guard.split("static bool front_button_is_pressed", 1)[0]
-    assert "external_powered()" not in sleep_guard
+    assert "external_power_blocks_deep_sleep() ||" in sleep_guard
     assert "deep_sleep_should_stay_awake() ||" in source
 
 
@@ -634,7 +642,8 @@ def test_ota_check_blocks_sleep_without_waking_display() -> None:
 
     assert "ota_in_progress()" not in display_guard
     assert "static bool deep_sleep_should_stay_awake(void)" in source
-    assert "return display_should_stay_active() || ota_in_progress();" in source
+    assert "display_should_stay_active() ||" in source
+    assert "ota_in_progress();" in source
     assert "ota_in_progress();" in source
     assert "deep_sleep_should_stay_awake() ||" in source
 
@@ -654,6 +663,25 @@ def test_ota_check_runs_on_network_wake_and_periodically() -> None:
     assert "now_ms - s_last_ota_check_ms >= ota_interval_ms" in source
     assert "ota_power_policy_allows" in source
     assert "VIBE_STICK_OTA_CHECK_MS" not in config
+
+
+def test_ota_download_has_bounded_waits_and_always_clears_overlay() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    update = source.split("static esp_err_t perform_ota_update", 1)[1]
+    update = update.split("static void ota_check_task", 1)[0]
+    check = source.split("static void ota_check_task", 1)[1]
+    check = check.split("static void start_ota_check_task", 1)[0]
+
+    assert "#define OTA_DOWNLOAD_TIMEOUT_MS 180000" in source
+    assert "#define OTA_NO_PROGRESS_TIMEOUT_MS 20000" in source
+    assert "now_ms - download_started_ms >= OTA_DOWNLOAD_TIMEOUT_MS" in update
+    assert "now_ms - last_progress_ms >= OTA_NO_PROGRESS_TIMEOUT_MS" in update
+    assert "last_progress_ms = esp_timer_get_time() / 1000;" in update
+    assert "ESP_ERR_TIMEOUT" in update
+    assert "bool overlay_shown = false;" in check
+    assert "overlay_shown = true;" in check
+    assert "if (overlay_shown)" in check
+    assert "show_recording_overlay(NULL, NULL, false);" in check
 
 
 def test_ota_rejects_lower_semantic_versions_before_hash_comparison() -> None:
@@ -713,7 +741,10 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     assert "write_reg(MPU6886_PWR_MGMT_1, MPU6886_SLEEP_MODE)" in motion_source
     assert "read_regs(MPU6886_INT_STATUS, &reg, 1)" in motion_source
     assert "#define VIBE_BOARD_PIN_IMU_INT GPIO_NUM_35" in board_profile
-    assert "#define VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE 0" in plus_profile
+    assert "#define VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE 1" in plus_profile
+    assert "#define VIBE_BOARD_PIN_MOTION_WAKE GPIO_NUM_35" in plus_profile
+    assert "esp_sleep_enable_ext1_wakeup_io(" in source
+    assert "vibe_board_prepare_motion_wake()" in source
     assert "#define VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL 1" in board_profile
     assert ".disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL" in source
 
@@ -880,7 +911,9 @@ def test_s3_deep_sleep_wake_gpio_preserves_internal_button_pullups() -> None:
     assert "rtc_gpio_pulldown_dis(VIBE_BOARD_PIN_BUTTON_FRONT)" in source
     assert "configure_deep_sleep_button_pullups(wake_mask)" in sleep
     assert "esp_sleep_enable_ext0_wakeup(ext0_gpio, 0)" in sleep
-    assert "esp_sleep_enable_ext1_wakeup_io" not in sleep
+    assert "esp_sleep_enable_ext1_wakeup_io" in sleep
+    assert "VIBE_BOARD_PIN_MOTION_WAKE" in sleep
+    assert "rtc_gpio_pullup_en(VIBE_BOARD_PIN_MOTION_WAKE)" in source
     assert "1ULL << VIBE_BOARD_PIN_BUTTON_FRONT" in source
     assert "1ULL << VIBE_BOARD_PIN_BUTTON_SIDE" not in source.split(
         "static uint64_t sleep_button_wake_mask", 1
@@ -979,17 +1012,89 @@ def test_ptt_recording_suspends_motion_and_lift_mode_resumes_it() -> None:
 
 def test_motion_calibration_has_finite_timeout_and_fallback_baseline() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
-    lift_mode = source.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[1]
-    lift_mode = lift_mode.split("static esp_err_t save_recording_mode_preference", 1)[0]
+    begin = source.split("static esp_err_t begin_motion_calibration", 1)[1]
+    begin = begin.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[0]
     timeout = source.split("static void maybe_timeout_motion_calibration", 1)[1]
     timeout = timeout.split("static uint32_t state_poll_interval_ms", 1)[0]
 
     assert "VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS 15000" in source
     assert "s_motion_calibration_deadline_ms" in source
-    assert "VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS" in lift_mode
-    assert "lift calibration timed out; falling back to PTT" in timeout
+    assert "VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS" in begin
+    assert "s_motion_calibration_had_previous" in timeout
+    assert "vibe_motion_apply_calibration(&s_motion_previous_calibration)" in timeout
+    assert "restored previous calibration" in timeout
+    assert "returning to PTT" in timeout
     assert "set_push_to_talk_trigger_mode();" in timeout
     assert "save_recording_mode_preference()" in timeout
+
+
+def test_motion_calibration_is_persisted_and_reused_without_boot_recalibration() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    motion_header = MOTION_H.read_text(encoding="utf-8")
+    motion_source = MOTION_C.read_text(encoding="utf-8")
+    lift_mode = source.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[1]
+    lift_mode = lift_mode.split("static void start_manual_motion_calibration", 1)[0]
+    app_main = source.split("void app_main(void)", 1)[1]
+
+    assert 'DEVICE_PREF_MOTION_CALIBRATION_KEY "motion_cal_v1"' in source
+    assert "nvs_get_blob(handle, DEVICE_PREF_MOTION_CALIBRATION_KEY" in source
+    assert "nvs_set_blob(handle, DEVICE_PREF_MOTION_CALIBRATION_KEY" in source
+    assert "nvs_erase_key(handle, DEVICE_PREF_MOTION_CALIBRATION_KEY)" in source
+    assert "vibe_motion_get_calibration(&store.calibration)" in source
+    assert "vibe_motion_apply_calibration(&store.calibration)" in source
+    assert "vibe_motion_get_calibration(&calibration)" in lift_mode
+    assert "begin_motion_calibration(reason)" in lift_mode
+    assert app_main.index("load_motion_calibration()") < app_main.index(
+        "restore_recording_mode_preference()"
+    )
+    assert "vibe_motion_calibration_t" in motion_header
+    assert "esp_err_t vibe_motion_get_calibration" in motion_header
+    assert "esp_err_t vibe_motion_apply_calibration" in motion_header
+    resume = motion_source.split("esp_err_t vibe_motion_resume(void)", 1)[1]
+    resume = resume.split("bool vibe_motion_suspended", 1)[0]
+    assert "reset_tracking_state();" in resume
+    assert "reset_calibration_state();" not in resume
+
+
+def test_side_button_defers_three_second_toggle_and_uses_six_seconds_for_manual_calibration() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    three_second = source.split("static void side_button_long_start_cb", 1)[1]
+    three_second = three_second.split(
+        "static void side_button_calibration_long_start_cb", 1
+    )[0]
+    release = source.split("static void side_button_up_cb", 1)[1]
+    release = release.split("static void button_long_start_cb", 1)[0]
+    init_button = source.split("static esp_err_t init_button", 1)[1]
+    init_button = init_button.split(
+        "static void capture_deep_sleep_front_button_intent", 1
+    )[0]
+
+    assert "SIDE_MODE_TOGGLE_HOLD_MS 3000" in source
+    assert "SIDE_MANUAL_CALIBRATION_HOLD_MS 6000" in source
+    assert "queue_event(" not in three_second
+    assert "s_side_button_mode_hold_reached = true;" in three_second
+    assert "s_side_button_calibration_hold_reached" in release
+    assert "VIBE_STICK_EVENT_MOTION_CALIBRATE" in release
+    assert "VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE" in release
+    assert ".press_time = SIDE_MODE_TOGGLE_HOLD_MS" in init_button
+    assert ".press_time = SIDE_MANUAL_CALIBRATION_HOLD_MS" in init_button
+
+
+def test_motion_wake_is_confirmed_before_recording_and_false_wake_returns_to_sleep() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    capture = source.split("static void capture_deep_sleep_motion_intent", 1)[1]
+    capture = capture.split("static void handle_deep_sleep_front_button_intent", 1)[0]
+    app_task = source.split("static void app_task(void *arg)", 1)[1]
+    app_task = app_task.split("#if VIBE_STICK_SERIAL_DEBUG_ENABLED", 1)[0]
+
+    assert "VIBE_STICK_MOTION_WAKE_CONFIRM_MS 500" in source
+    assert "VIBE_STICK_MOTION_FALSE_WAKE_DISPLAY_MS 3000" in source
+    assert "ESP_SLEEP_WAKEUP_EXT1" in capture
+    assert "s_motion_wake_confirm_pending = true;" in capture
+    assert "vibe_motion_is_lifted()" in app_task
+    assert "motion wake confirmed lifted; starting recording" in app_task
+    assert "motion wake rejected; display remains on for %dms" in app_task
+    assert "s_motion_false_wake_sleep_deadline_ms" in source
 
 
 def test_audio_stop_unblocks_bounded_recording_reads_before_waiting_for_task_exit() -> None:
@@ -1058,10 +1163,13 @@ def test_s3_blocks_automatic_light_sleep_while_the_display_is_active() -> None:
     assert "automatic light sleep blocked while display is active" in power_init
 
 
-def test_external_power_allows_deep_sleep_but_keeps_s3_serial_monitorable() -> None:
+def test_external_power_keeps_s3_serial_monitorable_without_forcing_display_on() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     display_guard = source.split("static bool display_should_stay_active(void)", 1)[1]
-    display_guard = display_guard.split("static bool deep_sleep_should_stay_awake", 1)[0]
+    display_guard = display_guard.split("static bool external_power_blocks_deep_sleep", 1)[0]
+    external_power_guard = source.split(
+        "static bool external_power_blocks_deep_sleep(void)", 1
+    )[1].split("static bool deep_sleep_should_stay_awake", 1)[0]
     sleep_guard = source.split("static bool deep_sleep_should_stay_awake(void)", 1)[1]
     sleep_guard = sleep_guard.split("static bool front_button_is_pressed", 1)[0]
     lock_policy = source.split("static void update_display_light_sleep_lock", 1)[1]
@@ -1070,7 +1178,9 @@ def test_external_power_allows_deep_sleep_but_keeps_s3_serial_monitorable() -> N
     power_refresh = power_refresh.split("static void maybe_refresh_power_status", 1)[0]
 
     assert "return active_work;" in display_guard
-    assert "external_powered()" not in sleep_guard
+    assert "#if defined(VIBE_BOARD_STICKS3)" in external_power_guard
+    assert "return external_powered();" in external_power_guard
+    assert "external_power_blocks_deep_sleep() ||" in sleep_guard
     assert "display_active || external_powered()" in lock_policy
     assert "update_display_light_sleep_lock(" in power_refresh
     removed = power_refresh.split(
@@ -1095,8 +1205,8 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.34"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.26"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.35"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.27"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher

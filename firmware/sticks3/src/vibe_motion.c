@@ -38,12 +38,18 @@
 #define BMI270_CHIP_ID 0x00
 #define BMI270_CHIP_ID_VALUE 0x24
 #define BMI270_STATUS 0x03
+#define BMI270_INT_STATUS_0 0x1c
 #define BMI270_ACC_X_LSB 0x0c
 #define BMI270_INTERNAL_STATUS 0x21
+#define BMI270_FEAT_PAGE 0x2f
+#define BMI270_FEATURES 0x30
 #define BMI270_ACC_CONF 0x40
 #define BMI270_ACC_RANGE 0x41
 #define BMI270_GYR_CONF 0x42
 #define BMI270_GYR_RANGE 0x43
+#define BMI270_INT1_IO_CTRL 0x53
+#define BMI270_INT_LATCH 0x55
+#define BMI270_INT1_MAP_FEAT 0x56
 #define BMI270_INT_MAP_DATA 0x58
 #define BMI270_INIT_CTRL 0x59
 #define BMI270_INIT_ADDR_0 0x5b
@@ -56,7 +62,14 @@
 #define BMI270_DATA_READY_MASK 0xc0
 #define BMI270_INIT_OK 0x01
 #define BMI270_PWR_CTRL_ALL_SENSORS_OFF 0x00
+#define BMI270_PWR_CTRL_ACCEL_ON 0x04
 #define BMI270_PWR_CTRL_ACCEL_GYRO_TEMP_ON 0x0e
+#define BMI270_ANY_MOTION_PAGE 0x01
+#define BMI270_ANY_MOTION_OFFSET 0x0c
+#define BMI270_ANY_MOTION_DURATION_SAMPLES 4
+#define BMI270_ANY_MOTION_THRESHOLD 0x68
+#define BMI270_ANY_MOTION_INT1_MASK BIT(6)
+#define BMI270_INT_ACTIVE_LOW_PUSH_PULL 0x08
 
 #define MOTION_SAMPLE_INTERVAL_MS 20
 #define MOTION_CALIBRATION_SAMPLES 50
@@ -123,6 +136,7 @@ static vec3f_t s_gyro_bias_sum;
 static vec3f_t s_gyro_bias;
 static vec3f_t s_gravity_lp;
 static bool s_gravity_ready;
+static bool s_calibration_valid;
 
 static esp_err_t add_imu_device(uint8_t address)
 {
@@ -269,9 +283,9 @@ static bool is_pickup_motion(vec3f_t accel_g, vec3f_t gyro_dps)
            accel_delta > MOTION_PICKUP_ACCEL_DELTA_G;
 }
 
-static void reset_runtime_state(void)
+static void reset_tracking_state(void)
 {
-    s_state = MOTION_STATE_CALIBRATING;
+    s_state = s_calibration_valid ? MOTION_STATE_FLAT : MOTION_STATE_CALIBRATING;
     s_last_sample_ms = 0;
     s_candidate_since_ms = -1;
     s_flat_since_ms = -1;
@@ -279,11 +293,17 @@ static void reset_runtime_state(void)
     s_calibration_last_log_ms = 0;
     s_calibration_samples = 0;
     s_baseline_sum = (vec3f_t){0};
-    s_baseline = (vec3f_t){0};
     s_gyro_bias_sum = (vec3f_t){0};
-    s_gyro_bias = (vec3f_t){0};
     s_gravity_lp = (vec3f_t){0};
     s_gravity_ready = false;
+}
+
+static void reset_calibration_state(void)
+{
+    s_calibration_valid = false;
+    s_baseline = (vec3f_t){0};
+    s_gyro_bias = (vec3f_t){0};
+    reset_tracking_state();
 }
 
 #if VIBE_BOARD_HAS_MPU6886
@@ -396,7 +416,7 @@ esp_err_t vibe_motion_init(void)
         return err;
     }
 
-    reset_runtime_state();
+    reset_calibration_state();
     s_suspended = false;
     s_available = true;
     return ESP_OK;
@@ -458,9 +478,9 @@ esp_err_t vibe_motion_resume(void)
 #if VIBE_BOARD_HAS_MPU6886
     if (s_motion_chip == MOTION_CHIP_MPU6886) {
         ESP_RETURN_ON_ERROR(configure_mpu6886_active(), TAG, "resume mpu6886");
-        reset_runtime_state();
+        reset_tracking_state();
         s_suspended = false;
-        ESP_LOGI(TAG, "MPU6886 resumed; recalibration started");
+        ESP_LOGI(TAG, "MPU6886 resumed calibration=%d", s_calibration_valid ? 1 : 0);
         return ESP_OK;
     }
 #endif
@@ -468,9 +488,9 @@ esp_err_t vibe_motion_resume(void)
 #if VIBE_BOARD_HAS_BMI270
     if (s_motion_chip == MOTION_CHIP_BMI270) {
         ESP_RETURN_ON_ERROR(configure_bmi270_active(), TAG, "resume bmi270");
-        reset_runtime_state();
+        reset_tracking_state();
         s_suspended = false;
-        ESP_LOGI(TAG, "BMI270 resumed; recalibration started");
+        ESP_LOGI(TAG, "BMI270 resumed calibration=%d", s_calibration_valid ? 1 : 0);
         return ESP_OK;
     }
 #endif
@@ -498,6 +518,13 @@ esp_err_t vibe_motion_clear_wake_status(void)
     uint8_t status = 0;
     ESP_RETURN_ON_ERROR(read_regs(MPU6886_INT_STATUS, &status, 1),
                         TAG, "clear mpu6886 wake status");
+    return ESP_OK;
+#elif VIBE_BOARD_HAS_BMI270 && VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    ESP_RETURN_ON_FALSE(s_available && s_motion_chip == MOTION_CHIP_BMI270,
+                        ESP_ERR_INVALID_STATE, TAG, "bmi270 unavailable");
+    uint8_t status = 0;
+    ESP_RETURN_ON_ERROR(read_regs(BMI270_INT_STATUS_0, &status, 1),
+                        TAG, "clear bmi270 wake status");
     return ESP_OK;
 #else
     return ESP_OK;
@@ -574,7 +601,55 @@ esp_err_t vibe_motion_prepare_deep_sleep_wake(void)
     ESP_RETURN_ON_ERROR(read_regs(MPU6886_PWR_MGMT_1, &reg, 1), TAG, "read mpu6886 pwr1 cycle");
     ESP_RETURN_ON_ERROR(write_reg(MPU6886_PWR_MGMT_1, reg | 0x20), TAG, "mpu6886 wake cycle");
     ESP_RETURN_ON_ERROR(read_regs(MPU6886_INT_STATUS, &reg, 1), TAG, "clear mpu6886 wake status");
+    s_suspended = true;
     ESP_LOGI(TAG, "MPU6886 wake-on-motion prepared");
+    return ESP_OK;
+#elif VIBE_BOARD_HAS_BMI270 && VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    ESP_RETURN_ON_FALSE(s_available && s_motion_chip == MOTION_CHIP_BMI270,
+                        ESP_ERR_INVALID_STATE, TAG, "bmi270 unavailable");
+    if (s_suspended) {
+        ESP_RETURN_ON_ERROR(configure_bmi270_active(), TAG, "resume bmi270 for wake prep");
+        s_suspended = false;
+    }
+
+    uint8_t feature_page[16] = {0};
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_PWR_CONF, 0x00), TAG, "bmi270 wake power save off");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_FEAT_PAGE, BMI270_ANY_MOTION_PAGE),
+                        TAG, "bmi270 any-motion page");
+    ESP_RETURN_ON_ERROR(read_regs(BMI270_FEATURES, feature_page, sizeof(feature_page)),
+                        TAG, "read bmi270 feature page");
+
+    uint16_t any_motion_1 =
+        (uint16_t)BMI270_ANY_MOTION_DURATION_SAMPLES | 0xe000;
+    uint16_t any_motion_2 =
+        (uint16_t)BMI270_ANY_MOTION_THRESHOLD | 0x3800 | 0x8000;
+    feature_page[BMI270_ANY_MOTION_OFFSET] = (uint8_t)any_motion_1;
+    feature_page[BMI270_ANY_MOTION_OFFSET + 1] = (uint8_t)(any_motion_1 >> 8);
+    feature_page[BMI270_ANY_MOTION_OFFSET + 2] = (uint8_t)any_motion_2;
+    feature_page[BMI270_ANY_MOTION_OFFSET + 3] = (uint8_t)(any_motion_2 >> 8);
+    ESP_RETURN_ON_ERROR(write_regs(BMI270_FEATURES, feature_page, sizeof(feature_page)),
+                        TAG, "write bmi270 any-motion feature");
+
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_INT_MAP_DATA, 0x00),
+                        TAG, "disable bmi270 data-ready interrupt");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_INT1_IO_CTRL, BMI270_INT_ACTIVE_LOW_PUSH_PULL),
+                        TAG, "configure bmi270 int1");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_INT_LATCH, 0x00),
+                        TAG, "configure bmi270 non-latched interrupt");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_INT1_MAP_FEAT, BMI270_ANY_MOTION_INT1_MASK),
+                        TAG, "map bmi270 any-motion interrupt");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_ACC_CONF, 0x27),
+                        TAG, "configure bmi270 low-power accel");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_PWR_CTRL, BMI270_PWR_CTRL_ACCEL_ON),
+                        TAG, "enable bmi270 accel-only wake");
+    ESP_RETURN_ON_ERROR(write_reg(BMI270_PWR_CONF, 0x01),
+                        TAG, "enable bmi270 advanced power save");
+    uint8_t status = 0;
+    ESP_RETURN_ON_ERROR(read_regs(BMI270_INT_STATUS_0, &status, 1),
+                        TAG, "clear bmi270 any-motion status");
+    s_suspended = true;
+    ESP_LOGI(TAG, "BMI270 wake-on-motion prepared threshold=%d duration=%d",
+             BMI270_ANY_MOTION_THRESHOLD, BMI270_ANY_MOTION_DURATION_SAMPLES);
     return ESP_OK;
 #else
     return ESP_ERR_NOT_SUPPORTED;
@@ -585,10 +660,84 @@ esp_err_t vibe_motion_recalibrate(void)
 {
 #if VIBE_BOARD_HAS_LIFT_TO_TALK
     ESP_RETURN_ON_FALSE(s_available, ESP_ERR_INVALID_STATE, TAG, "motion unavailable");
-    reset_runtime_state();
+    reset_calibration_state();
     ESP_LOGI(TAG, "motion flat baseline recalibration started");
     return ESP_OK;
 #else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+bool vibe_motion_calibration_valid(const vibe_motion_calibration_t *calibration)
+{
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    if (calibration == NULL) {
+        return false;
+    }
+    vec3f_t baseline = {
+        .x = calibration->baseline[0],
+        .y = calibration->baseline[1],
+        .z = calibration->baseline[2],
+    };
+    float baseline_norm = vec_norm(baseline);
+    if (!isfinite(baseline_norm) || baseline_norm < 0.90f || baseline_norm > 1.10f) {
+        return false;
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        if (!isfinite(calibration->gyro_bias[i]) ||
+            fabsf(calibration->gyro_bias[i]) > MOTION_CALIBRATION_GYRO_DPS) {
+            return false;
+        }
+    }
+    return true;
+#else
+    (void)calibration;
+    return false;
+#endif
+}
+
+esp_err_t vibe_motion_get_calibration(vibe_motion_calibration_t *calibration)
+{
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    ESP_RETURN_ON_FALSE(calibration != NULL, ESP_ERR_INVALID_ARG, TAG, "null calibration");
+    ESP_RETURN_ON_FALSE(s_available && s_calibration_valid &&
+                            s_state != MOTION_STATE_CALIBRATING,
+                        ESP_ERR_INVALID_STATE, TAG, "calibration unavailable");
+    calibration->baseline[0] = s_baseline.x;
+    calibration->baseline[1] = s_baseline.y;
+    calibration->baseline[2] = s_baseline.z;
+    calibration->gyro_bias[0] = s_gyro_bias.x;
+    calibration->gyro_bias[1] = s_gyro_bias.y;
+    calibration->gyro_bias[2] = s_gyro_bias.z;
+    return ESP_OK;
+#else
+    (void)calibration;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t vibe_motion_apply_calibration(const vibe_motion_calibration_t *calibration)
+{
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    ESP_RETURN_ON_FALSE(s_available, ESP_ERR_INVALID_STATE, TAG, "motion unavailable");
+    ESP_RETURN_ON_FALSE(vibe_motion_calibration_valid(calibration),
+                        ESP_ERR_INVALID_ARG, TAG, "invalid calibration");
+    s_baseline = vec_normalize((vec3f_t){
+        .x = calibration->baseline[0],
+        .y = calibration->baseline[1],
+        .z = calibration->baseline[2],
+    });
+    s_gyro_bias = (vec3f_t){
+        .x = calibration->gyro_bias[0],
+        .y = calibration->gyro_bias[1],
+        .z = calibration->gyro_bias[2],
+    };
+    s_calibration_valid = true;
+    reset_tracking_state();
+    ESP_LOGI(TAG, "motion calibration applied");
+    return ESP_OK;
+#else
+    (void)calibration;
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }
@@ -597,6 +746,16 @@ bool vibe_motion_is_calibrating(void)
 {
 #if VIBE_BOARD_HAS_LIFT_TO_TALK
     return s_available && !s_suspended && s_state == MOTION_STATE_CALIBRATING;
+#else
+    return false;
+#endif
+}
+
+bool vibe_motion_is_lifted(void)
+{
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    return s_available && !s_suspended && s_calibration_valid &&
+           s_state == MOTION_STATE_LIFTED;
 #else
     return false;
 #endif
@@ -641,6 +800,7 @@ vibe_motion_event_t vibe_motion_poll(int64_t now_ms)
             s_gyro_bias.x = s_gyro_bias_sum.x / (float)s_calibration_samples;
             s_gyro_bias.y = s_gyro_bias_sum.y / (float)s_calibration_samples;
             s_gyro_bias.z = s_gyro_bias_sum.z / (float)s_calibration_samples;
+            s_calibration_valid = true;
             s_state = MOTION_STATE_FLAT;
             s_flat_since_ms = now_ms;
             ESP_LOGI(TAG, "flat baseline calibrated g=(%.3f,%.3f,%.3f) gyro_bias=(%.2f,%.2f,%.2f)",

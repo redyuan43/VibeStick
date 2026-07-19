@@ -79,6 +79,8 @@
 #define PTT_FOLLOWUP_REQUEST_TIMEOUT_MS 1000
 #define FRONT_PTT_LONG_PRESS_MS 400
 #define OTA_READ_BUFFER_BYTES 4096
+#define OTA_DOWNLOAD_TIMEOUT_MS 180000
+#define OTA_NO_PROGRESS_TIMEOUT_MS 20000
 #define OTA_PERIODIC_CHECK_MS 300000
 #define OTA_BATTERY_CHECK_MS 1800000
 #define HTTP_CLIENT_BUFFER_SIZE 2048
@@ -112,6 +114,10 @@
 #define VIBE_STICK_MODE_SWITCH_FRAME_MS 260
 #define VIBE_STICK_CYBER_TTS_WAIT_TIMEOUT_MS 180000
 #define VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS 15000
+#define VIBE_STICK_MOTION_WAKE_CONFIRM_MS 500
+#define VIBE_STICK_MOTION_FALSE_WAKE_DISPLAY_MS 3000
+#define SIDE_MODE_TOGGLE_HOLD_MS 3000
+#define SIDE_MANUAL_CALIBRATION_HOLD_MS 6000
 #define VIBE_STICK_STATE_POLL_IDLE_MS 10000
 #define VIBE_STICK_STATE_POLL_INTERACTIVE_MS 15000
 #define VIBE_STICK_APP_IDLE_WAIT_MS 1000
@@ -140,6 +146,9 @@
 #define DEVICE_PREF_RECORDING_MODE_KEY "rec_mode"
 #define DEVICE_PREF_RECORDING_TRIGGER_KEY "rec_trig"
 #define DEVICE_PREF_RECORDING_INTENT_KEY "rec_intent"
+#define DEVICE_PREF_MOTION_CALIBRATION_KEY "motion_cal_v1"
+#define MOTION_CALIBRATION_MAGIC 0x564d4341u
+#define MOTION_CALIBRATION_STORE_VERSION 1
 #define DEEP_SLEEP_NAMESPACE "vibe_sleep"
 #define DEEP_SLEEP_RECORD_KEY "last_entry"
 #define DEEP_SLEEP_RECORD_MAGIC 0x56534c50u
@@ -249,6 +258,14 @@ typedef struct {
     uint8_t reserved;
 } deep_sleep_record_t;
 
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    char board[16];
+    vibe_motion_calibration_t calibration;
+} motion_calibration_store_t;
+
 typedef enum {
     VIBE_STICK_EVENT_POLL_STATE,
     VIBE_STICK_EVENT_RECORDING_TOGGLE,
@@ -258,6 +275,7 @@ typedef enum {
     VIBE_STICK_EVENT_PROVIDER_NEXT,
     VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE,
     VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE,
+    VIBE_STICK_EVENT_MOTION_CALIBRATE,
     VIBE_STICK_EVENT_MOTION_START,
     VIBE_STICK_EVENT_MOTION_STOP,
     VIBE_STICK_EVENT_TTS_PROBE,
@@ -441,8 +459,13 @@ static bool s_long_press_active;
 static bool s_motion_recording_active;
 static bool s_motion_calibrating;
 static int64_t s_motion_calibration_deadline_ms;
+static bool s_motion_calibration_had_previous;
+static vibe_motion_calibration_t s_motion_previous_calibration;
 static bool s_motion_lift_armed;
 static bool s_motion_start_pending;
+static bool s_motion_wake_confirm_pending;
+static int64_t s_motion_wake_confirm_deadline_ms;
+static int64_t s_motion_false_wake_sleep_deadline_ms;
 static bool s_tap_recording_active;
 static char s_last_alert_event_id[56];
 static char s_last_alert_type[24];
@@ -499,7 +522,8 @@ static bool s_front_fallback_pressed;
 static bool s_front_fallback_suppressed;
 static int64_t s_front_fallback_down_ms;
 static volatile int64_t s_front_button_iot_down_ms;
-static volatile bool s_side_button_long_press_active;
+static volatile bool s_side_button_mode_hold_reached;
+static volatile bool s_side_button_calibration_hold_reached;
 static volatile int64_t s_front_button_iot_single_ms;
 static volatile int64_t s_front_button_iot_up_ms;
 
@@ -890,8 +914,13 @@ static void reset_recording_trigger_runtime_state(void)
     s_motion_recording_active = false;
     s_motion_calibrating = false;
     s_motion_calibration_deadline_ms = 0;
+    s_motion_calibration_had_previous = false;
+    memset(&s_motion_previous_calibration, 0, sizeof(s_motion_previous_calibration));
     s_motion_lift_armed = false;
     s_motion_start_pending = false;
+    s_motion_wake_confirm_pending = false;
+    s_motion_wake_confirm_deadline_ms = 0;
+    s_motion_false_wake_sleep_deadline_ms = 0;
 }
 
 static void set_push_to_talk_trigger_mode(void)
@@ -905,6 +934,102 @@ static void set_push_to_talk_trigger_mode(void)
                      esp_err_to_name(err));
         }
     }
+}
+
+static esp_err_t load_motion_calibration(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DEVICE_PREF_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "open motion calibration NVS");
+
+    motion_calibration_store_t store = {0};
+    size_t size = sizeof(store);
+    err = nvs_get_blob(handle, DEVICE_PREF_MOTION_CALIBRATION_KEY, &store, &size);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "read motion calibration");
+    if (size != sizeof(store) ||
+        store.magic != MOTION_CALIBRATION_MAGIC ||
+        store.version != MOTION_CALIBRATION_STORE_VERSION ||
+        store.size != sizeof(store) ||
+        strncmp(store.board, VIBE_BOARD_NAME, sizeof(store.board)) != 0 ||
+        !vibe_motion_calibration_valid(&store.calibration)) {
+        ESP_LOGW(TAG, "stored motion calibration rejected board=%.*s size=%u",
+                 (int)sizeof(store.board), store.board, (unsigned)size);
+        if (nvs_open(DEVICE_PREF_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+            esp_err_t erase_err =
+                nvs_erase_key(handle, DEVICE_PREF_MOTION_CALIBRATION_KEY);
+            if (erase_err == ESP_OK || erase_err == ESP_ERR_NVS_NOT_FOUND) {
+                erase_err = nvs_commit(handle);
+            }
+            nvs_close(handle);
+            if (erase_err != ESP_OK) {
+                ESP_LOGW(TAG, "invalid motion calibration cleanup failed: %s",
+                         esp_err_to_name(erase_err));
+            }
+        }
+        return ESP_ERR_INVALID_VERSION;
+    }
+
+    ESP_RETURN_ON_ERROR(vibe_motion_apply_calibration(&store.calibration),
+                        TAG, "apply stored motion calibration");
+    ESP_LOGI(TAG, "stored motion calibration loaded board=%s", store.board);
+    return ESP_OK;
+}
+
+static esp_err_t save_motion_calibration(void)
+{
+    motion_calibration_store_t store = {
+        .magic = MOTION_CALIBRATION_MAGIC,
+        .version = MOTION_CALIBRATION_STORE_VERSION,
+        .size = sizeof(motion_calibration_store_t),
+    };
+    snprintf(store.board, sizeof(store.board), "%s", VIBE_BOARD_NAME);
+    ESP_RETURN_ON_ERROR(vibe_motion_get_calibration(&store.calibration),
+                        TAG, "capture motion calibration");
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DEVICE_PREF_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "open motion calibration NVS for write");
+    err = nvs_set_blob(handle, DEVICE_PREF_MOTION_CALIBRATION_KEY,
+                       &store, sizeof(store));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    ESP_RETURN_ON_ERROR(err, TAG, "commit motion calibration");
+    ESP_LOGI(TAG, "motion calibration persisted board=%s", store.board);
+    return ESP_OK;
+}
+
+static esp_err_t begin_motion_calibration(const char *reason)
+{
+    s_motion_calibration_had_previous =
+        vibe_motion_get_calibration(&s_motion_previous_calibration) == ESP_OK;
+    esp_err_t err = vibe_motion_recalibrate();
+    if (err != ESP_OK) {
+        s_motion_calibration_had_previous = false;
+        ESP_LOGW(TAG, "%s motion calibration start failed: %s",
+                 reason, esp_err_to_name(err));
+        return err;
+    }
+    s_motion_calibrating = true;
+    s_motion_calibration_deadline_ms =
+        esp_timer_get_time() / 1000 +
+        VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS;
+    s_motion_lift_armed = false;
+    s_motion_start_pending = false;
+    s_motion_wake_confirm_pending = false;
+    s_motion_wake_confirm_deadline_ms = 0;
+    s_motion_false_wake_sleep_deadline_ms = 0;
+    ESP_LOGI(TAG, "%s motion calibration started previous=%d",
+             reason, s_motion_calibration_had_previous ? 1 : 0);
+    return ESP_OK;
 }
 
 static esp_err_t set_lift_to_talk_trigger_mode(const char *reason)
@@ -921,21 +1046,41 @@ static esp_err_t set_lift_to_talk_trigger_mode(const char *reason)
         set_push_to_talk_trigger_mode();
         return err;
     }
-    err = vibe_motion_recalibrate();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "%s lift recording mode calibration failed: %s",
-                 reason, esp_err_to_name(err));
-        set_push_to_talk_trigger_mode();
-        return err;
-    }
     s_recording_trigger_mode = RECORDING_TRIGGER_LIFT_TO_TALK;
-    s_motion_calibrating = true;
-    s_motion_calibration_deadline_ms =
-        esp_timer_get_time() / 1000 +
-        VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS;
-    s_motion_lift_armed = false;
+    vibe_motion_calibration_t calibration = {0};
+    if (vibe_motion_get_calibration(&calibration) != ESP_OK) {
+        err = begin_motion_calibration(reason);
+        if (err != ESP_OK) {
+            set_push_to_talk_trigger_mode();
+            return err;
+        }
+        return ESP_OK;
+    }
+    s_motion_calibrating = false;
+    s_motion_calibration_deadline_ms = 0;
+    s_motion_calibration_had_previous = false;
+    s_motion_lift_armed = true;
     s_motion_start_pending = false;
+    ESP_LOGI(TAG, "%s lift recording mode using persisted calibration", reason);
     return ESP_OK;
+}
+
+static void start_manual_motion_calibration(void)
+{
+    register_activity();
+    if (s_recording_trigger_mode != RECORDING_TRIGGER_LIFT_TO_TALK) {
+        ESP_LOGI(TAG, "manual calibration ignored outside LIFT mode");
+        return;
+    }
+    if (s_recording_overlay_visible || vibe_audio_is_recording() ||
+        recording_finalize_active()) {
+        ESP_LOGI(TAG, "manual calibration ignored while recording is active");
+        return;
+    }
+    if (begin_motion_calibration("manual") != ESP_OK) {
+        return;
+    }
+    render_state();
 }
 
 static esp_err_t save_recording_mode_preference(void)
@@ -1282,13 +1427,28 @@ static bool display_should_stay_active(void)
            s_tap_recording_active ||
            s_motion_recording_active ||
            s_motion_calibrating ||
+           s_motion_wake_confirm_pending ||
            recording_finalize_active();
     return active_work;
 }
 
+static bool external_power_blocks_deep_sleep(void)
+{
+#if defined(VIBE_BOARD_STICKS3)
+    return external_powered();
+#else
+    return false;
+#endif
+}
+
 static bool deep_sleep_should_stay_awake(void)
 {
-    return display_should_stay_active() || ota_in_progress();
+    return display_should_stay_active() ||
+           external_power_blocks_deep_sleep() ||
+           s_motion_start_pending ||
+           (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
+            vibe_motion_is_lifted()) ||
+           ota_in_progress();
 }
 
 static bool front_button_is_pressed(void)
@@ -1354,6 +1514,7 @@ static void register_activity(void)
 {
     s_last_activity_ms = esp_timer_get_time() / 1000;
     s_next_deep_sleep_attempt_ms = 0;
+    s_motion_false_wake_sleep_deadline_ms = 0;
     request_wifi_reconnect_now();
     if (atomic_load(&s_display_rendering_suspended)) {
         set_display_rendering_suspended(false);
@@ -1378,7 +1539,13 @@ static void update_power_saving(int64_t now_ms)
     }
     display_power_state_t next_state = DISPLAY_POWER_ACTIVE;
     uint8_t target = LCD_BACKLIGHT_DEFAULT;
-    if (!display_should_stay_active()) {
+    const bool false_wake_sleep_due =
+        s_motion_false_wake_sleep_deadline_ms != 0 &&
+        now_ms >= s_motion_false_wake_sleep_deadline_ms;
+    if (false_wake_sleep_due) {
+        next_state = DISPLAY_POWER_OFF;
+        target = LCD_BACKLIGHT_OFF;
+    } else if (!display_should_stay_active()) {
         const int64_t idle_ms = now_ms - s_last_activity_ms;
         if (idle_ms >= VIBE_STICK_IDLE_OFF_MS) {
             next_state = DISPLAY_POWER_OFF;
@@ -1389,7 +1556,11 @@ static void update_power_saving(int64_t now_ms)
         }
     }
     if (target != s_current_backlight) {
-        fade_backlight_toward(target, now_ms);
+        if (false_wake_sleep_due) {
+            set_backlight(target);
+        } else {
+            fade_backlight_toward(target, now_ms);
+        }
     }
     if (next_state == DISPLAY_POWER_OFF &&
         s_current_backlight == LCD_BACKLIGHT_OFF) {
@@ -1400,6 +1571,7 @@ static void update_power_saving(int64_t now_ms)
 
 static void request_motion_recording_start(void)
 {
+    s_motion_false_wake_sleep_deadline_ms = 0;
     if (s_motion_recording_active) {
         s_motion_start_pending = false;
         return;
@@ -1441,6 +1613,14 @@ static esp_err_t configure_deep_sleep_button_pullups(uint64_t wake_mask)
         ESP_RETURN_ON_ERROR(rtc_gpio_pulldown_dis(VIBE_BOARD_PIN_BUTTON_FRONT),
                             TAG, "front wake pull-down");
     }
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    if ((wake_mask & (1ULL << VIBE_BOARD_PIN_MOTION_WAKE)) != 0) {
+        ESP_RETURN_ON_ERROR(rtc_gpio_pullup_en(VIBE_BOARD_PIN_MOTION_WAKE),
+                            TAG, "motion wake pull-up");
+        ESP_RETURN_ON_ERROR(rtc_gpio_pulldown_dis(VIBE_BOARD_PIN_MOTION_WAKE),
+                            TAG, "motion wake pull-down");
+    }
+#endif
     return ESP_OK;
 }
 #endif
@@ -1462,7 +1642,14 @@ static bool prepare_imu_deep_sleep_wake(uint64_t *wake_mask)
         ESP_LOGW(TAG, "deep sleep skipped: IMU wake prep failed: %s", esp_err_to_name(err));
         return false;
     }
-    *wake_mask |= 1ULL << VIBE_BOARD_PIN_IMU_INT;
+    err = vibe_board_prepare_motion_wake();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: board motion wake prep failed: %s",
+                 esp_err_to_name(err));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_motion_resume());
+        return false;
+    }
+    *wake_mask |= 1ULL << VIBE_BOARD_PIN_MOTION_WAKE;
     return true;
 #else
     ESP_LOGI(TAG, "%s lift mode entering button-only deep sleep", VIBE_BOARD_NAME);
@@ -1473,6 +1660,16 @@ static bool prepare_imu_deep_sleep_wake(uint64_t *wake_mask)
         return false;
     }
     return true;
+#endif
+}
+
+static void cancel_imu_deep_sleep_wake(void)
+{
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_cancel_motion_wake());
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_motion_resume());
+    }
 #endif
 }
 
@@ -1560,22 +1757,7 @@ static esp_err_t save_deep_sleep_record(uint64_t wake_mask)
 static bool enter_deep_sleep(void)
 {
     uint64_t wake_mask = sleep_button_wake_mask();
-#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
-    if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
-        VIBE_BOARD_PIN_IMU_INT != GPIO_NUM_NC) {
-        wake_mask |= 1ULL << VIBE_BOARD_PIN_IMU_INT;
-    }
-#endif
     gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;
-#if !defined(CONFIG_IDF_TARGET_ESP32)
-    esp_err_t pull_err = configure_deep_sleep_button_pullups(wake_mask);
-    if (pull_err != ESP_OK) {
-        ESP_LOGW(TAG, "deep sleep skipped: wake pull-up setup failed: %s",
-                 esp_err_to_name(pull_err));
-        return false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(1));
-#endif
     if (sleep_wake_gpio_is_active(ext0_gpio)) {
         ESP_LOGW(TAG, "deep sleep skipped: ext0 wake gpio=%d is already active",
                  (int)ext0_gpio);
@@ -1585,17 +1767,43 @@ static bool enter_deep_sleep(void)
     if (!prepare_imu_deep_sleep_wake(&wake_mask)) {
         return false;
     }
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+    esp_err_t pull_err = configure_deep_sleep_button_pullups(wake_mask);
+    if (pull_err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep skipped: wake pull-up setup failed: %s",
+                 esp_err_to_name(pull_err));
+        cancel_imu_deep_sleep_wake();
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+#endif
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    const bool motion_wake_enabled =
+        s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
+        VIBE_BOARD_PIN_MOTION_WAKE != GPIO_NUM_NC;
+    if (motion_wake_enabled &&
+        sleep_wake_gpio_is_active(VIBE_BOARD_PIN_MOTION_WAKE)) {
+        ESP_LOGW(TAG, "deep sleep skipped: motion wake gpio=%d is already active",
+                 (int)VIBE_BOARD_PIN_MOTION_WAKE);
+        cancel_imu_deep_sleep_wake();
+        return false;
+    }
+#else
+    const bool motion_wake_enabled = false;
+#endif
 
     esp_err_t err = save_deep_sleep_record(wake_mask);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "deep sleep skipped: persistent record failed: %s",
                  esp_err_to_name(err));
+        cancel_imu_deep_sleep_wake();
         return false;
     }
     err = vibe_audio_prepare_deep_sleep();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "deep sleep skipped: audio power-down failed: %s",
                  esp_err_to_name(err));
+        cancel_imu_deep_sleep_wake();
         return false;
     }
     set_display_rendering_suspended(true);
@@ -1628,18 +1836,38 @@ static bool enter_deep_sleep(void)
                  esp_err_to_name(err));
         esp_restart();
     }
+    if (motion_wake_enabled) {
+#if defined(CONFIG_IDF_TARGET_ESP32)
+        err = esp_sleep_enable_ext1_wakeup_io(
+            1ULL << VIBE_BOARD_PIN_MOTION_WAKE,
+            ESP_EXT1_WAKEUP_ALL_LOW);
+#else
+        err = esp_sleep_enable_ext1_wakeup_io(
+            1ULL << VIBE_BOARD_PIN_MOTION_WAKE,
+            ESP_EXT1_WAKEUP_ANY_LOW);
+#endif
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "motion wake source setup failed; restarting instead of sleeping: %s",
+                     esp_err_to_name(err));
+            esp_restart();
+        }
+    }
     esp_deep_sleep_start();
     return true;
 }
 
 static void maybe_enter_deep_sleep(int64_t now_ms)
 {
+    const bool false_wake_sleep_due =
+        s_motion_false_wake_sleep_deadline_ms != 0 &&
+        now_ms >= s_motion_false_wake_sleep_deadline_ms;
     if (s_last_activity_ms == 0 ||
         deep_sleep_should_stay_awake() ||
         s_current_backlight != LCD_BACKLIGHT_OFF) {
         return;
     }
-    if ((now_ms - s_last_activity_ms) < VIBE_STICK_DEEP_SLEEP_MS) {
+    if (!false_wake_sleep_due &&
+        (now_ms - s_last_activity_ms) < VIBE_STICK_DEEP_SLEEP_MS) {
         return;
     }
     if (s_next_deep_sleep_attempt_ms != 0 &&
@@ -4394,6 +4622,8 @@ static esp_err_t perform_ota_update(const ota_manifest_t *manifest)
     }
 
     int total_read = 0;
+    const int64_t download_started_ms = esp_timer_get_time() / 1000;
+    int64_t last_progress_ms = download_started_ms;
     while (true) {
         int data_read = esp_http_client_read(client, (char *)buffer, OTA_READ_BUFFER_BYTES);
         if (data_read < 0) {
@@ -4406,6 +4636,16 @@ static esp_err_t perform_ota_update(const ota_manifest_t *manifest)
                 err = ESP_OK;
                 break;
             }
+            const int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - download_started_ms >= OTA_DOWNLOAD_TIMEOUT_MS ||
+                now_ms - last_progress_ms >= OTA_NO_PROGRESS_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "OTA download timed out bytes=%d elapsed=%lld idle=%lld",
+                         total_read,
+                         (long long)(now_ms - download_started_ms),
+                         (long long)(now_ms - last_progress_ms));
+                err = ESP_ERR_TIMEOUT;
+                break;
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -4415,6 +4655,14 @@ static esp_err_t perform_ota_update(const ota_manifest_t *manifest)
             break;
         }
         total_read += data_read;
+        last_progress_ms = esp_timer_get_time() / 1000;
+        if (last_progress_ms - download_started_ms >= OTA_DOWNLOAD_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "OTA download exceeded total timeout bytes=%d elapsed=%lld",
+                     total_read,
+                     (long long)(last_progress_ms - download_started_ms));
+            err = ESP_ERR_TIMEOUT;
+            break;
+        }
     }
 
     const bool complete = esp_http_client_is_complete_data_received(client);
@@ -4457,6 +4705,7 @@ static void ota_check_task(void *arg)
     char path[80];
     char response[768] = {0};
     ota_manifest_t manifest;
+    bool overlay_shown = false;
 
     snprintf(path, sizeof(path), "%s?board=%s", VIBE_STICK_OTA_MANIFEST_PATH, VIBE_BOARD_NAME);
     ESP_LOGD(TAG, "OTA check start path=%s", path);
@@ -4469,15 +4718,18 @@ static void ota_check_task(void *arg)
         ESP_LOGD(TAG, "OTA no update board=%s build=%s", manifest.board, manifest.build_id);
     } else {
         show_recording_overlay("OTA update", "", true);
+        overlay_shown = true;
         err = perform_ota_update(&manifest);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "OTA update failed: %s", esp_err_to_name(err));
             show_recording_overlay("OTA failed", "", true);
             vTaskDelay(pdMS_TO_TICKS(1200));
-            show_recording_overlay(NULL, NULL, false);
         }
     }
 
+    if (overlay_shown) {
+        show_recording_overlay(NULL, NULL, false);
+    }
     set_ota_in_progress(false);
     s_ota_task = NULL;
     vTaskDelete(NULL);
@@ -5892,8 +6144,17 @@ static void side_button_long_start_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
-    s_side_button_long_press_active = true;
-    queue_event(VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE);
+    s_side_button_mode_hold_reached = true;
+    ESP_LOGI(TAG, "side button mode hold reached");
+}
+
+static void side_button_calibration_long_start_cb(void *button_handle, void *usr_data)
+{
+    (void)button_handle;
+    (void)usr_data;
+    register_activity();
+    s_side_button_calibration_hold_reached = true;
+    ESP_LOGI(TAG, "side button calibration hold reached");
 }
 
 static void side_button_up_cb(void *button_handle, void *usr_data)
@@ -5901,8 +6162,19 @@ static void side_button_up_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
-    if (s_side_button_long_press_active) {
-        s_side_button_long_press_active = false;
+    if (s_side_button_calibration_hold_reached) {
+        s_side_button_calibration_hold_reached = false;
+        s_side_button_mode_hold_reached = false;
+        if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK) {
+            queue_event(VIBE_STICK_EVENT_MOTION_CALIBRATE);
+        } else {
+            queue_event(VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE);
+        }
+        return;
+    }
+    if (s_side_button_mode_hold_reached) {
+        s_side_button_mode_hold_reached = false;
+        queue_event(VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE);
         return;
     }
     const bool can_arm = !recording_network_busy();
@@ -6054,12 +6326,22 @@ static esp_err_t init_button(void)
                         TAG, "side button release");
     button_event_args_t side_long_press_args = {
         .long_press = {
-            .press_time = 3000,
+            .press_time = SIDE_MODE_TOGGLE_HOLD_MS,
         },
     };
     ESP_RETURN_ON_ERROR(iot_button_register_cb(side_button, BUTTON_LONG_PRESS_START, &side_long_press_args,
                                                side_button_long_start_cb, NULL),
                         TAG, "side button long");
+    button_event_args_t side_calibration_press_args = {
+        .long_press = {
+            .press_time = SIDE_MANUAL_CALIBRATION_HOLD_MS,
+        },
+    };
+    ESP_RETURN_ON_ERROR(
+        iot_button_register_cb(side_button, BUTTON_LONG_PRESS_START,
+                               &side_calibration_press_args,
+                               side_button_calibration_long_start_cb, NULL),
+        TAG, "side button calibration");
     return ESP_OK;
 }
 
@@ -6074,6 +6356,31 @@ static void capture_deep_sleep_front_button_intent(void)
     }
     s_wake_front_button_pending = true;
     ESP_LOGI(TAG, "front button held during deep sleep wake; pending PTT restore");
+}
+
+static void capture_deep_sleep_motion_intent(void)
+{
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    if (!s_woke_from_deep_sleep ||
+        s_boot_wake_cause != ESP_SLEEP_WAKEUP_EXT1 ||
+        (s_boot_ext1_wake_status &
+         (1ULL << VIBE_BOARD_PIN_MOTION_WAKE)) == 0) {
+        return;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_motion_clear_wake_status());
+    if (s_recording_trigger_mode != RECORDING_TRIGGER_LIFT_TO_TALK ||
+        s_motion_calibrating) {
+        ESP_LOGW(TAG, "motion wake ignored because LIFT calibration is unavailable");
+        return;
+    }
+    s_motion_wake_confirm_pending = true;
+    s_motion_wake_confirm_deadline_ms =
+        esp_timer_get_time() / 1000 + VIBE_STICK_MOTION_WAKE_CONFIRM_MS;
+    s_motion_lift_armed = false;
+    s_motion_start_pending = false;
+    ESP_LOGI(TAG, "motion deep-sleep wake pending %dms posture confirmation",
+             VIBE_STICK_MOTION_WAKE_CONFIRM_MS);
+#endif
 }
 
 static void handle_deep_sleep_front_button_intent(void)
@@ -6134,7 +6441,24 @@ static void maybe_timeout_motion_calibration(int64_t now_ms)
         return;
     }
 
-    ESP_LOGW(TAG, "lift calibration timed out; falling back to PTT");
+    if (s_motion_calibration_had_previous &&
+        vibe_motion_apply_calibration(&s_motion_previous_calibration) == ESP_OK) {
+        s_motion_calibrating = false;
+        s_motion_calibration_deadline_ms = 0;
+        s_motion_calibration_had_previous = false;
+        s_motion_lift_armed = true;
+        s_motion_start_pending = false;
+        ESP_LOGW(TAG, "lift calibration timed out; restored previous calibration");
+        render_state();
+        show_mode_switch_visual("CAL FAILED", "LIFT RESTORED",
+                                s_mode_switch_dict_frames,
+                                sizeof(s_mode_switch_dict_frames) /
+                                    sizeof(s_mode_switch_dict_frames[0]),
+                                lv_color_hex(0xfacc15));
+        return;
+    }
+
+    ESP_LOGW(TAG, "lift calibration timed out without fallback; returning to PTT");
     set_push_to_talk_trigger_mode();
     ESP_ERROR_CHECK_WITHOUT_ABORT(save_recording_mode_preference());
     render_state();
@@ -6206,12 +6530,34 @@ static void app_task(void *arg)
             if (s_motion_calibrating && !vibe_motion_is_calibrating()) {
                 s_motion_calibrating = false;
                 s_motion_calibration_deadline_ms = 0;
+                s_motion_calibration_had_previous = false;
                 s_motion_lift_armed = true;
                 s_motion_start_pending = false;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(save_motion_calibration());
                 ESP_LOGI(TAG, "lift recording mode calibration complete");
                 render_state();
             }
-            if (!s_motion_calibrating && motion_event == VIBE_MOTION_EVENT_FLAT) {
+            bool motion_wake_handled = false;
+            if (!s_motion_calibrating && s_motion_wake_confirm_pending) {
+                motion_wake_handled = true;
+                if (now_ms >= s_motion_wake_confirm_deadline_ms) {
+                    s_motion_wake_confirm_pending = false;
+                    s_motion_wake_confirm_deadline_ms = 0;
+                    if (vibe_motion_is_lifted()) {
+                        ESP_LOGI(TAG, "motion wake confirmed lifted; starting recording");
+                        request_motion_recording_start();
+                    } else {
+                        s_motion_lift_armed = true;
+                        s_motion_false_wake_sleep_deadline_ms =
+                            now_ms + VIBE_STICK_MOTION_FALSE_WAKE_DISPLAY_MS;
+                        ESP_LOGI(TAG, "motion wake rejected; display remains on for %dms",
+                                 VIBE_STICK_MOTION_FALSE_WAKE_DISPLAY_MS);
+                    }
+                }
+            }
+            if (!motion_wake_handled &&
+                !s_motion_calibrating &&
+                motion_event == VIBE_MOTION_EVENT_FLAT) {
                 if (s_motion_start_pending) {
                     ESP_LOGI(TAG, "motion lift start deferred request cancelled by flat posture");
                     s_motion_start_pending = false;
@@ -6221,11 +6567,13 @@ static void app_task(void *arg)
                 } else if (!s_motion_lift_armed) {
                     s_motion_lift_armed = true;
                 }
-            } else if (!s_motion_calibrating && s_motion_lift_armed &&
+            } else if (!motion_wake_handled &&
+                       !s_motion_calibrating && s_motion_lift_armed &&
                        motion_event == VIBE_MOTION_EVENT_LIFTED &&
                        !s_motion_recording_active) {
                 request_motion_recording_start();
-            } else if (!s_motion_calibrating && s_motion_start_pending &&
+            } else if (!motion_wake_handled &&
+                       !s_motion_calibrating && s_motion_start_pending &&
                        !s_motion_recording_active) {
                 request_motion_recording_start();
             }
@@ -6265,6 +6613,9 @@ static void app_task(void *arg)
             break;
         case VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE:
             toggle_recording_intent();
+            break;
+        case VIBE_STICK_EVENT_MOTION_CALIBRATE:
+            start_manual_motion_calibration();
             break;
         case VIBE_STICK_EVENT_BRIDGE_SCAN_FULL:
             (void)start_bridge_discovery_task(true);
@@ -6405,6 +6756,13 @@ void app_main(void)
     if (s_woke_from_deep_sleep) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_FRONT));
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+        if ((s_boot_ext1_wake_status &
+             (1ULL << VIBE_BOARD_PIN_MOTION_WAKE)) != 0) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                rtc_gpio_deinit(VIBE_BOARD_PIN_MOTION_WAKE));
+        }
+#endif
     }
     if (s_woke_from_deep_sleep) {
         s_deep_sleep_wake_ms = esp_timer_get_time() / 1000;
@@ -6456,6 +6814,14 @@ void app_main(void)
     if (motion_err != ESP_OK && motion_err != ESP_ERR_NOT_SUPPORTED) {
         ESP_LOGW(TAG, "motion init failed: %s", esp_err_to_name(motion_err));
     }
+    if (motion_err == ESP_OK) {
+        esp_err_t calibration_err = load_motion_calibration();
+        if (calibration_err != ESP_OK &&
+            calibration_err != ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(TAG, "motion calibration load skipped: %s",
+                     esp_err_to_name(calibration_err));
+        }
+    }
     set_push_to_talk_trigger_mode();
     ESP_ERROR_CHECK_WITHOUT_ABORT(restore_recording_mode_preference());
     render_state();
@@ -6465,6 +6831,7 @@ void app_main(void)
     ESP_ERROR_CHECK(bridge_control_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(init_button());
     capture_deep_sleep_front_button_intent();
+    capture_deep_sleep_motion_intent();
     ESP_ERROR_CHECK(vibe_audio_init());
     xTaskCreatePinnedToCore(app_task, "agent_app", 6144, NULL, 4, NULL,
                             VIBE_STICK_APP_CORE);

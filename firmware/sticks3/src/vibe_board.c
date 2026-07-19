@@ -30,6 +30,7 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 #define M5PM1_REG_GPIO_IN 0x12
 #define M5PM1_REG_GPIO_DRV 0x13
 #define M5PM1_REG_GPIO_FUNC0 0x16
+#define M5PM1_REG_GPIO_FUNC1 0x17
 #define M5PM1_REG_GPIO_WAKE_ENABLE 0x18
 #define M5PM1_REG_GPIO_WAKE_CONFIG 0x19
 #define M5PM1_REG_BAT_L 0x22
@@ -51,6 +52,7 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 #define M5PM1_HOLD_CFG_LDO_HOLD BIT(5)
 #define M5PM1_GPIO2_L3B_POWER_EN BIT(2)
 #define M5PM1_GPIO3_SPK_PULSE BIT(3)
+#define M5PM1_GPIO4_IMU_INT BIT(4)
 #define M5PM1_GPIO_FUNC_MASK(pin) (0x03 << ((pin) * 2))
 #define M5PM1_GPIO_FUNC_GPIO(pin) (0x00 << ((pin) * 2))
 #define M5PM1_GPIO_FUNC_IRQ(pin)  (0x01 << ((pin) * 2))
@@ -379,6 +381,59 @@ esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
     return ESP_OK;
 }
 
+esp_err_t vibe_board_prepare_motion_wake(void)
+{
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_FUNC1, 0x03, 0x00),
+                        TAG, "set imu wake gpio function");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_MODE, M5PM1_GPIO4_IMU_INT, 0),
+                        TAG, "set imu wake gpio input");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS1, 0x00),
+                        TAG, "clear gpio wake irq");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS2, 0x00),
+                        TAG, "clear power wake irq");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS3, 0x00),
+                        TAG, "clear button wake irq");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_IRQ_MASK1, M5PM1_GPIO4_IMU_INT, 0),
+                        TAG, "unmask imu gpio irq");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_WAKE_CONFIG,
+                                   M5PM1_GPIO4_IMU_INT, 0),
+                        TAG, "set imu gpio falling-edge wake");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_WAKE_ENABLE,
+                                   0, M5PM1_GPIO4_IMU_INT),
+                        TAG, "enable imu gpio wake");
+    ESP_LOGI(TAG, "M5PM1 IMU wake prepared gpio4->irq gpio13");
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_cancel_motion_wake(void)
+{
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_WAKE_ENABLE,
+                                   M5PM1_GPIO4_IMU_INT, 0),
+                        TAG, "disable imu gpio wake");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_WAKE_CONFIG,
+                                   M5PM1_GPIO4_IMU_INT, 0),
+                        TAG, "reset imu gpio wake edge");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_IRQ_MASK1,
+                                   0, M5PM1_GPIO4_IMU_INT),
+                        TAG, "mask imu gpio irq");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS1, 0x00),
+                        TAG, "clear imu gpio irq");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS2, 0x00),
+                        TAG, "clear motion wake power irq");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS3, 0x00),
+                        TAG, "clear motion wake button irq");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_WAKE_SRC, 0x00),
+                        TAG, "clear motion wake source");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_FUNC1, 0x03, 0x00),
+                        TAG, "restore imu gpio function");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_MODE,
+                                   M5PM1_GPIO4_IMU_INT, 0),
+                        TAG, "restore imu gpio input");
+    return ESP_OK;
+}
+
 esp_err_t vibe_board_prepare_deep_sleep(void)
 {
     ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
@@ -520,6 +575,16 @@ esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
                                   (reg & 0x0f) | ((uint8_t)encoded << 4)),
                         TAG, "write ldo23");
     return update_reg(AXP192_REG_OUTPUT_CTRL, 0, AXP192_OUTPUT_CTRL_LDO2);
+}
+
+esp_err_t vibe_board_prepare_motion_wake(void)
+{
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_cancel_motion_wake(void)
+{
+    return ESP_OK;
 }
 
 esp_err_t vibe_board_prepare_deep_sleep(void)
