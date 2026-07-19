@@ -425,6 +425,20 @@ esp_err_t vibe_board_prepare_motion_wake(void)
     return ESP_OK;
 }
 
+esp_err_t vibe_board_clear_motion_wake_status(void)
+{
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS1, 0x00),
+                        TAG, "clear imu gpio irq");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS2, 0x00),
+                        TAG, "clear power wake irq");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS3, 0x00),
+                        TAG, "clear button wake irq");
+    ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_WAKE_SRC, 0x00),
+                        TAG, "clear motion wake source");
+    return ESP_OK;
+}
+
 esp_err_t vibe_board_cancel_motion_wake(void)
 {
     ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
@@ -658,6 +672,11 @@ esp_err_t vibe_board_prepare_motion_wake(void)
     ESP_LOGI(TAG,
              "shared SYS_INT cleared for MPU6886 wake axp=disabled rtc_status2=0x%02x",
              rtc_status2);
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_clear_motion_wake_status(void)
+{
     return ESP_OK;
 }
 

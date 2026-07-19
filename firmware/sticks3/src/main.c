@@ -1649,6 +1649,7 @@ static bool wait_for_motion_wake_idle(void)
         const bool active =
             sleep_wake_gpio_is_active(VIBE_BOARD_PIN_MOTION_WAKE);
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_motion_clear_wake_status());
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_clear_motion_wake_status());
         if (active) {
             quiet_since_ms = 0;
         } else if (quiet_since_ms == 0) {

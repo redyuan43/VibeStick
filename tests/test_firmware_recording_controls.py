@@ -753,6 +753,7 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     assert "VIBE_STICK_MOTION_WAKE_SETTLE_TIMEOUT_MS 15000" in source
     assert "static bool wait_for_motion_wake_idle(void)" in source
     assert "vibe_motion_clear_wake_status()" in source
+    assert "vibe_board_clear_motion_wake_status()" in source
     assert "if (!wait_for_motion_wake_idle())" in source
     assert "#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE\nstatic bool wait_for_motion_wake_idle(void)" in source
     assert "static esp_err_t configure_motion_wake_gpio_input(void)" in source
@@ -1248,7 +1249,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.41"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.42"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.34"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher

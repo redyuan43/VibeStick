@@ -28,5 +28,6 @@ esp_err_t vibe_board_usb_powered(bool *usb_powered);
 esp_err_t vibe_board_speaker_set_enabled(bool enabled);
 esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness);
 esp_err_t vibe_board_prepare_motion_wake(void);
+esp_err_t vibe_board_clear_motion_wake_status(void);
 esp_err_t vibe_board_cancel_motion_wake(void);
 esp_err_t vibe_board_prepare_deep_sleep(void);
