@@ -33,8 +33,9 @@ Run the normal setup first:
 ./scripts/setup.sh
 ```
 
-If port `8765` is already occupied, choose a dedicated telemetry port for
-both setup and the test command:
+Telemetry runs independently on port `8878` by default, so it does not share
+the normal voice bridge port `8765`. Override it only when that dedicated port
+is unavailable:
 
 ```sh
 VIBE_STICK_TELEMETRY_PORT=8878 ./scripts/setup.sh
@@ -141,7 +142,7 @@ substitute for discharge-based state-of-charge calibration.
 With the bridge running, open:
 
 ```text
-http://127.0.0.1:8765/telemetry
+http://127.0.0.1:8878/telemetry
 ```
 
 The dashboard is read-only. It shows current devices and sessions, supports

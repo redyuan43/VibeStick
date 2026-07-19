@@ -10,8 +10,17 @@ from urllib.request import Request, urlopen
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Send simulated VibeStick battery telemetry.")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8765")
-    parser.add_argument("--token", default=os.environ.get("VIBE_STICK_BRIDGE_TOKEN", ""))
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("VIBE_STICK_TELEMETRY_URL", "http://127.0.0.1:8878"),
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get(
+            "VIBE_STICK_TELEMETRY_TOKEN",
+            os.environ.get("VIBE_STICK_BRIDGE_TOKEN", ""),
+        ),
+    )
     parser.add_argument("--board", choices=("sticks3", "stickc_plus_11"), required=True)
     parser.add_argument("--device-id", default="")
     parser.add_argument("--phase", choices=("powered", "battery"), default="powered")

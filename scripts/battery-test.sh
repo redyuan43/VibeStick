@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE_PID=""
-TELEMETRY_PORT="${VIBE_STICK_TELEMETRY_PORT:-8765}"
-TELEMETRY_LOCAL_URL="${VIBE_STICK_BRIDGE_URL:-http://127.0.0.1:$TELEMETRY_PORT}"
+TELEMETRY_PORT="${VIBE_STICK_TELEMETRY_PORT:-8878}"
+TELEMETRY_LOCAL_URL="${VIBE_STICK_TELEMETRY_URL:-http://127.0.0.1:$TELEMETRY_PORT}"
 
 cleanup() {
   if [[ -n "$BRIDGE_PID" ]]; then
@@ -32,8 +32,8 @@ ensure_bridge() {
     exit 1
   fi
   PYTHONPATH="$ROOT_DIR/bridge/src" \
-    python3 -m vibe_stick --host 0.0.0.0 --port "$TELEMETRY_PORT" \
-    >"${TMPDIR:-/tmp}/vibestick-battery-bridge.log" 2>&1 &
+    python3 -m vibe_stick.telemetry.server --host 0.0.0.0 --port "$TELEMETRY_PORT" \
+    >"${TMPDIR:-/tmp}/vibestick-telemetry.log" 2>&1 &
   BRIDGE_PID=$!
   for _ in {1..50}; do
     health="$(curl -fsS "$TELEMETRY_LOCAL_URL/health" 2>/dev/null || true)"

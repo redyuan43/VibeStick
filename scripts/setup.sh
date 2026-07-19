@@ -194,11 +194,10 @@ if [ -f "$TELEMETRY_SECRETS_PATH" ]; then
   wifi_ssid="$(secret_value VIBE_STICK_WIFI_SSID "$SECRETS_PATH")"
   wifi_password="$(secret_value VIBE_STICK_WIFI_PASSWORD "$SECRETS_PATH")"
   bridge_host="$(secret_value VIBE_STICK_BRIDGE_HOST "$SECRETS_PATH")"
-  bridge_port="${VIBE_STICK_TELEMETRY_PORT:-}"
+  bridge_port="${VIBE_STICK_TELEMETRY_PORT:-8878}"
   if [ -z "$bridge_port" ]; then
     bridge_port="$(awk '$1 == "#define" && $2 == "VIBE_STICK_BRIDGE_PORT" { print $3; exit }' "$SECRETS_PATH")"
   fi
-  bridge_port="${bridge_port:-8765}"
   set_secret_value VIBE_TELEMETRY_WIFI_SSID "$wifi_ssid" "$TELEMETRY_SECRETS_PATH"
   set_secret_value VIBE_TELEMETRY_WIFI_PASSWORD "$wifi_password" "$TELEMETRY_SECRETS_PATH"
   set_secret_value VIBE_TELEMETRY_BASE_URL "http://$bridge_host:$bridge_port" "$TELEMETRY_SECRETS_PATH"

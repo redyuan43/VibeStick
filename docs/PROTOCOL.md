@@ -42,7 +42,7 @@ When `VIBE_STICK_BRIDGE_TOKEN` is configured on the bridge and firmware, protect
 X-Vibe-Stick-Token: <shared-token>
 ```
 
-Protected endpoints are `/event`, `/quota/refresh`, `/recording/start`, `/recording/audio`, `/recording/stop`, and telemetry POST endpoints. If the bridge binds outside loopback, such as `0.0.0.0`, `VIBE_STICK_BRIDGE_TOKEN` is required and placeholder tokens are rejected. If the bridge binds to loopback only, missing tokens are allowed for local development.
+Protected endpoints are `/event`, `/quota/refresh`, `/recording/start`, `/recording/audio`, and `/recording/stop`. If the bridge binds outside loopback, such as `0.0.0.0`, `VIBE_STICK_BRIDGE_TOKEN` is required and placeholder tokens are rejected. If the bridge binds to loopback only, missing tokens are allowed for local development.
 
 ## GET /state
 
@@ -261,6 +261,11 @@ Push-to-talk uses `button_long_stop`; lift-to-talk uses `motion_lift_stop`.
 When transcription succeeds, the bridge pastes the transcript into the focused macOS app. Recording status does not trigger agent alert sounds.
 
 ## POST /telemetry/v1/samples
+
+Telemetry routes are served by the dedicated telemetry service on port `8878`
+by default, rather than the normal voice bridge on port `8765`. The telemetry
+service accepts `VIBE_STICK_TELEMETRY_TOKEN`, falling back to
+`VIBE_STICK_BRIDGE_TOKEN` for existing device secrets.
 
 Receives one sample from dedicated battery-test firmware. The request is
 protected by `X-Vibe-Stick-Token`.

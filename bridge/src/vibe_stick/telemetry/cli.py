@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8765"
+DEFAULT_BASE_URL = "http://127.0.0.1:8878"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,7 +35,13 @@ def main(argv: list[str] | None = None) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="VibeStick battery telemetry CLI.")
-    parser.add_argument("--base-url", default=os.environ.get("VIBE_STICK_BRIDGE_URL", DEFAULT_BASE_URL))
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get(
+            "VIBE_STICK_TELEMETRY_URL",
+            os.environ.get("VIBE_STICK_BRIDGE_URL", DEFAULT_BASE_URL),
+        ),
+    )
     parser.add_argument("--token", default="")
     sub = parser.add_subparsers(dest="command", required=True)
 

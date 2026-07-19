@@ -30,7 +30,7 @@ Typical smoke tests:
 Open the read-only live dashboard at:
 
 ```text
-http://127.0.0.1:8765/telemetry
+http://127.0.0.1:8878/telemetry
 ```
 
 See [Battery Telemetry](docs/BATTERY_TELEMETRY.md) for isolated builds,

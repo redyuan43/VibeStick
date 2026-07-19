@@ -6,40 +6,38 @@ import os
 import tempfile
 import threading
 import unittest
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from vibe_stick.protocol.state import default_state
 from vibe_stick.server import app
+from vibe_stick.telemetry import server as telemetry_server
 from vibe_stick.telemetry.store import TelemetryStore
 
 
-class _Store:
-    def __init__(self, telemetry: TelemetryStore) -> None:
-        self.telemetry = telemetry
-
-    def get_state(self):  # noqa: ANN201
-        state = default_state()
-        state.battery = 72
-        return state
-
-    def register_device_request(self, **_: object) -> None:
-        return None
-
-    def tts_playback_request_id(self) -> str:
-        return ""
-
-
 class TelemetryServerTests(unittest.TestCase):
-    def test_health_advertises_feature_and_state_keeps_battery_null(self) -> None:
+    def test_health_advertises_telemetry_feature(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with _server(TelemetryStore(Path(tmp))) as base:
                 health = _request_json(base, "GET", "/health")
-                state = _request_json(base, "GET", "/state")
 
         self.assertIn("battery_telemetry_v1", health["features"])
-        self.assertIsNone(state["battery"])
+        self.assertEqual(health["service_name"], "vibestick-telemetry")
+
+    def test_legacy_bridge_no_longer_serves_telemetry_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = type(
+                "Store",
+                (),
+                {
+                    "register_device_request": lambda *args, **kwargs: None,
+                },
+            )()
+            handler = app.make_handler(store)  # type: ignore[arg-type]
+            with _http_server(handler) as base:
+                status, _ = _request(base, "GET", "/telemetry/v1/devices")
+
+        self.assertEqual(status, 404)
 
     def test_protected_telemetry_post_requires_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,7 +125,10 @@ class _server:
         self.base = ""
 
     def __enter__(self) -> str:
-        handler = app.make_handler(_Store(self.telemetry))  # type: ignore[arg-type]
+        handler = telemetry_server.make_handler(self.telemetry)
+        return self._start(handler)
+
+    def _start(self, handler: type[BaseHTTPRequestHandler]) -> str:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         host, port = self.server.server_address
         self.base = f"{host}:{port}"
@@ -141,6 +142,15 @@ class _server:
         self.server.server_close()
         assert self.thread is not None
         self.thread.join(timeout=2)
+
+
+class _http_server(_server):
+    def __init__(self, handler: type[BaseHTTPRequestHandler]) -> None:
+        super().__init__(TelemetryStore(Path(tempfile.gettempdir())))
+        self.handler = handler
+
+    def __enter__(self) -> str:
+        return self._start(self.handler)
 
 
 def _request_json(

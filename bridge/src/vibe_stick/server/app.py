@@ -5,7 +5,6 @@ import html
 import hmac
 import ipaddress
 import json
-import mimetypes
 import os
 import shutil
 import socket
@@ -15,7 +14,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 try:
     from zeroconf import IPVersion, ServiceInfo, Zeroconf
@@ -46,7 +45,6 @@ from vibe_stick.protocol.state import (
 from vibe_stick.providers.base import ProviderObservation
 from vibe_stick.providers.claude import observe_claude
 from vibe_stick.providers.codex import observe_codex
-from vibe_stick.telemetry import TelemetryError, TelemetryStore
 
 MANUAL_STATUS_SECONDS = 60
 BRIDGE_NAME = "vibestick-bridge"
@@ -84,7 +82,6 @@ class BridgeStateStore:
         self._state.codex.quota_updated_at = quota.quota_updated_at
         self._state.codex.quota_stale = quota.quota_stale
         self.recording = RecordingController(RECORDING_PATH)
-        self.telemetry = TelemetryStore()
         self._devices: dict[str, dict[str, Any]] = {}
         self._events: list[dict[str, Any]] = []
         self._tts_playback_request_id = ""
@@ -523,13 +520,7 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                     payload["tts_playback_request_id"] = request_id
                 self._send_json(payload)
             elif parsed.path == "/health":
-                self._send_json(
-                    {
-                        "ok": True,
-                        **_bridge_metadata(),
-                        "features": ["battery_telemetry_v1"],
-                    }
-                )
+                self._send_json({"ok": True, **_bridge_metadata()})
             elif parsed.path == "/devices":
                 self._send_json({"devices": store.devices()})
             elif parsed.path == "/debug/status":
@@ -558,8 +549,6 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                     self._send_error(HTTPStatus.NOT_FOUND, "TTS audio not found")
                     return
                 self._send_file(audio, _audio_content_type(audio))
-            elif parsed.path.startswith("/telemetry"):
-                self._handle_telemetry_get(parsed)
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
 
@@ -636,90 +625,8 @@ def make_handler(store: BridgeStateStore) -> type[BaseHTTPRequestHandler]:
                     self._send_json(_device_recording_result(result))
                 else:
                     self._send_json(result)
-            elif parsed.path.startswith("/telemetry/v1/"):
-                self._handle_telemetry_post(parsed)
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
-
-        def _handle_telemetry_get(self, parsed: Any) -> None:
-            try:
-                if parsed.path == "/telemetry/v1/devices":
-                    self._send_json(store.telemetry.list_devices())
-                elif _telemetry_device_raw_route(parsed.path, "export.csv"):
-                    device_id = _telemetry_device_raw_route(parsed.path, "export.csv")
-                    query = parse_qs(parsed.query)
-                    self._send_text(
-                        store.telemetry.export_raw_csv(device_id, _first(query, "boot_id")),
-                        content_type="text/csv; charset=utf-8",
-                    )
-                elif _telemetry_device_raw_route(parsed.path, ""):
-                    device_id = _telemetry_device_raw_route(parsed.path, "")
-                    query = parse_qs(parsed.query)
-                    self._send_json(
-                        store.telemetry.list_raw_samples(device_id, _first(query, "boot_id"))
-                    )
-                elif parsed.path == "/telemetry/v1/sessions":
-                    self._send_json(store.telemetry.list_sessions())
-                elif _telemetry_session_route(parsed.path, "samples"):
-                    session_id = _telemetry_session_route(parsed.path, "samples")
-                    self._send_json(store.telemetry.list_samples(session_id))
-                elif _telemetry_session_route(parsed.path, "export.csv"):
-                    session_id = _telemetry_session_route(parsed.path, "export.csv")
-                    self._send_text(
-                        store.telemetry.export_csv(session_id),
-                        content_type="text/csv; charset=utf-8",
-                    )
-                elif _telemetry_session_route(parsed.path, ""):
-                    session_id = _telemetry_session_route(parsed.path, "")
-                    self._send_json(store.telemetry.get_session(session_id))
-                elif parsed.path == "/telemetry":
-                    self._send_redirect("/telemetry/")
-                elif parsed.path.startswith("/telemetry/"):
-                    self._serve_telemetry_dashboard(parsed.path)
-                else:
-                    self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
-            except TelemetryError as exc:
-                self._send_error(exc.status, exc.message)
-
-        def _handle_telemetry_post(self, parsed: Any) -> None:
-            try:
-                if parsed.path == "/telemetry/v1/samples":
-                    body = self._read_json_body()
-                    body.setdefault(
-                        "firmware_name",
-                        self.headers.get("X-Vibe-Stick-Firmware-Name", ""),
-                    )
-                    body.setdefault(
-                        "firmware_version",
-                        self.headers.get("X-Vibe-Stick-Firmware-Version", ""),
-                    )
-                    body.setdefault(
-                        "transport",
-                        self.headers.get("X-Vibe-Stick-Firmware-Transport", "HTTP"),
-                    )
-                    self._send_json(store.telemetry.submit_sample(body), status=HTTPStatus.CREATED)
-                elif parsed.path == "/telemetry/v1/sessions":
-                    self._send_json(
-                        store.telemetry.create_session(self._read_json_body()),
-                        status=HTTPStatus.CREATED,
-                    )
-                elif _telemetry_session_route(parsed.path, "stop"):
-                    session_id = _telemetry_session_route(parsed.path, "stop")
-                    self._send_json(
-                        store.telemetry.stop_session(session_id, self._read_json_body())
-                    )
-                else:
-                    self._send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
-            except TelemetryError as exc:
-                self._send_error(exc.status, exc.message)
-
-        def _serve_telemetry_dashboard(self, request_path: str) -> None:
-            dashboard_file = _telemetry_dashboard_file(request_path)
-            if dashboard_file is None:
-                self._send_error(HTTPStatus.NOT_FOUND, "Dashboard asset not found")
-                return
-            content_type = mimetypes.guess_type(str(dashboard_file))[0] or "application/octet-stream"
-            self._send_file(dashboard_file, content_type)
 
         def log_message(self, fmt: str, *args: object) -> None:
             firmware_name = self.headers.get("X-Vibe-Stick-Firmware-Name", "-")
@@ -850,8 +757,6 @@ def _protected_paths() -> set[str]:
         "/recording/start",
         "/recording/audio",
         "/recording/stop",
-        "/telemetry/v1/samples",
-        "/telemetry/v1/sessions",
     }
 
 
@@ -865,50 +770,7 @@ def _protected_get_paths() -> set[str]:
 
 
 def _is_protected_path(path: str) -> bool:
-    return path in _protected_paths() or bool(_telemetry_session_route(path, "stop"))
-
-
-def _telemetry_session_route(path: str, leaf: str) -> str:
-    prefix = "/telemetry/v1/sessions/"
-    if not path.startswith(prefix):
-        return ""
-    remainder = path.removeprefix(prefix).strip("/")
-    if not remainder:
-        return ""
-    parts = remainder.split("/")
-    if leaf == "":
-        return parts[0] if len(parts) == 1 else ""
-    return parts[0] if len(parts) == 2 and parts[1] == leaf else ""
-
-
-def _telemetry_device_raw_route(path: str, leaf: str) -> str:
-    prefix = "/telemetry/v1/devices/"
-    if not path.startswith(prefix):
-        return ""
-    remainder = path.removeprefix(prefix).strip("/")
-    parts = remainder.split("/")
-    expected = 2 if leaf == "" else 3
-    if len(parts) != expected or parts[1] != "raw":
-        return ""
-    if leaf and parts[2] != leaf:
-        return ""
-    return unquote(parts[0])
-
-
-def _telemetry_dashboard_file(request_path: str) -> Path | None:
-    web_root = Path(__file__).resolve().parents[1] / "web" / "telemetry"
-    if request_path == "/telemetry/":
-        candidate = web_root / "index.html"
-    else:
-        candidate = web_root / request_path.removeprefix("/telemetry/").strip("/")
-    try:
-        resolved_root = web_root.resolve()
-        resolved_candidate = candidate.resolve()
-    except OSError:
-        return None
-    if resolved_root not in resolved_candidate.parents and resolved_candidate != resolved_root:
-        return None
-    return resolved_candidate if resolved_candidate.is_file() else None
+    return path in _protected_paths()
 
 
 def _audio_content_type(path: Path) -> str:
