@@ -1159,6 +1159,9 @@ def test_s3_blocks_automatic_light_sleep_while_the_display_is_active() -> None:
     assert "ESP_PM_NO_LIGHT_SLEEP" in power_init
     assert '"display_active"' in power_init
     assert "esp_pm_lock_acquire(s_display_no_light_sleep_lock)" in source
+    assert "static bool board_requires_light_sleep_lock(void)" in source
+    assert "#if defined(VIBE_BOARD_STICKS3)" in source
+    assert "board_requires_light_sleep_lock() || display_active || external_powered()" in source
     assert "#if VIBE_BOARD_HAS_GPIO_BACKLIGHT" in power_init
     assert "automatic light sleep blocked while display is active" in power_init
 
@@ -1205,7 +1208,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.36"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.37"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.29"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher

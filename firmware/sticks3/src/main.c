@@ -1313,12 +1313,22 @@ static void set_backlight(uint8_t brightness)
 }
 
 #if CONFIG_PM_ENABLE && VIBE_BOARD_HAS_GPIO_BACKLIGHT
+static bool board_requires_light_sleep_lock(void)
+{
+#if defined(VIBE_BOARD_STICKS3)
+    return true;
+#else
+    return false;
+#endif
+}
+
 static void update_display_light_sleep_lock(bool display_active)
 {
     if (!s_display_no_light_sleep_lock) {
         return;
     }
-    const bool should_hold = display_active || external_powered();
+    const bool should_hold =
+        board_requires_light_sleep_lock() || display_active || external_powered();
     if (should_hold && !s_display_no_light_sleep_lock_held) {
         if (esp_pm_lock_acquire(s_display_no_light_sleep_lock) == ESP_OK) {
             s_display_no_light_sleep_lock_held = true;
