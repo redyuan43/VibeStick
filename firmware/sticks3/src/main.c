@@ -364,17 +364,6 @@ typedef struct {
     bool available;
 } bridge_target_t;
 
-typedef struct {
-    bool available;
-    char board[24];
-    char version[48];
-    char build_id[64];
-    char sha256[65];
-    char elf_sha256[65];
-    char url[160];
-    int size;
-} ota_manifest_t;
-
 typedef enum {
     RECORDING_MODE_PUSH_TO_TALK,
     RECORDING_MODE_LIFT_TO_TALK,
@@ -4491,7 +4480,7 @@ static esp_err_t play_latest_tts_audio(void)
     return err;
 }
 
-static bool parse_ota_manifest(const char *json, ota_manifest_t *manifest)
+static bool parse_ota_manifest(const char *json, vibe_ota_manifest_t *manifest)
 {
     if (!json || !manifest) {
         return false;
@@ -4534,79 +4523,34 @@ static void build_bridge_url(const char *path_or_url, char *url, size_t url_len)
     snprintf(url, url_len, "http://%s:%d%s", target.host, target.port, path_or_url);
 }
 
-static bool ota_manifest_is_new(const ota_manifest_t *manifest)
+static bool ota_manifest_is_new(const vibe_ota_manifest_t *manifest)
 {
-    if (!manifest || !manifest->available) {
-        return false;
-    }
-    if (strcmp(manifest->board, VIBE_BOARD_NAME) != 0) {
-        ESP_LOGW(TAG, "OTA manifest board mismatch got=%s expected=%s",
-                 manifest->board, VIBE_BOARD_NAME);
-        return false;
-    }
-    int version_comparison = 0;
-    if (!vibe_ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION,
-                                            &version_comparison)) {
-        ESP_LOGW(TAG, "OTA manifest version is invalid candidate=%s current=%s",
-                 manifest->version, FIRMWARE_VERSION);
-        return false;
-    }
-    if (version_comparison < 0) {
-        ESP_LOGW(TAG, "OTA manifest version is older candidate=%s current=%s",
-                 manifest->version, FIRMWARE_VERSION);
-        return false;
-    }
-    if (version_comparison == 0) {
-        ESP_LOGI(TAG, "OTA manifest version is not newer candidate=%s current=%s",
-                 manifest->version, FIRMWARE_VERSION);
-        return false;
-    }
-    if (manifest->sha256[0] != '\0') {
+    char current_sha256[65] = {0};
+    if (manifest && manifest->sha256[0] != '\0') {
         uint8_t running_sha256[32] = {0};
         const esp_partition_t *running_partition = esp_ota_get_running_partition();
         if (running_partition &&
             esp_partition_get_sha256(running_partition, running_sha256) == ESP_OK) {
-            char current_sha256[65] = {0};
-            for (size_t i = 0; i < sizeof(running_sha256); i++) {
-                snprintf(current_sha256 + i * 2, sizeof(current_sha256) - i * 2,
-                         "%02x", running_sha256[i]);
+            for (size_t index = 0; index < sizeof(running_sha256); index++) {
+                snprintf(current_sha256 + index * 2, sizeof(current_sha256) - index * 2,
+                         "%02x", running_sha256[index]);
             }
-            if (strcmp(manifest->sha256, current_sha256) == 0) {
-                ESP_LOGI(TAG, "OTA manifest is current image sha256=%.12s",
-                         manifest->sha256);
-                return false;
-            }
-            ESP_LOGI(TAG, "OTA manifest is new image sha256=%.12s current=%.12s",
-                     manifest->sha256, current_sha256);
-            return true;
+        } else {
+            ESP_LOGW(TAG, "OTA running partition sha256 unavailable; falling back");
         }
-        ESP_LOGW(TAG, "OTA running partition sha256 unavailable; falling back");
     }
-    if (manifest->elf_sha256[0] != '\0') {
-        const char *current_elf_sha256 = esp_app_get_elf_sha256_str();
-        size_t current_len = strlen(current_elf_sha256);
-        if (current_len > 0 &&
-            strncmp(manifest->elf_sha256, current_elf_sha256, current_len) == 0) {
-            ESP_LOGI(TAG, "OTA manifest is current elf_sha256=%.12s current=%s",
-                     manifest->elf_sha256, current_elf_sha256);
-            return false;
-        }
-        ESP_LOGI(TAG, "OTA manifest is new elf_sha256=%.12s current=%.12s",
-                 manifest->elf_sha256, current_elf_sha256);
+    vibe_ota_decision_t decision = vibe_ota_update_decision(
+        manifest, VIBE_BOARD_NAME, FIRMWARE_VERSION, FIRMWARE_BUILD_ID,
+        current_sha256, esp_app_get_elf_sha256_str());
+    if (decision == VIBE_OTA_DECISION_UPDATE) {
         return true;
     }
-    if (manifest->build_id[0] == '\0') {
-        ESP_LOGW(TAG, "OTA manifest missing build_id and elf_sha256");
-        return false;
-    }
-    if (strcmp(manifest->build_id, FIRMWARE_BUILD_ID) == 0) {
-        ESP_LOGI(TAG, "OTA manifest is current build_id=%s", manifest->build_id);
-        return false;
-    }
-    return true;
+    ESP_LOGI(TAG, "OTA manifest not selected decision=%d candidate=%s",
+             (int)decision, manifest ? manifest->version : "");
+    return false;
 }
 
-static esp_err_t perform_ota_update(const ota_manifest_t *manifest)
+static esp_err_t perform_ota_update(const vibe_ota_manifest_t *manifest)
 {
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
     ESP_RETURN_ON_FALSE(update_partition != NULL, ESP_ERR_NOT_FOUND, TAG, "no OTA partition");
@@ -4769,7 +4713,7 @@ static void ota_check_task(void *arg)
     (void)arg;
     char path[80];
     char response[768] = {0};
-    ota_manifest_t manifest;
+    vibe_ota_manifest_t manifest;
     bool overlay_shown = false;
 
     snprintf(path, sizeof(path), "%s?board=%s", VIBE_STICK_OTA_MANIFEST_PATH, VIBE_BOARD_NAME);

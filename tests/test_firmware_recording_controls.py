@@ -709,19 +709,14 @@ def test_ota_rejects_lower_semantic_versions_before_hash_comparison() -> None:
     assert '#include "vibe_ota_policy.h"' in source
     assert "bool vibe_ota_parse_semantic_version" in policy
     assert "bool vibe_ota_compare_semantic_versions" in policy
-    assert (
-        "vibe_ota_compare_semantic_versions(manifest->version, FIRMWARE_VERSION"
-        in ota_check
+    assert "vibe_ota_update_decision(" in ota_check
+    assert "if (comparison < 0)" in policy
+    assert "if (comparison == 0)" in policy
+    assert policy.index("if (comparison < 0)") < policy.index(
+        "if (manifest->sha256[0] != '\\0'"
     )
-    assert "version_comparison < 0" in ota_check
-    assert "OTA manifest version is older" in ota_check
-    assert "version_comparison == 0" in ota_check
-    assert "OTA manifest version is not newer" in ota_check
-    assert ota_check.index("version_comparison < 0") < ota_check.index(
-        "if (manifest->sha256[0] != '\\0')"
-    )
-    assert ota_check.index("version_comparison == 0") < ota_check.index(
-        "if (manifest->sha256[0] != '\\0')"
+    assert policy.index("if (comparison == 0)") < policy.index(
+        "if (manifest->sha256[0] != '\\0'"
     )
 
 

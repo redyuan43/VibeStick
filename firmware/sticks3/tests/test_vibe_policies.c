@@ -20,6 +20,24 @@ static void test_ota_versions(void)
     assert(!vibe_ota_version_is_newer("1.2.3", "1.2.3"));
     assert(!vibe_ota_parse_semantic_version("1.2", (uint32_t[3]){0}));
     assert(!vibe_ota_parse_semantic_version("1.2.x", (uint32_t[3]){0}));
+
+    vibe_ota_manifest_t manifest = {
+        .available = true,
+        .board = "sticks3",
+        .version = "1.2.4",
+        .build_id = "build-new",
+    };
+    assert(vibe_ota_update_decision(&manifest, "sticks3", "1.2.3", "build-old",
+                                    "", "") == VIBE_OTA_DECISION_UPDATE);
+    assert(vibe_ota_update_decision(&manifest, "stickc_plus", "1.2.3", "build-old",
+                                    "", "") == VIBE_OTA_DECISION_BOARD_MISMATCH);
+    strcpy(manifest.version, "1.2.3");
+    assert(vibe_ota_update_decision(&manifest, "sticks3", "1.2.3", "build-old",
+                                    "", "") == VIBE_OTA_DECISION_CURRENT_VERSION);
+    strcpy(manifest.version, "1.2.4");
+    strcpy(manifest.sha256, "same");
+    assert(vibe_ota_update_decision(&manifest, "sticks3", "1.2.3", "build-old",
+                                    "same", "") == VIBE_OTA_DECISION_CURRENT_IMAGE_SHA256);
 }
 
 static void test_followup_window(void)
