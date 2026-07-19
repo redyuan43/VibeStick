@@ -537,8 +537,6 @@ def test_idle_backlight_has_dim_and_off_states() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
 
-    assert "VIBE_STICK_IDLE_DIM_MS 15000" in source
-    assert "VIBE_STICK_IDLE_OFF_MS 30000" in source
     assert "VIBE_STICK_IDLE_DIM_MS 30000" in source
     assert "VIBE_STICK_IDLE_OFF_MS 60000" in source
     assert "VIBE_STICK_IDLE_STATE_POLL_MS" not in source
@@ -733,7 +731,8 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
     plus_profile = board_profile.split("#else", 1)[0]
 
-    assert "#define VIBE_STICK_DEEP_SLEEP_MS 60000" in source
+    assert "#define VIBE_STICK_IDLE_DIM_MS 30000" in source
+    assert "#define VIBE_STICK_IDLE_OFF_MS 60000" in source
     assert "#define VIBE_STICK_DEEP_SLEEP_MS 300000" in source
     assert "maybe_enter_deep_sleep(now_ms)" in source
     assert "esp_deep_sleep_start()" in source
@@ -767,6 +766,12 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     assert "motion wake gpio input enabled gpio=%d level=%d" in source
     assert "AXP192 IRQ before motion wake=" in board_source
     assert "shared SYS_INT cleared for MPU6886 wake" in board_source
+    assert "M5PM1_REG_GPIO_PUPD1 0x15" in board_source
+    assert "M5PM1_GPIO4_PULL_UP 0x01" in board_source
+    assert "pull up imu wake gpio" in board_source
+    assert "set irq output function" in board_source
+    assert "set irq output push-pull" in board_source
+    assert "gpio4(pull-up)->gpio1 irq->gpio13" in board_source
     assert "#define BM8563_ADDR 0x51" in board_source
     assert "BM8563_REG_CONTROL_STATUS2" in board_source
     assert "i2c_master_bus_add_device(s_i2c_bus, &rtc_config, &s_rtc_dev)" in board_source
@@ -1254,7 +1259,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.44"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.46"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.34"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher

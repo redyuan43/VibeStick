@@ -32,6 +32,7 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 #define M5PM1_REG_GPIO_OUT 0x11
 #define M5PM1_REG_GPIO_IN 0x12
 #define M5PM1_REG_GPIO_DRV 0x13
+#define M5PM1_REG_GPIO_PUPD1 0x15
 #define M5PM1_REG_GPIO_FUNC0 0x16
 #define M5PM1_REG_GPIO_FUNC1 0x17
 #define M5PM1_REG_GPIO_WAKE_ENABLE 0x18
@@ -56,6 +57,9 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 #define M5PM1_GPIO2_L3B_POWER_EN BIT(2)
 #define M5PM1_GPIO3_SPK_PULSE BIT(3)
 #define M5PM1_GPIO4_IMU_INT BIT(4)
+#define M5PM1_GPIO1_IRQ BIT(1)
+#define M5PM1_GPIO4_PULL_MASK 0x03
+#define M5PM1_GPIO4_PULL_UP 0x01
 #define M5PM1_GPIO_FUNC_MASK(pin) (0x03 << ((pin) * 2))
 #define M5PM1_GPIO_FUNC_GPIO(pin) (0x00 << ((pin) * 2))
 #define M5PM1_GPIO_FUNC_IRQ(pin)  (0x01 << ((pin) * 2))
@@ -403,10 +407,27 @@ esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
 esp_err_t vibe_board_prepare_motion_wake(void)
 {
     ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    /*
+     * StickS3 routes BMI270 INT1 to M5PM1 PYG4, then M5PM1 PYG1_IRQ to
+     * ESP32-S3 GPIO13. Keep PYG4 pulled high while idle so the active-low
+     * BMI270 pulse is the only source that can assert the chained wake line.
+     */
     ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_FUNC1, 0x03, 0x00),
                         TAG, "set imu wake gpio function");
     ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_MODE, M5PM1_GPIO4_IMU_INT, 0),
                         TAG, "set imu wake gpio input");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_PUPD1,
+                                   M5PM1_GPIO4_PULL_MASK,
+                                   M5PM1_GPIO4_PULL_UP),
+                        TAG, "pull up imu wake gpio");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_FUNC0,
+                                   M5PM1_GPIO_FUNC_MASK(1),
+                                   M5PM1_GPIO_FUNC_IRQ(1)),
+                        TAG, "set irq output function");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_MODE, 0, M5PM1_GPIO1_IRQ),
+                        TAG, "set irq output mode");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_DRV, M5PM1_GPIO1_IRQ, 0),
+                        TAG, "set irq output push-pull");
     ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS1, 0x00),
                         TAG, "clear gpio wake irq");
     ESP_RETURN_ON_ERROR(write_reg(M5PM1_REG_IRQ_STATUS2, 0x00),
@@ -415,13 +436,7 @@ esp_err_t vibe_board_prepare_motion_wake(void)
                         TAG, "clear button wake irq");
     ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_IRQ_MASK1, M5PM1_GPIO4_IMU_INT, 0),
                         TAG, "unmask imu gpio irq");
-    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_WAKE_CONFIG,
-                                   M5PM1_GPIO4_IMU_INT, 0),
-                        TAG, "set imu gpio falling-edge wake");
-    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_WAKE_ENABLE,
-                                   0, M5PM1_GPIO4_IMU_INT),
-                        TAG, "enable imu gpio wake");
-    ESP_LOGI(TAG, "M5PM1 IMU wake prepared gpio4->irq gpio13");
+    ESP_LOGI(TAG, "M5PM1 IMU irq chain prepared gpio4(pull-up)->gpio1 irq->gpio13");
     return ESP_OK;
 }
 
@@ -444,10 +459,10 @@ esp_err_t vibe_board_cancel_motion_wake(void)
     ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
     ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_WAKE_ENABLE,
                                    M5PM1_GPIO4_IMU_INT, 0),
-                        TAG, "disable imu gpio wake");
+                        TAG, "disable stale imu gpio wake");
     ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_WAKE_CONFIG,
                                    M5PM1_GPIO4_IMU_INT, 0),
-                        TAG, "reset imu gpio wake edge");
+                        TAG, "reset stale imu gpio wake edge");
     ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_IRQ_MASK1,
                                    0, M5PM1_GPIO4_IMU_INT),
                         TAG, "mask imu gpio irq");
@@ -464,6 +479,10 @@ esp_err_t vibe_board_cancel_motion_wake(void)
     ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_MODE,
                                    M5PM1_GPIO4_IMU_INT, 0),
                         TAG, "restore imu gpio input");
+    ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_PUPD1,
+                                   M5PM1_GPIO4_PULL_MASK,
+                                   M5PM1_GPIO4_PULL_UP),
+                        TAG, "keep imu gpio pulled up");
     return ESP_OK;
 }
 
