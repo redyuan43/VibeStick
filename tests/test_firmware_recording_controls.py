@@ -157,7 +157,7 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     socket_wait = source.split("static void bridge_wait_for_socket_connections", 1)[1]
     socket_wait = socket_wait.split("static size_t bridge_discover_subnet_profiles", 1)[0]
     discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
-    discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
+    discovery = discovery.split("static bool bridge_profiles_merge_scan_results", 1)[0]
     merge = source.split("static bool bridge_profiles_merge_scan_results", 1)[1]
     merge = merge.split("static void bridge_discovery_task", 1)[0]
     task = source.split("static void bridge_discovery_task", 1)[1]
@@ -181,7 +181,7 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     assert "bridge_profiles_merge_scan_results" not in discovery
     assert "bridge_profiles_save_nvs" not in discovery
     assert "s_bridge_scan_profiles[s_bridge_scan_profile_count++] = *profile" in source
-    assert "for (size_t scan_index = 0;" in merge
+    assert "vibe_bridge_profiles_merge(" in merge
     assert "bridge_profiles_save_nvs(scan_ssid)" in merge
     assert "changed" in merge
     assert task.count("bridge_profiles_merge_scan_results(scan_ssid)") == 1
@@ -228,6 +228,9 @@ def test_battery_curves_are_board_specific_and_calibrated() -> None:
 
 def test_idle_pet_bobs_briefly_then_uses_a_low_frequency_static_timer() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    policy = (ROOT / "firmware/sticks3/src/vibe_bridge_profile_policy.c").read_text(
+        encoding="utf-8"
+    )
     activity = source.split("static void register_activity(void)\n{", 1)[1]
     activity = activity.split("static void update_power_saving", 1)[0]
     update_pet = source.split("static void update_pet_visual(void)\n{", 1)[1]
@@ -326,6 +329,9 @@ def test_full_scan_uses_probe_lock_but_saved_bridge_switch_does_not() -> None:
 
 def test_bridge_profile_store_access_uses_lock_and_snapshots() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    policy = (ROOT / "firmware/sticks3/src/vibe_bridge_profile_policy.c").read_text(
+        encoding="utf-8"
+    )
     snapshot_at = source.split("static bool bridge_profile_snapshot_at", 1)[1]
     snapshot_at = snapshot_at.split("static bool bridge_target_profile_snapshot", 1)[0]
     saved_snapshot = source.split("static bool bridge_saved_profile_snapshot_at", 1)[1]
@@ -341,17 +347,19 @@ def test_bridge_profile_store_access_uses_lock_and_snapshots() -> None:
     assert "static void bridge_profiles_unlock(void)" in source
     assert "bridge_profiles_lock();" in snapshot_at
     assert "bridge_profiles_unlock();" in snapshot_at
-    assert "bridge_profile_snapshot_from_discovered" in snapshot_at
+    assert "vibe_bridge_profile_snapshot_from_discovered" in snapshot_at
     assert "bridge_profiles_lock();" in merge
     assert "bridge_profile_views_rebuild();" in merge
+    assert "vibe_bridge_profiles_merge(" in merge
     assert "bridge_profiles_unlock();" in merge
     assert merge.index("bridge_profiles_unlock();") < merge.index(
         "bridge_profiles_save_nvs(scan_ssid)"
     )
     assert "bridge_profiles_lock();" in saved_snapshot
-    assert "bridge_profile_snapshot_from_discovered" in saved_snapshot
+    assert "vibe_bridge_profile_snapshot_from_discovered" in saved_snapshot
     assert "bridge_saved_profile_snapshot_at(index, &profile)" in cycle
     assert "bridge_saved_profile_snapshot_at(next_index, &next)" in cycle
+    assert "bool vibe_bridge_profiles_merge(" in policy
 
 
 def test_background_merge_keeps_active_target_and_wifi_identity_stable() -> None:
@@ -359,7 +367,7 @@ def test_background_merge_keeps_active_target_and_wifi_identity_stable() -> None
     target_lookup = source.split("static bool bridge_target_profile_snapshot", 1)[1]
     target_lookup = target_lookup.split("static void bridge_profile_views_rebuild", 1)[0]
     discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
-    discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
+    discovery = discovery.split("static bool bridge_profiles_merge_scan_results", 1)[0]
     merge = source.split("static bool bridge_profiles_merge_scan_results", 1)[1]
     merge = merge.split("static void bridge_discovery_task", 1)[0]
     task = source.split("static void bridge_discovery_task", 1)[1]
@@ -1274,8 +1282,8 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.46"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.34"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.48"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.36"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher

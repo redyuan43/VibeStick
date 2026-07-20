@@ -92,6 +92,48 @@ static void test_bridge_identity_policy(void)
     assert(!vibe_bridge_identity_is_generic("desk-a"));
     vibe_bridge_fallback_id("192.168.100.142", fallback, sizeof(fallback));
     assert(strcmp(fallback, "lan-192-168-100-142") == 0);
+
+    bridge_discovered_profile_t stored[2] = {
+        {
+            .id = "bridge-a",
+            .label = "A",
+            .host = "192.168.1.10",
+            .port = 8765,
+            .token = "one",
+        },
+    };
+    bridge_discovered_profile_t scanned[2] = {
+        {
+            .id = "bridge-a",
+            .label = "A renamed",
+            .host = "192.168.1.11",
+            .port = 8765,
+            .token = "one",
+        },
+        {
+            .id = "bridge-b",
+            .label = "B",
+            .host = "192.168.1.12",
+            .port = 8765,
+            .token = "two",
+        },
+    };
+    size_t stored_count = 1;
+    size_t skipped = 0;
+    assert(vibe_bridge_profiles_merge(stored, &stored_count, 2,
+                                      scanned, 2, &skipped));
+    assert(stored_count == 2);
+    assert(skipped == 0);
+    assert(strcmp(stored[0].label, "A renamed") == 0);
+    assert(strcmp(stored[0].host, "192.168.1.11") == 0);
+    assert(strcmp(stored[1].id, "bridge-b") == 0);
+
+    bridge_profile_snapshot_t snapshot;
+    vibe_bridge_profile_snapshot_from_discovered(&stored[1], &snapshot);
+    assert(strcmp(snapshot.id, "bridge-b") == 0);
+    bridge_profile_config_t view;
+    vibe_bridge_profile_snapshot_view(&snapshot, &view);
+    assert(strcmp(view.host, "192.168.1.12") == 0);
 }
 
 int main(void)

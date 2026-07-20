@@ -166,10 +166,10 @@
 #define BRIDGE_TARGET_PORT_KEY "port"
 #define BRIDGE_TARGET_SSID_KEY "ssid"
 #define BRIDGE_TARGET_PROFILE_KEY "profile"
-#define BRIDGE_TARGET_HOST_LEN 64
-#define BRIDGE_TARGET_PROFILE_LEN 65
-#define BRIDGE_TARGET_LABEL_LEN 65
-#define BRIDGE_TARGET_TOKEN_LEN 65
+#define BRIDGE_TARGET_HOST_LEN VIBE_BRIDGE_PROFILE_HOST_LEN
+#define BRIDGE_TARGET_PROFILE_LEN VIBE_BRIDGE_PROFILE_ID_LEN
+#define BRIDGE_TARGET_LABEL_LEN VIBE_BRIDGE_PROFILE_LABEL_LEN
+#define BRIDGE_TARGET_TOKEN_LEN VIBE_BRIDGE_PROFILE_TOKEN_LEN
 #define BRIDGE_TARGET_SOURCE_LEN 12
 #define BRIDGE_PROFILE_STORE_KEY "profiles"
 #define BRIDGE_PROFILE_STORE_MAGIC 0x56424250u
@@ -205,14 +205,6 @@ typedef struct {
 
 static const wifi_profile_t k_configured_wifi_profiles[] = VIBE_STICK_WIFI_PROFILES;
 
-typedef struct {
-    const char *id;
-    const char *label;
-    const char *host;
-    int port;
-    const char *token;
-} bridge_profile_config_t;
-
 #ifndef VIBE_STICK_BRIDGE_PROFILES
 #define VIBE_STICK_BRIDGE_PROFILES \
     { { VIBE_STICK_BRIDGE_ID, VIBE_STICK_BRIDGE_LABEL, VIBE_STICK_BRIDGE_HOST, \
@@ -225,22 +217,6 @@ _Static_assert(sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge
 _Static_assert(sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]) <=
                    VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT,
                "too many bridge profiles");
-
-typedef struct {
-    char id[BRIDGE_TARGET_PROFILE_LEN];
-    char label[BRIDGE_TARGET_LABEL_LEN];
-    char host[BRIDGE_TARGET_HOST_LEN];
-    int32_t port;
-    char token[BRIDGE_TARGET_TOKEN_LEN];
-} bridge_discovered_profile_t;
-
-typedef struct {
-    char id[BRIDGE_TARGET_PROFILE_LEN];
-    char label[BRIDGE_TARGET_LABEL_LEN];
-    char host[BRIDGE_TARGET_HOST_LEN];
-    int port;
-    char token[BRIDGE_TARGET_TOKEN_LEN];
-} bridge_profile_snapshot_t;
 
 typedef struct {
     uint32_t magic;
@@ -3182,46 +3158,6 @@ static void bridge_probe_unlock(void)
     }
 }
 
-static void bridge_profile_snapshot_from_config(const bridge_profile_config_t *profile,
-                                                bridge_profile_snapshot_t *snapshot)
-{
-    memset(snapshot, 0, sizeof(*snapshot));
-    if (!profile) {
-        return;
-    }
-    strlcpy(snapshot->id, profile->id ? profile->id : "", sizeof(snapshot->id));
-    strlcpy(snapshot->label, profile->label ? profile->label : "", sizeof(snapshot->label));
-    strlcpy(snapshot->host, profile->host ? profile->host : "", sizeof(snapshot->host));
-    snapshot->port = profile->port;
-    strlcpy(snapshot->token, profile->token ? profile->token : "", sizeof(snapshot->token));
-}
-
-static void bridge_profile_snapshot_from_discovered(const bridge_discovered_profile_t *profile,
-                                                    bridge_profile_snapshot_t *snapshot)
-{
-    memset(snapshot, 0, sizeof(*snapshot));
-    if (!profile) {
-        return;
-    }
-    strlcpy(snapshot->id, profile->id, sizeof(snapshot->id));
-    strlcpy(snapshot->label, profile->label, sizeof(snapshot->label));
-    strlcpy(snapshot->host, profile->host, sizeof(snapshot->host));
-    snapshot->port = (int)profile->port;
-    strlcpy(snapshot->token, profile->token, sizeof(snapshot->token));
-}
-
-static void bridge_profile_snapshot_view(const bridge_profile_snapshot_t *snapshot,
-                                         bridge_profile_config_t *view)
-{
-    *view = (bridge_profile_config_t){
-        .id = snapshot->id,
-        .label = snapshot->label,
-        .host = snapshot->host,
-        .port = snapshot->port,
-        .token = snapshot->token,
-    };
-}
-
 static size_t bridge_profile_count(void)
 {
     bridge_profiles_lock();
@@ -3252,8 +3188,8 @@ static bool bridge_saved_profile_snapshot_at(size_t index,
         bridge_profiles_unlock();
         return false;
     }
-    bridge_profile_snapshot_from_discovered(&s_discovered_bridge_profiles[index],
-                                            snapshot);
+    vibe_bridge_profile_snapshot_from_discovered(
+        &s_discovered_bridge_profiles[index], snapshot);
     bridge_profiles_unlock();
     return true;
 }
@@ -3270,8 +3206,8 @@ static bool bridge_profile_snapshot_at(size_t index, bridge_profile_snapshot_t *
             bridge_profiles_unlock();
             return false;
         }
-        bridge_profile_snapshot_from_discovered(&s_discovered_bridge_profiles[index],
-                                                snapshot);
+        vibe_bridge_profile_snapshot_from_discovered(
+            &s_discovered_bridge_profiles[index], snapshot);
         bridge_profiles_unlock();
         return true;
     }
@@ -3282,7 +3218,8 @@ static bool bridge_profile_snapshot_at(size_t index, bridge_profile_snapshot_t *
     if (index >= configured_count) {
         return false;
     }
-    bridge_profile_snapshot_from_config(&k_configured_bridge_profiles[index], snapshot);
+    vibe_bridge_profile_snapshot_from_config(
+        &k_configured_bridge_profiles[index], snapshot);
     return true;
 }
 
@@ -3298,7 +3235,7 @@ static bool bridge_target_profile_snapshot(const bridge_target_t *target,
         const bridge_discovered_profile_t *profile =
             &s_discovered_bridge_profiles[index];
         if (strcmp(profile->id, target->profile_id) == 0) {
-            bridge_profile_snapshot_from_discovered(profile, snapshot);
+            vibe_bridge_profile_snapshot_from_discovered(profile, snapshot);
             bridge_profiles_unlock();
             return true;
         }
@@ -3310,7 +3247,7 @@ static bool bridge_target_profile_snapshot(const bridge_target_t *target,
     for (size_t index = 0; index < configured_count; index++) {
         const bridge_profile_config_t *profile = &k_configured_bridge_profiles[index];
         if (profile->id && strcmp(profile->id, target->profile_id) == 0) {
-            bridge_profile_snapshot_from_config(profile, snapshot);
+            vibe_bridge_profile_snapshot_from_config(profile, snapshot);
             return true;
         }
     }
@@ -3989,33 +3926,6 @@ static size_t bridge_discover_subnet_profiles(void)
     return s_bridge_scan_profile_count;
 }
 
-static bool bridge_discovered_profile_equal(const bridge_discovered_profile_t *a,
-                                            const bridge_discovered_profile_t *b)
-{
-    return a && b &&
-           strcmp(a->id, b->id) == 0 &&
-           strcmp(a->label, b->label) == 0 &&
-           strcmp(a->host, b->host) == 0 &&
-           a->port == b->port &&
-           strcmp(a->token, b->token) == 0;
-}
-
-static int bridge_discovered_profile_find_locked(const bridge_discovered_profile_t *profile)
-{
-    if (!profile || profile->id[0] == '\0') {
-        return -1;
-    }
-    for (size_t index = 0; index < s_discovered_bridge_profile_count; index++) {
-        bridge_discovered_profile_t *stored = &s_discovered_bridge_profiles[index];
-        if ((stored->id[0] != '\0' && strcmp(stored->id, profile->id) == 0) ||
-            (strcmp(stored->host, profile->host) == 0 &&
-             stored->port == profile->port)) {
-            return (int)index;
-        }
-    }
-    return -1;
-}
-
 static bool bridge_profiles_merge_scan_results(const char *scan_ssid)
 {
     char current_ssid[WIFI_PROFILE_SSID_LEN] = {0};
@@ -4025,37 +3935,23 @@ static bool bridge_profiles_merge_scan_results(const char *scan_ssid)
         return false;
     }
 
-    bool changed = false;
+    size_t skipped_full = 0;
     bridge_profiles_lock();
-    for (size_t scan_index = 0;
-         scan_index < s_bridge_scan_profile_count;
-         scan_index++) {
-        const bridge_discovered_profile_t *profile =
-            &s_bridge_scan_profiles[scan_index];
-        int existing = bridge_discovered_profile_find_locked(profile);
-        if (existing >= 0) {
-            bridge_discovered_profile_t *stored =
-                &s_discovered_bridge_profiles[(size_t)existing];
-            if (!bridge_discovered_profile_equal(stored, profile)) {
-                *stored = *profile;
-                changed = true;
-            }
-        } else {
-            if (s_discovered_bridge_profile_count >=
-                VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT) {
-                ESP_LOGW(TAG, "bridge profile store full; skipping id=%s host=%s",
-                         profile->id, profile->host);
-            } else {
-                s_discovered_bridge_profiles[s_discovered_bridge_profile_count++] =
-                    *profile;
-                changed = true;
-            }
-        }
-    }
+    bool changed = vibe_bridge_profiles_merge(
+        s_discovered_bridge_profiles,
+        &s_discovered_bridge_profile_count,
+        VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT,
+        s_bridge_scan_profiles,
+        s_bridge_scan_profile_count,
+        &skipped_full);
     if (changed) {
         bridge_profile_views_rebuild();
     }
     bridge_profiles_unlock();
+    if (skipped_full > 0) {
+        ESP_LOGW(TAG, "bridge profile store full; skipped=%u",
+                 (unsigned int)skipped_full);
+    }
 
     if (!changed) {
         return false;
@@ -4218,7 +4114,7 @@ static esp_err_t bridge_prepare_active_target(bridge_target_t *target)
     if (!bridge_target_profile_snapshot(&current, &profile)) {
         return ESP_ERR_NOT_FOUND;
     }
-    bridge_profile_snapshot_view(&profile, &profile_view);
+    vibe_bridge_profile_snapshot_view(&profile, &profile_view);
     if (!current.available) {
         if (!bridge_probe_profile(&profile_view, 1200)) {
             bridge_target_note_result(current.profile_id, ESP_FAIL);
