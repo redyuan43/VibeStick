@@ -8,11 +8,8 @@ SECRETS_PATH="$ROOT_DIR/firmware/sticks3/include/vibe_stick_secrets.h"
 CONFIG_DIR="$HOME/Library/Application Support/VibeStick"
 RUNTIME_DIR="$CONFIG_DIR/runtime"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
-PLIST_PATH="$LAUNCH_AGENTS_DIR/com.vibestick.bridge.plist"
-HUD_PLIST_PATH="$LAUNCH_AGENTS_DIR/com.vibestick.hud.plist"
-RUNNER_PATH="$CONFIG_DIR/run-bridge.sh"
-HUD_BINARY_PATH="$CONFIG_DIR/VibeStickHUD"
-HUD_SOURCE_PATH="$ROOT_DIR/app/macos/VibeStickHUD/main.swift"
+PLIST_PATH="$LAUNCH_AGENTS_DIR/com.vibestick.telemetry.plist"
+RUNNER_PATH="$CONFIG_DIR/run-telemetry.sh"
 
 is_placeholder_token() {
   case "${1:-}" in
@@ -100,7 +97,6 @@ python3 -m venv "$RUNTIME_DIR/venv"
 if [ -f "$ENV_PATH" ]; then
   cp "$ENV_PATH" "$CONFIG_DIR/.env"
 fi
-swiftc "$HUD_SOURCE_PATH" -o "$HUD_BINARY_PATH" -framework AppKit -framework QuartzCore
 cat > "$RUNNER_PATH" <<RUNNER
 #!/usr/bin/env sh
 set -eu
@@ -110,7 +106,7 @@ if [ -f "$CONFIG_DIR/.env" ]; then
   . "$CONFIG_DIR/.env"
   set +a
 fi
-exec "$RUNTIME_DIR/venv/bin/python" -m vibe_stick --host 0.0.0.0 --port 8765
+exec "$RUNTIME_DIR/venv/bin/python" -m vibe_stick.telemetry.server --host 0.0.0.0 --port 8878
 RUNNER
 chmod +x "$RUNNER_PATH"
 
@@ -121,7 +117,7 @@ cat > "$PLIST_PATH" <<PLIST
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.vibestick.bridge</string>
+  <string>com.vibestick.telemetry</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
@@ -139,47 +135,18 @@ cat > "$PLIST_PATH" <<PLIST
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>$CONFIG_DIR/bridge.log</string>
+  <string>$CONFIG_DIR/telemetry.log</string>
   <key>StandardErrorPath</key>
-  <string>$CONFIG_DIR/bridge.err.log</string>
-</dict>
-</plist>
-PLIST
-
-cat > "$HUD_PLIST_PATH" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.vibestick.hud</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$HUD_BINARY_PATH</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$CONFIG_DIR/hud.log</string>
-  <key>StandardErrorPath</key>
-  <string>$CONFIG_DIR/hud.err.log</string>
+  <string>$CONFIG_DIR/telemetry.err.log</string>
 </dict>
 </plist>
 PLIST
 
 launchctl bootout "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 || true
-launchctl bootout "gui/$(id -u)" "$HUD_PLIST_PATH" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
-launchctl bootstrap "gui/$(id -u)" "$HUD_PLIST_PATH"
-launchctl kickstart -k "gui/$(id -u)/com.vibestick.bridge"
-launchctl kickstart -k "gui/$(id -u)/com.vibestick.hud"
+launchctl kickstart -k "gui/$(id -u)/com.vibestick.telemetry"
 
 printf '%s\n' "VibeStick config directory is ready:"
 printf '%s\n' "$CONFIG_DIR"
-printf '%s\n' "VibeStick Bridge LaunchAgent installed:"
+printf '%s\n' "VibeStick telemetry LaunchAgent installed:"
 printf '%s\n' "$PLIST_PATH"
-printf '%s\n' "VibeStick Bridge HUD LaunchAgent installed:"
-printf '%s\n' "$HUD_PLIST_PATH"
