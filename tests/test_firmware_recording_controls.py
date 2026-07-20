@@ -10,6 +10,7 @@ BOARD_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board.h"
 BOARD_PROFILE_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board_profile.h"
 MOTION_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_motion.c"
 MOTION_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_motion.h"
+INPUT_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_input.c"
 
 
 def test_front_single_click_toggles_device_recording() -> None:
@@ -107,11 +108,11 @@ def test_ptt_followup_accepts_a_deliberate_press_without_starting_another_record
     source = MAIN_C.read_text(encoding="utf-8")
     button_long = source.split("static void button_long_start_cb", 1)[1]
     button_long = button_long.split("static void bridge_selection_confirm_long_cb", 1)[0]
-    init_button = source.split("static esp_err_t init_button", 1)[1]
-    init_button = init_button.split("static void restore_wake_button_intent", 1)[0]
+    input_source = INPUT_C.read_text(encoding="utf-8")
 
     assert "#define FRONT_PTT_LONG_PRESS_MS 400" in source
-    assert ".press_time = FRONT_PTT_LONG_PRESS_MS" in init_button
+    assert ".front_long_ms = FRONT_PTT_LONG_PRESS_MS" in source
+    assert ".press_time = config->front_long_ms" in input_source
     assert "ptt_followup_enter_window_present()" in button_long
     assert "consume_ptt_followup_enter_window()" in button_long
     assert '"button_followup_enter"' in button_long
@@ -283,8 +284,7 @@ def test_front_button_enters_persistent_bridge_selection_and_confirms_on_hold() 
     button_up = button_up.split("static esp_err_t init_button", 1)[0]
     confirm = source.split("static void bridge_selection_confirm_long_cb", 1)[1]
     confirm = confirm.split("static void button_up_cb", 1)[0]
-    init_button = source.split("static esp_err_t init_button", 1)[1]
-    init_button = init_button.split("static void restore_wake_button_intent", 1)[0]
+    input_source = INPUT_C.read_text(encoding="utf-8")
 
     assert "static atomic_bool s_bridge_selection_active;" in source
     assert "static atomic_int_fast64_t s_bridge_selection_entry_deadline_ms;" in source
@@ -297,8 +297,9 @@ def test_front_button_enters_persistent_bridge_selection_and_confirms_on_hold() 
     assert "static void bridge_control_task" in source
     assert 'xTaskCreatePinnedToCore(bridge_control_task, "bridge_control"' in source
     assert "#define BRIDGE_SELECTION_CONFIRM_HOLD_MS 1500" in source
-    assert ".press_time = BRIDGE_SELECTION_CONFIRM_HOLD_MS" in init_button
-    assert "bridge_selection_confirm_long_cb" in init_button
+    assert ".front_confirm_ms = BRIDGE_SELECTION_CONFIRM_HOLD_MS" in source
+    assert ".press_time = config->front_confirm_ms" in input_source
+    assert ".front_confirm = bridge_selection_confirm_long_cb" in source
     assert '"CONFIRMING"' in source
     assert '"CONFIRMED"' in source
 
@@ -821,7 +822,8 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     assert "esp_sleep_enable_ext1_wakeup_io(" in source
     assert "vibe_board_prepare_motion_wake()" in source
     assert "#define VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL 1" in board_profile
-    assert ".disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL" in source
+    input_source = INPUT_C.read_text(encoding="utf-8")
+    assert ".disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL" in input_source
 
 
 def test_recording_mode_preference_survives_deep_sleep_restart() -> None:
@@ -848,10 +850,9 @@ def test_recording_trigger_is_independent_from_disabled_cyber_intents() -> None:
     intent_toggle = intent_toggle.split("static void lvgl_lock", 1)[0]
     migration = source.split("static void migrate_legacy_recording_mode", 1)[1]
     migration = migration.split("static esp_err_t restore_recording_mode_preference", 1)[0]
-    init_button = source.split("static esp_err_t init_button", 1)[1]
-    init_button = init_button.split("static void restore_wake_button_intent", 1)[0]
-    side_button_setup = init_button.split(
-        "iot_button_new_gpio_device(&button_config, &side_gpio_config", 1
+    input_source = INPUT_C.read_text(encoding="utf-8")
+    side_button_setup = input_source.split(
+        "iot_button_new_gpio_device(&button_config, &side_gpio", 1
     )[1]
 
     assert "VIBE_STICK_ANIM_PREVIEW 0" in source
@@ -977,11 +978,10 @@ def test_s3_deep_sleep_wake_gpio_preserves_internal_button_pullups() -> None:
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
     sleep = source.split("static bool enter_deep_sleep(void)", 1)[1]
     sleep = sleep.split("static void maybe_enter_deep_sleep", 1)[0]
-    init_button = source.split("static esp_err_t init_button", 1)[1]
-    init_button = init_button.split("static void capture_deep_sleep_front_button_intent", 1)[0]
+    input_source = INPUT_C.read_text(encoding="utf-8")
 
     assert "#define VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL 0" in board_profile
-    assert ".disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL" in init_button
+    assert ".disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL" in input_source
     assert "rtc_gpio_pullup_en(VIBE_BOARD_PIN_BUTTON_FRONT)" in source
     assert "rtc_gpio_pulldown_dis(VIBE_BOARD_PIN_BUTTON_FRONT)" in source
     assert "configure_deep_sleep_button_pullups(wake_mask)" in sleep
@@ -1062,10 +1062,8 @@ def test_board_power_rails_are_disabled_before_deep_sleep() -> None:
 
 
 def test_side_button_gpio_keeps_power_save_enabled() -> None:
-    source = MAIN_C.read_text(encoding="utf-8")
-    init_button = source.split("static esp_err_t init_button", 1)[1]
-    init_button = init_button.split("static void capture_deep_sleep_front_button_intent", 1)[0]
-    side_gpio = init_button.split("const button_gpio_config_t side_gpio_config", 1)[1]
+    input_source = INPUT_C.read_text(encoding="utf-8")
+    side_gpio = input_source.split("const button_gpio_config_t side_gpio", 1)[1]
     side_gpio = side_gpio.split("};", 1)[0]
 
     assert ".enable_power_save = true" in side_gpio
@@ -1139,10 +1137,7 @@ def test_side_button_defers_three_second_toggle_and_uses_six_seconds_for_manual_
     )[0]
     release = source.split("static void side_button_up_cb", 1)[1]
     release = release.split("static void button_long_start_cb", 1)[0]
-    init_button = source.split("static esp_err_t init_button", 1)[1]
-    init_button = init_button.split(
-        "static void capture_deep_sleep_front_button_intent", 1
-    )[0]
+    input_source = INPUT_C.read_text(encoding="utf-8")
 
     assert "SIDE_MODE_TOGGLE_HOLD_MS 3000" in source
     assert "SIDE_MANUAL_CALIBRATION_HOLD_MS 6000" in source
@@ -1151,8 +1146,10 @@ def test_side_button_defers_three_second_toggle_and_uses_six_seconds_for_manual_
     assert "s_side_button_calibration_hold_reached" in release
     assert "VIBE_STICK_EVENT_MOTION_CALIBRATE" in release
     assert "VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE" in release
-    assert ".press_time = SIDE_MODE_TOGGLE_HOLD_MS" in init_button
-    assert ".press_time = SIDE_MANUAL_CALIBRATION_HOLD_MS" in init_button
+    assert ".side_mode_ms = SIDE_MODE_TOGGLE_HOLD_MS" in source
+    assert ".side_calibration_ms = SIDE_MANUAL_CALIBRATION_HOLD_MS" in source
+    assert ".press_time = config->side_mode_ms" in input_source
+    assert ".press_time = config->side_calibration_ms" in input_source
 
 
 def test_motion_wake_is_confirmed_before_recording_and_false_wake_returns_to_sleep() -> None:

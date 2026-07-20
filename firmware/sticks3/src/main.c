@@ -11,6 +11,7 @@
 #include "vibe_board.h"
 #include "vibe_board_profile.h"
 #include "vibe_bridge_profile_policy.h"
+#include "vibe_input.h"
 #include "vibe_motion.h"
 #include "vibe_ota_policy.h"
 #include "vibe_power_policy.h"
@@ -20,7 +21,6 @@
 #include "vibe_stick_pet_assets.h"
 #include "vibe_wifi_policy.h"
 #include "vibe_wav.h"
-#include "button_gpio.h"
 #include "cJSON.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -50,7 +50,6 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "iot_button.h"
 #include "lvgl.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -1437,7 +1436,7 @@ static bool deep_sleep_should_stay_awake(void)
 
 static bool front_button_is_pressed(void)
 {
-    return gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0;
+    return vibe_input_front_pressed();
 }
 
 static void reset_front_button_fallback(void)
@@ -6098,71 +6097,24 @@ static void button_up_cb(void *button_handle, void *usr_data)
 
 static esp_err_t init_button(void)
 {
-    button_handle_t button = NULL;
-    button_handle_t side_button = NULL;
-    const button_config_t button_config = {0};
-    const button_gpio_config_t gpio_config = {
-        .gpio_num = VIBE_BOARD_PIN_BUTTON_FRONT,
-        .active_level = 0,
-        .enable_power_save = true,
-        .disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL,
+    const vibe_input_config_t config = {
+        .front_long_ms = FRONT_PTT_LONG_PRESS_MS,
+        .front_confirm_ms = BRIDGE_SELECTION_CONFIRM_HOLD_MS,
+        .side_mode_ms = SIDE_MODE_TOGGLE_HOLD_MS,
+        .side_calibration_ms = SIDE_MANUAL_CALIBRATION_HOLD_MS,
     };
-    ESP_RETURN_ON_ERROR(iot_button_new_gpio_device(&button_config, &gpio_config, &button), TAG, "button");
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_PRESS_DOWN, NULL, button_press_down_cb, NULL),
-                        TAG, "button down");
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_SINGLE_CLICK, NULL, button_single_click_cb, NULL),
-                        TAG, "button single");
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_DOUBLE_CLICK, NULL, button_double_click_cb, NULL),
-                        TAG, "button double");
-    button_event_args_t front_long_press_args = {
-        .long_press = {
-            .press_time = FRONT_PTT_LONG_PRESS_MS,
-        },
+    const vibe_input_callbacks_t callbacks = {
+        .front_down = button_press_down_cb,
+        .front_single = button_single_click_cb,
+        .front_double = button_double_click_cb,
+        .front_long = button_long_start_cb,
+        .front_confirm = bridge_selection_confirm_long_cb,
+        .front_up = button_up_cb,
+        .side_up = side_button_up_cb,
+        .side_mode_hold = side_button_long_start_cb,
+        .side_calibration_hold = side_button_calibration_long_start_cb,
     };
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_LONG_PRESS_START, &front_long_press_args, button_long_start_cb, NULL),
-                        TAG, "button long");
-    button_event_args_t bridge_confirm_args = {
-        .long_press = {
-            .press_time = BRIDGE_SELECTION_CONFIRM_HOLD_MS,
-        },
-    };
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_LONG_PRESS_START,
-                                               &bridge_confirm_args,
-                                               bridge_selection_confirm_long_cb,
-                                               NULL),
-                        TAG, "button bridge confirm");
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(button, BUTTON_PRESS_UP, NULL, button_up_cb, NULL),
-                        TAG, "button up");
-
-    const button_gpio_config_t side_gpio_config = {
-        .gpio_num = VIBE_BOARD_PIN_BUTTON_SIDE,
-        .active_level = 0,
-        .enable_power_save = true,
-        .disable_pull = VIBE_BOARD_BUTTONS_DISABLE_INTERNAL_PULL,
-    };
-    ESP_RETURN_ON_ERROR(iot_button_new_gpio_device(&button_config, &side_gpio_config, &side_button), TAG, "side button");
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(side_button, BUTTON_PRESS_UP, NULL,
-                                               side_button_up_cb, NULL),
-                        TAG, "side button release");
-    button_event_args_t side_long_press_args = {
-        .long_press = {
-            .press_time = SIDE_MODE_TOGGLE_HOLD_MS,
-        },
-    };
-    ESP_RETURN_ON_ERROR(iot_button_register_cb(side_button, BUTTON_LONG_PRESS_START, &side_long_press_args,
-                                               side_button_long_start_cb, NULL),
-                        TAG, "side button long");
-    button_event_args_t side_calibration_press_args = {
-        .long_press = {
-            .press_time = SIDE_MANUAL_CALIBRATION_HOLD_MS,
-        },
-    };
-    ESP_RETURN_ON_ERROR(
-        iot_button_register_cb(side_button, BUTTON_LONG_PRESS_START,
-                               &side_calibration_press_args,
-                               side_button_calibration_long_start_cb, NULL),
-        TAG, "side button calibration");
-    return ESP_OK;
+    return vibe_input_init(&config, &callbacks);
 }
 
 static void capture_deep_sleep_front_button_intent(void)
