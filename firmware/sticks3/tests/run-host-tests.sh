@@ -11,5 +11,6 @@ cc -std=c11 -Wall -Wextra -Werror \
   src/vibe_power_policy.c \
   src/vibe_bridge_profile_policy.c \
   src/vibe_wifi_policy.c \
+  src/vibe_wav.c \
   -o build-host-tests/test_vibe_policies
 ./build-host-tests/test_vibe_policies

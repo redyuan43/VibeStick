@@ -3,6 +3,7 @@
 #include "vibe_power_policy.h"
 #include "vibe_recording_policy.h"
 #include "vibe_wifi_policy.h"
+#include "vibe_wav.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -187,6 +188,33 @@ static void test_wifi_profile_policy(void)
     assert(vibe_wifi_reconnect_delay_ms(4, 10000) == 10000);
 }
 
+static void test_wav_payload_policy(void)
+{
+    uint8_t wav[48] = {
+        'R', 'I', 'F', 'F', 40, 0, 0, 0,
+        'W', 'A', 'V', 'E',
+        'f', 'm', 't', ' ', 16, 0, 0, 0,
+        1, 0, 1, 0, 0x80, 0x3e, 0, 0,
+        0, 0x7d, 0, 0, 2, 0, 16, 0,
+        'd', 'a', 't', 'a', 4, 0, 0, 0,
+        1, 0, 2, 0,
+    };
+    const uint8_t *pcm = NULL;
+    size_t pcm_len = 0;
+    assert(vibe_wav_pcm_payload(wav, sizeof(wav), 16000, 1, 16,
+                                &pcm, &pcm_len));
+    assert(pcm == wav + 44);
+    assert(pcm_len == 4);
+
+    wav[22] = 2;
+    assert(!vibe_wav_pcm_payload(wav, sizeof(wav), 16000, 1, 16,
+                                 &pcm, &pcm_len));
+    wav[22] = 1;
+    wav[40] = 8;
+    assert(!vibe_wav_pcm_payload(wav, sizeof(wav), 16000, 1, 16,
+                                 &pcm, &pcm_len));
+}
+
 int main(void)
 {
     test_ota_versions();
@@ -194,6 +222,7 @@ int main(void)
     test_power_policy();
     test_bridge_identity_policy();
     test_wifi_profile_policy();
+    test_wav_payload_policy();
     puts("vibestick policy tests passed");
     return 0;
 }
