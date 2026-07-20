@@ -759,6 +759,8 @@ def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
 
 def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    enter_sleep = source.split("static bool enter_deep_sleep(void)", 1)[1]
+    enter_sleep = enter_sleep.split("static void maybe_enter_deep_sleep", 1)[0]
     motion_source = (ROOT / "firmware/sticks3/src/vibe_motion.c").read_text(encoding="utf-8")
     motion_header = (ROOT / "firmware/sticks3/include/vibe_motion.h").read_text(encoding="utf-8")
     board_source = BOARD_C.read_text(encoding="utf-8")
@@ -792,7 +794,10 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     assert "static bool wait_for_motion_wake_idle(void)" in source
     assert "vibe_motion_clear_wake_status()" in source
     assert "vibe_board_clear_motion_wake_status()" in source
-    assert "if (!wait_for_motion_wake_idle())" in source
+    assert "if (motion_wake_enabled && !wait_for_motion_wake_idle())" in enter_sleep
+    assert enter_sleep.index("const bool motion_wake_enabled") < enter_sleep.index(
+        "wait_for_motion_wake_idle()"
+    )
     assert "#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE\nstatic bool wait_for_motion_wake_idle(void)" in source
     assert "static esp_err_t configure_motion_wake_gpio_input(void)" in source
     assert ".pin_bit_mask = 1ULL << VIBE_BOARD_PIN_MOTION_WAKE" in source

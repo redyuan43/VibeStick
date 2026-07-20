@@ -1786,6 +1786,13 @@ static bool enter_deep_sleep(void)
 {
     uint64_t wake_mask = sleep_button_wake_mask();
     gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
+    const bool motion_wake_enabled =
+        s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
+        VIBE_BOARD_PIN_MOTION_WAKE != GPIO_NUM_NC;
+#else
+    const bool motion_wake_enabled = false;
+#endif
     if (sleep_wake_gpio_is_active(ext0_gpio)) {
         s_deep_sleep_block_reason = "front_gpio_low";
         ESP_LOGW(TAG, "deep sleep skipped: ext0 wake gpio=%d is already active",
@@ -1798,7 +1805,7 @@ static bool enter_deep_sleep(void)
         return false;
     }
 #if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
-    if (!wait_for_motion_wake_idle()) {
+    if (motion_wake_enabled && !wait_for_motion_wake_idle()) {
         s_deep_sleep_block_reason = "motion_gpio_unsettled";
         cancel_imu_deep_sleep_wake();
         return false;
@@ -1816,9 +1823,6 @@ static bool enter_deep_sleep(void)
     vTaskDelay(pdMS_TO_TICKS(1));
 #endif
 #if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
-    const bool motion_wake_enabled =
-        s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
-        VIBE_BOARD_PIN_MOTION_WAKE != GPIO_NUM_NC;
     if (motion_wake_enabled &&
         sleep_wake_gpio_is_active(VIBE_BOARD_PIN_MOTION_WAKE)) {
         s_deep_sleep_block_reason = "motion_gpio_low";
@@ -1827,8 +1831,6 @@ static bool enter_deep_sleep(void)
         cancel_imu_deep_sleep_wake();
         return false;
     }
-#else
-    const bool motion_wake_enabled = false;
 #endif
 
     esp_err_t err = save_deep_sleep_record(wake_mask);
