@@ -126,13 +126,10 @@ OTA 依赖三个条件：
 
 - 设备已经通过 USB 烧录过带 OTA 分区布局的固件。
 - 设备和本机 bridge 在同一个可互通的 2.4GHz Wi-Fi 网络。
-- 本机 bridge 正在运行并监听 `0.0.0.0:8765`。
+- CapsWriter M5 bridge 正在运行并监听 `0.0.0.0:8765`。
 
-启动开发 bridge：
-
-```sh
-./scripts/dev.sh
-```
+Python 的 `scripts/dev.sh` 只启动独立电池遥测服务 `8878`，不能替代
+CapsWriter 的语音和 OTA bridge。
 
 发布 S3 OTA：
 
@@ -155,7 +152,7 @@ firmware/sticks3/ota/<board>.json
 firmware/sticks3/ota/<board>.bin
 ```
 
-bridge 会通过下面两个接口提供 OTA：
+CapsWriter bridge 会通过下面两个接口提供 OTA：
 
 ```text
 /ota/manifest?board=sticks3

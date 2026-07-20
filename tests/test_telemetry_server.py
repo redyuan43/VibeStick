@@ -10,7 +10,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from vibe_stick.server import app
 from vibe_stick.telemetry import server as telemetry_server
 from vibe_stick.telemetry.store import TelemetryStore
 
@@ -23,21 +22,6 @@ class TelemetryServerTests(unittest.TestCase):
 
         self.assertIn("battery_telemetry_v1", health["features"])
         self.assertEqual(health["service_name"], "vibestick-telemetry")
-
-    def test_legacy_bridge_no_longer_serves_telemetry_routes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = type(
-                "Store",
-                (),
-                {
-                    "register_device_request": lambda *args, **kwargs: None,
-                },
-            )()
-            handler = app.make_handler(store)  # type: ignore[arg-type]
-            with _http_server(handler) as base:
-                status, _ = _request(base, "GET", "/telemetry/v1/devices")
-
-        self.assertEqual(status, 404)
 
     def test_protected_telemetry_post_requires_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

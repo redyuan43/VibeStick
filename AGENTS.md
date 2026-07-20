@@ -24,10 +24,8 @@
 
 - The M5 bridge in `/home/ivan/github/capswriter-agx-client` uses the fixed
   port `8765` and is the default receiver for normal device use.
-- This repository's `scripts/dev.sh` is only for standalone Python bridge
-  debugging and defaults to port `8766` to avoid conflicting with CapsWriter.
-- Start only CapsWriter for normal device use. Do not run both bridges at the
-  same time, and do not change `scripts/dev.sh` back to port `8765`.
-- Firmware still targets CapsWriter at `192.168.31.225:8765`. Tests using
-  `scripts/dev.sh` must explicitly configure a matching target and must not
-  assume devices will automatically connect to port `8766`.
+- This repository's Python runtime is telemetry-only. `scripts/dev.sh` starts
+  the battery telemetry service on port `8878`; it does not receive voice
+  recordings, serve OTA firmware, or replace CapsWriter.
+- Start CapsWriter for normal device use. Firmware targets CapsWriter at
+  `192.168.31.225:8765`.

@@ -1,2 +1,0 @@
-"""Local paste package."""
-

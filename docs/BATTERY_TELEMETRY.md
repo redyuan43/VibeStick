@@ -7,7 +7,7 @@ VibeStick includes dedicated battery-test firmware for:
 
 These images are test firmware, not replacements for the normal StickS3
 VibeStick firmware. They keep the display and Wi-Fi workload stable while
-sending power samples to the local bridge.
+sending power samples to the dedicated telemetry service.
 
 ## What Is Measured
 

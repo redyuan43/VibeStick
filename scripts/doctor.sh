@@ -233,150 +233,12 @@ check_telemetry_secrets() {
   fi
 }
 
-check_bridge_health() {
-  if command -v curl >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1; then
-    pass "Bridge health endpoint responded on 127.0.0.1:8765."
+check_telemetry_health() {
+  if command -v curl >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8878/health >/dev/null 2>&1; then
+    pass "Telemetry health endpoint responded on 127.0.0.1:8878."
   else
-    warn "Bridge health endpoint is not responding on 127.0.0.1:8765."
+    warn "Telemetry health endpoint is not responding on 127.0.0.1:8878."
   fi
-}
-
-check_asr() {
-  if python3 - "$ENV_PATH" "$APP_SUPPORT_DIR" <<'PY'
-import os
-import sys
-import tomllib
-from pathlib import Path
-
-env_path = Path(sys.argv[1])
-app_support = Path(sys.argv[2])
-
-def clean(value):
-    if value is None:
-        return ""
-    value = str(value).strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        value = value[1:-1].strip()
-    return value
-
-def present(value):
-    value = clean(value)
-    return bool(value) and value.lower() not in {
-        "changeme",
-        "change-me",
-        "your-key",
-        "your-api-key",
-        "paste-api-key-here",
-    }
-
-def read_dotenv(path):
-    data = {}
-    try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        return data
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        data[key.strip()] = clean(value)
-    return data
-
-def merged_env(path):
-    data = read_dotenv(path)
-    for key in (
-        "VIBE_STICK_TRANSCRIBE_CMD",
-        "VIBE_STICK_ASR_PROVIDER",
-        "VIBE_STICK_ASR_BASE_URL",
-        "VIBE_STICK_ASR_API_KEY",
-        "VIBE_STICK_GROQ_API_KEY",
-    ):
-        if key in os.environ:
-            data[key] = os.environ[key]
-    return data
-
-def env_has_asr(data):
-    if present(data.get("VIBE_STICK_TRANSCRIBE_CMD")):
-        return True
-    provider = clean(data.get("VIBE_STICK_ASR_PROVIDER")).lower()
-    base_url = data.get("VIBE_STICK_ASR_BASE_URL")
-    asr_key = data.get("VIBE_STICK_ASR_API_KEY")
-    groq_key = data.get("VIBE_STICK_GROQ_API_KEY")
-    if provider == "groq":
-        return present(asr_key) or present(groq_key)
-    if provider == "openai-compatible" or present(base_url) or present(asr_key):
-        return present(base_url) and present(asr_key)
-    return present(groq_key)
-
-def toml_has_asr(path):
-    try:
-        data = tomllib.loads(path.read_text())
-    except (OSError, tomllib.TOMLDecodeError):
-        return False
-    provider = clean(data.get("asr_provider") or data.get("provider")).lower()
-    base_url = data.get("base_url")
-    api_key = data.get("api_key")
-    groq_key = data.get("groq_api_key")
-    if provider == "groq":
-        return present(groq_key) or present(api_key)
-    if provider == "openai-compatible" or present(base_url) or present(api_key):
-        return present(base_url) and present(api_key)
-    return False
-
-dotenv = merged_env(env_path)
-ok = env_has_asr(dotenv) or any(
-    toml_has_asr(path)
-    for path in (app_support / "asr.toml", app_support / "config.toml")
-)
-raise SystemExit(0 if ok else 1)
-PY
-  then
-    pass "ASR is configured through command, Groq, or OpenAI-compatible settings."
-  else
-    warn "ASR is not configured; recording can capture audio but will not transcribe."
-  fi
-}
-
-check_claude_token() {
-  claude_usage="$(env_value VIBE_STICK_CLAUDE_USAGE "$ENV_PATH" | tr '[:upper:]' '[:lower:]')"
-  case "$claude_usage" in
-    1|true|yes|on)
-      if PYTHONPATH="$ROOT_DIR/bridge/src" python3 - "$ENV_PATH" <<'PY'
-import os
-import sys
-from pathlib import Path
-
-env_path = Path(sys.argv[1])
-
-def load_dotenv(path):
-    try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        return
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        value = value.strip().strip("\"'")
-        os.environ.setdefault(key.strip(), value)
-
-load_dotenv(env_path)
-from vibe_stick.claude.usage import resolve_token
-
-raise SystemExit(0 if resolve_token() else 1)
-PY
-      then
-        pass "Claude usage is on and an OAuth token can be resolved: yes."
-      else
-        warn "Claude usage is on but an OAuth token can be resolved: no."
-      fi
-      ;;
-    *)
-      pass "Claude usage is off; token resolution skipped."
-      ;;
-  esac
 }
 
 check_python
@@ -385,9 +247,6 @@ check_dotenv
 check_secrets
 check_token_match
 check_telemetry_secrets
-check_bridge_health
-check_asr
-check_claude_token
+check_telemetry_health
 
-printf 'INFO macOS permissions: grant Microphone permission for recording and Accessibility permission for the bridge runner/terminal that performs paste injection.\n'
 printf 'SUMMARY pass=%s warn=%s fail=%s\n' "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
