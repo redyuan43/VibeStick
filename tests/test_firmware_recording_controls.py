@@ -11,6 +11,9 @@ BOARD_PROFILE_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board_profil
 MOTION_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_motion.c"
 MOTION_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_motion.h"
 INPUT_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_input.c"
+RECORDING_UPLOAD_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_recording_upload.c"
+)
 
 
 def test_front_single_click_toggles_device_recording() -> None:
@@ -144,9 +147,11 @@ def test_ptt_followup_enter_arms_after_long_press_or_tap_stop() -> None:
 
 def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
 
     assert "start_recording_upload_task()" in source
-    assert "upload_recording_chunk(buffer, audio_len)" in source
+    assert ".post_chunk = upload_recording_chunk" in source
+    assert "s_config.post_chunk(buffer, audio_len, s_config.context)" in upload_source
     assert "VIBE_STICK_RECORDING_AUDIO_PATH" in source
     assert '\\"session_id\\":\\"%s\\",\\"intent\\":\\"%s\\",\\"mode\\":\\"%s\\"' in source
 
@@ -412,19 +417,22 @@ def test_concurrent_bridge_switch_ignores_stale_network_results() -> None:
 
 def test_background_scan_uses_atomic_recording_lifecycle_flags() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
     busy = source.split("static bool recording_network_busy", 1)[1]
     busy = busy.split("static agent_state_t", 1)[0]
 
     assert "static atomic_bool s_recording_session_active;" in source
-    assert "static atomic_bool s_recording_upload_active;" in source
+    assert "static atomic_bool s_active;" in upload_source
     assert "atomic_load(&s_recording_session_active)" in busy
-    assert "atomic_load(&s_recording_upload_active)" in busy
+    assert "vibe_recording_upload_active()" in busy
     assert "s_recording_session_id[0]" not in busy
     assert "s_recording_upload_task" not in busy
     assert "set_recording_session_active(true);" in source
     assert "set_recording_session_active(false);" in source
-    assert "set_recording_upload_active(true);" in source
-    assert "set_recording_upload_active(false);" in source
+    assert "atomic_exchange(&s_active, true)" in upload_source
+    assert "atomic_store(&s_active, false);" in upload_source
+    assert "xSemaphoreTake(s_completion, portMAX_DELAY)" in upload_source
+    assert "vibe_recording_upload_wait();" in source
     assert "bridge_profile_at(" not in source
     assert "bridge_target_profile(&" not in source
 
@@ -548,11 +556,13 @@ def test_followup_enter_and_escape_use_distinct_buzz_sounds() -> None:
 
 def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
 
     assert "append=1" in source
-    assert "recording diagnostics board=%s" in source
+    assert "recording diagnostics board=%s" in upload_source
     assert "esp_wifi_sta_get_ap_info" in source
-    assert "post_ms_min" in source
+    assert "post_ms_min" in upload_source
+    assert "vibe_recording_upload_log_diagnostics" in source
 
 
 def test_idle_backlight_has_dim_and_off_states() -> None:

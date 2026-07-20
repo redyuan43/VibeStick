@@ -56,6 +56,35 @@ static void test_followup_window(void)
     assert(!vibe_recording_followup_present(&window));
 }
 
+static void test_recording_upload_stats(void)
+{
+    vibe_recording_upload_stats_t stats;
+    vibe_recording_upload_stats_reset(&stats, -48, -127);
+    assert(stats.post_duration_min_ms == -1);
+    assert(stats.start_rssi == -48);
+    assert(stats.stop_rssi == -127);
+
+    vibe_recording_upload_stats_note_pending(&stats, 3);
+    vibe_recording_upload_stats_note_pending(&stats, 2);
+    assert(stats.max_pending_chunks == 3);
+
+    vibe_recording_upload_stats_note_read(&stats, true);
+    vibe_recording_upload_stats_note_read(&stats, false);
+    assert(stats.read_timeouts == 1);
+    assert(stats.read_failures == 1);
+
+    vibe_recording_upload_stats_note_post(&stats, 40, 9600, true);
+    vibe_recording_upload_stats_note_post(&stats, 20, 0, false);
+    vibe_recording_upload_stats_note_post(&stats, -5, 4800, true);
+    assert(stats.upload_posts == 2);
+    assert(stats.uploaded_bytes == 14400);
+    assert(stats.upload_failures == 1);
+    assert(stats.post_duration_min_ms == 0);
+    assert(stats.post_duration_max_ms == 40);
+    assert(stats.post_duration_total_ms == 60);
+    assert(vibe_recording_upload_stats_average_post_ms(&stats) == 30);
+}
+
 static void test_power_policy(void)
 {
     vibe_power_policy_input_t input = {
@@ -219,6 +248,7 @@ int main(void)
 {
     test_ota_versions();
     test_followup_window();
+    test_recording_upload_stats();
     test_power_policy();
     test_bridge_identity_policy();
     test_wifi_profile_policy();

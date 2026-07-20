@@ -16,6 +16,7 @@
 #include "vibe_ota_policy.h"
 #include "vibe_power_policy.h"
 #include "vibe_recording_policy.h"
+#include "vibe_recording_upload.h"
 #include "vibe_stick_anim_assets.h"
 #include "vibe_stick_config.h"
 #include "vibe_stick_pet_assets.h"
@@ -77,7 +78,6 @@
 #define BATTERY_HIGH_THRESHOLD_PERCENT 50
 #define RECORDING_UPLOAD_BATCH_CHUNKS 4
 #define RECORDING_UPLOAD_BUFFER_BYTES 8192
-#define RECORDING_UPLOAD_WAIT_MS 10000
 #define RECORDING_START_TIMEOUT_MS 1200
 #define RECORDING_STOP_TIMEOUT_MS 210000
 #define PTT_ENTER_GRACE_MS 3000
@@ -368,20 +368,6 @@ typedef enum {
     BRIDGE_SELECTION_UI_CONFIRMED,
 } bridge_selection_ui_phase_t;
 
-typedef struct {
-    size_t upload_posts;
-    size_t uploaded_bytes;
-    size_t upload_failures;
-    size_t read_failures;
-    size_t read_timeouts;
-    size_t max_pending_chunks;
-    int64_t post_duration_total_ms;
-    int64_t post_duration_min_ms;
-    int64_t post_duration_max_ms;
-    int start_rssi;
-    int stop_rssi;
-} recording_upload_stats_t;
-
 static QueueHandle_t s_event_queue;
 static QueueHandle_t s_bridge_control_queue;
 static SemaphoreHandle_t s_lvgl_lock;
@@ -443,9 +429,6 @@ static char s_last_alert_type[24];
 static bool s_alert_sound_baseline_ready;
 static char s_recording_session_id[40];
 static atomic_bool s_recording_session_active;
-static TaskHandle_t s_recording_upload_task;
-static atomic_bool s_recording_upload_active;
-static atomic_bool s_recording_upload_failed;
 static TaskHandle_t s_recording_finalize_task;
 static atomic_bool s_recording_finalize_active;
 static char s_recording_finalize_event_name[32];
@@ -465,7 +448,6 @@ static int64_t s_last_deep_sleep_diagnostic_report_ms;
 static const char *s_deep_sleep_block_reason = "boot";
 static uint8_t s_current_backlight = LCD_BACKLIGHT_DEFAULT;
 static display_power_state_t s_display_power_state = DISPLAY_POWER_ACTIVE;
-static recording_upload_stats_t s_recording_upload_stats;
 static uint8_t *s_pet_pixels;
 static vibe_stick_pet_frame_id_t s_pet_current_frame = VIBE_STICK_PET_FRAME_COUNT;
 static int64_t s_pet_next_frame_ms;
@@ -573,16 +555,6 @@ static void set_ota_in_progress(bool in_progress)
     atomic_store(&s_ota_in_progress, in_progress);
 }
 
-static bool recording_upload_failed(void)
-{
-    return atomic_load(&s_recording_upload_failed);
-}
-
-static void set_recording_upload_failed(bool failed)
-{
-    atomic_store(&s_recording_upload_failed, failed);
-}
-
 static bool recording_finalize_active(void)
 {
     return atomic_load(&s_recording_finalize_active);
@@ -598,16 +570,11 @@ static void set_recording_session_active(bool active)
     atomic_store(&s_recording_session_active, active);
 }
 
-static void set_recording_upload_active(bool active)
-{
-    atomic_store(&s_recording_upload_active, active);
-}
-
 static bool recording_network_busy(void)
 {
     return vibe_audio_is_recording() ||
            atomic_load(&s_recording_session_active) ||
-           atomic_load(&s_recording_upload_active) ||
+           vibe_recording_upload_active() ||
            recording_finalize_active();
 }
 
@@ -1410,14 +1377,12 @@ static bool display_should_stay_active(void)
 {
     const bool active_work =
            s_recording_overlay_visible ||
-           vibe_audio_is_recording() ||
-           s_recording_session_id[0] != '\0' ||
+           recording_network_busy() ||
            s_tap_recording_active ||
            s_motion_recording_active ||
            s_motion_calibrating ||
            s_motion_wake_confirm_pending ||
-           s_motion_wake_network_pending ||
-           recording_finalize_active();
+           s_motion_wake_network_pending;
     return active_work;
 }
 
@@ -5188,66 +5153,10 @@ static int current_wifi_rssi(void)
     return ap.rssi;
 }
 
-static void reset_recording_upload_stats(void)
+static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len,
+                                        void *context)
 {
-    memset(&s_recording_upload_stats, 0, sizeof(s_recording_upload_stats));
-    s_recording_upload_stats.post_duration_min_ms = -1;
-    s_recording_upload_stats.start_rssi = current_wifi_rssi();
-    s_recording_upload_stats.stop_rssi = RECORDING_RSSI_UNKNOWN;
-}
-
-static void record_upload_duration(int64_t duration_ms)
-{
-    if (duration_ms < 0) {
-        duration_ms = 0;
-    }
-    if (s_recording_upload_stats.post_duration_min_ms < 0 ||
-        duration_ms < s_recording_upload_stats.post_duration_min_ms) {
-        s_recording_upload_stats.post_duration_min_ms = duration_ms;
-    }
-    if (duration_ms > s_recording_upload_stats.post_duration_max_ms) {
-        s_recording_upload_stats.post_duration_max_ms = duration_ms;
-    }
-    s_recording_upload_stats.post_duration_total_ms += duration_ms;
-}
-
-static void log_recording_diagnostics(void)
-{
-    vibe_audio_stats_t audio_stats = {0};
-    vibe_audio_stats(&audio_stats);
-    s_recording_upload_stats.stop_rssi = current_wifi_rssi();
-    const int64_t avg_post_ms = s_recording_upload_stats.upload_posts > 0
-                                    ? s_recording_upload_stats.post_duration_total_ms /
-                                          (int64_t)s_recording_upload_stats.upload_posts
-                                    : 0;
-    const int64_t min_post_ms = s_recording_upload_stats.post_duration_min_ms >= 0
-                                    ? s_recording_upload_stats.post_duration_min_ms
-                                    : 0;
-    ESP_LOGI(TAG,
-             "recording diagnostics board=%s audio_read_chunks=%u audio_queued_chunks=%u "
-             "audio_dropped_chunks=%u audio_dropped_bytes=%u upload_posts=%u uploaded_bytes=%u "
-             "upload_failures=%u read_failures=%u read_timeouts=%u max_pending=%u "
-             "post_ms_min=%lld post_ms_avg=%lld post_ms_max=%lld rssi_start=%d rssi_stop=%d",
-             VIBE_BOARD_NAME,
-             (unsigned)audio_stats.chunks_read,
-             (unsigned)audio_stats.chunks_queued,
-             (unsigned)audio_stats.chunks_dropped,
-             (unsigned)audio_stats.bytes_dropped,
-             (unsigned)s_recording_upload_stats.upload_posts,
-             (unsigned)s_recording_upload_stats.uploaded_bytes,
-             (unsigned)s_recording_upload_stats.upload_failures,
-             (unsigned)s_recording_upload_stats.read_failures,
-             (unsigned)s_recording_upload_stats.read_timeouts,
-             (unsigned)s_recording_upload_stats.max_pending_chunks,
-             (long long)min_post_ms,
-             (long long)avg_post_ms,
-             (long long)s_recording_upload_stats.post_duration_max_ms,
-             s_recording_upload_stats.start_rssi,
-             s_recording_upload_stats.stop_rssi);
-}
-
-static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len)
-{
+    (void)context;
     if (!audio || audio_len == 0 || s_recording_session_id[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
@@ -5265,90 +5174,20 @@ static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len)
     return ESP_OK;
 }
 
-static void recording_upload_task(void *arg)
-{
-    (void)arg;
-    uint8_t *buffer = heap_caps_malloc(RECORDING_UPLOAD_BUFFER_BYTES, MALLOC_CAP_8BIT);
-    if (!buffer) {
-        ESP_LOGW(TAG, "recording upload buffer allocation failed");
-        set_recording_upload_failed(true);
-        set_recording_upload_active(false);
-        s_recording_upload_task = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    while (vibe_audio_is_recording() || vibe_audio_pending_chunks() > 0) {
-        size_t pending = vibe_audio_pending_chunks();
-        if (pending > s_recording_upload_stats.max_pending_chunks) {
-            s_recording_upload_stats.max_pending_chunks = pending;
-        }
-        size_t audio_len = 0;
-        esp_err_t err = vibe_audio_read_batch(buffer, RECORDING_UPLOAD_BUFFER_BYTES, &audio_len,
-                                              RECORDING_UPLOAD_BATCH_CHUNKS, 250);
-        if (err == ESP_ERR_TIMEOUT) {
-            s_recording_upload_stats.read_timeouts++;
-            continue;
-        }
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "audio read for upload failed: %s", esp_err_to_name(err));
-            s_recording_upload_stats.read_failures++;
-            set_recording_upload_failed(true);
-            continue;
-        }
-        int64_t post_start_ms = esp_timer_get_time() / 1000;
-        err = upload_recording_chunk(buffer, audio_len);
-        int64_t post_duration_ms = esp_timer_get_time() / 1000 - post_start_ms;
-        record_upload_duration(post_duration_ms);
-        if (err != ESP_OK) {
-            s_recording_upload_stats.upload_failures++;
-            set_recording_upload_failed(true);
-        } else {
-            s_recording_upload_stats.upload_posts++;
-            s_recording_upload_stats.uploaded_bytes += audio_len;
-        }
-    }
-
-    heap_caps_free(buffer);
-    ESP_LOGI(TAG, "recording upload task done posts=%u bytes=%u failures=%u failed=%d",
-             (unsigned)s_recording_upload_stats.upload_posts,
-             (unsigned)s_recording_upload_stats.uploaded_bytes,
-             (unsigned)s_recording_upload_stats.upload_failures,
-             recording_upload_failed());
-    set_recording_upload_active(false);
-    s_recording_upload_task = NULL;
-    vTaskDelete(NULL);
-}
-
 static bool start_recording_upload_task(void)
 {
-    set_recording_upload_failed(false);
-    set_recording_upload_active(true);
-    reset_recording_upload_stats();
-    s_recording_upload_task = NULL;
-    BaseType_t ok = xTaskCreatePinnedToCore(recording_upload_task, "recording_upload", 6144,
-                                            NULL, 4, &s_recording_upload_task,
-                                            VIBE_STICK_NETWORK_CORE);
-    if (ok != pdPASS) {
-        set_recording_upload_failed(true);
-        set_recording_upload_active(false);
-        s_recording_upload_task = NULL;
-        ESP_LOGW(TAG, "recording upload task create failed");
-        return false;
-    }
-    return true;
-}
-
-static void wait_recording_upload_task(void)
-{
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(RECORDING_UPLOAD_WAIT_MS);
-    while (s_recording_upload_task != NULL && xTaskGetTickCount() < deadline) {
-        vTaskDelay(pdMS_TO_TICKS(25));
-    }
-    if (s_recording_upload_task != NULL) {
-        ESP_LOGW(TAG, "recording upload task wait timeout");
-        set_recording_upload_failed(true);
-    }
+    const vibe_recording_upload_config_t config = {
+        .buffer_bytes = RECORDING_UPLOAD_BUFFER_BYTES,
+        .batch_chunks = RECORDING_UPLOAD_BATCH_CHUNKS,
+        .read_timeout_ms = 250,
+        .task_stack_bytes = 6144,
+        .task_priority = 4,
+        .task_core = VIBE_STICK_NETWORK_CORE,
+        .post_chunk = upload_recording_chunk,
+        .context = NULL,
+    };
+    return vibe_recording_upload_start(
+        &config, current_wifi_rssi(), RECORDING_RSSI_UNKNOWN);
 }
 
 static bool handle_recording_start(const char *event_name, const char *hint)
@@ -5453,8 +5292,8 @@ static void finish_recording_stop(const char *event_name)
     if (sound_err != ESP_OK) {
         ESP_LOGW(TAG, "recording stop sound skipped: %s", esp_err_to_name(sound_err));
     }
-    wait_recording_upload_task();
-    log_recording_diagnostics();
+    vibe_recording_upload_wait();
+    vibe_recording_upload_log_diagnostics(VIBE_BOARD_NAME, current_wifi_rssi());
     vibe_audio_clear();
 
     show_recording_overlay("TRANSCRIBING", "", true);
@@ -5492,7 +5331,7 @@ static void finish_recording_stop(const char *event_name)
             render_state();
         }
     }
-    if (err != ESP_OK || recording_failed || recording_upload_failed()) {
+    if (err != ESP_OK || recording_failed || vibe_recording_upload_failed()) {
         ESP_LOGW(TAG, "recording stop bridge request failed: %s", esp_err_to_name(err));
         const char *title = (strcmp(recording_status, "audio_skipped") == 0 ||
                              strcmp(recording_status, "transcript_rejected") == 0)

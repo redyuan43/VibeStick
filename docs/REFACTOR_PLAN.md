@@ -17,9 +17,14 @@ persisted NVS formats, bridge routing, or OTA compatibility.
 
 ## Current Slice
 
-Bridge profile snapshots, identity normalization, ordering, and merge behavior
-become a policy boundary. NVS reads and writes, background discovery, and UI
-notifications remain in the existing runtime while that boundary is introduced.
+Recording upload queue draining, task lifecycle, completion signaling, failure
+tracking, and diagnostics now live behind `vibe_recording_upload`. Recording
+session orchestration, bridge routing, finalization, UI, and Wi-Fi power policy
+remain in the composition root.
+
+The earlier slices also established host-tested boundaries for bridge profile
+merge rules, Wi-Fi profile policy, OTA decisions, power decisions, follow-up
+input policy, WAV validation, and physical button wiring.
 
 ## Guardrails
 
