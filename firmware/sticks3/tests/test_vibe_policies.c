@@ -2,6 +2,7 @@
 #include "vibe_ota_policy.h"
 #include "vibe_power_policy.h"
 #include "vibe_recording_policy.h"
+#include "vibe_wifi_policy.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -136,12 +137,63 @@ static void test_bridge_identity_policy(void)
     assert(strcmp(view.host, "192.168.1.12") == 0);
 }
 
+static void test_wifi_profile_policy(void)
+{
+    vibe_wifi_profile_t profiles[2] = {0};
+    size_t count = 0;
+    const vibe_wifi_profile_t empty = {0};
+    const vibe_wifi_profile_t first = {
+        .ssid = "330",
+        .password = "first-password",
+    };
+    const vibe_wifi_profile_t updated = {
+        .ssid = "330",
+        .password = "updated-password",
+    };
+    const vibe_wifi_profile_t second = {
+        .ssid = "HANYUAN",
+        .password = "second-password",
+    };
+    const vibe_wifi_profile_t overflow = {
+        .ssid = "EDGE",
+        .password = "third-password",
+    };
+
+    assert(vibe_wifi_profiles_merge(profiles, &count, 2, &empty) ==
+           VIBE_WIFI_PROFILE_INVALID);
+    assert(vibe_wifi_profiles_merge(profiles, &count, 2, &first) ==
+           VIBE_WIFI_PROFILE_ADDED);
+    assert(count == 1);
+    assert(strcmp(profiles[0].ssid, "330") == 0);
+    assert(vibe_wifi_profiles_merge(profiles, &count, 2, &first) ==
+           VIBE_WIFI_PROFILE_UNCHANGED);
+    assert(vibe_wifi_profiles_merge(profiles, &count, 2, &updated) ==
+           VIBE_WIFI_PROFILE_UPDATED);
+    assert(strcmp(profiles[0].password, "updated-password") == 0);
+    assert(vibe_wifi_profiles_merge(profiles, &count, 2, &second) ==
+           VIBE_WIFI_PROFILE_ADDED);
+    assert(count == 2);
+    assert(vibe_wifi_profiles_merge(profiles, &count, 2, &overflow) ==
+           VIBE_WIFI_PROFILE_FULL);
+    assert(vibe_wifi_profiles_merge(profiles, &count, 2, &first) ==
+           VIBE_WIFI_PROFILE_UPDATED);
+    assert(strcmp(profiles[0].password, "first-password") == 0);
+
+    const uint32_t expected[] = {1000, 2000, 4000, 8000, 30000, 30000};
+    for (size_t index = 0; index < sizeof(expected) / sizeof(expected[0]); index++) {
+        assert(vibe_wifi_reconnect_delay_ms((unsigned int)index, 30000) ==
+               expected[index]);
+    }
+    assert(vibe_wifi_reconnect_delay_ms(4, 10000) == 10000);
+}
+
 int main(void)
 {
     test_ota_versions();
     test_followup_window();
     test_power_policy();
     test_bridge_identity_policy();
+    test_wifi_profile_policy();
     puts("vibestick policy tests passed");
     return 0;
 }

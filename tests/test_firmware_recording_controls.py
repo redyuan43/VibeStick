@@ -126,7 +126,7 @@ def test_ptt_followup_enter_arms_after_long_press_or_tap_stop() -> None:
     handle_stop = source.split("static void handle_recording_stop", 1)[1]
     handle_stop = handle_stop.split("static void handle_recording_toggle", 1)[0]
     handle_toggle = source.split("static void handle_recording_toggle", 1)[1]
-    handle_toggle = handle_toggle.split("static bool wifi_profile_has_ssid", 1)[0]
+    handle_toggle = handle_toggle.split("static bool wifi_profile_merge", 1)[0]
 
     assert 'strcmp(event_name, "button_long_stop") == 0' in handle_stop
     assert 'strcmp(event_name, "button_tap_stop") == 0' in handle_stop
@@ -1296,7 +1296,7 @@ def test_wifi_reconnect_uses_delayed_backoff_instead_of_immediate_retry() -> Non
     disconnect = handler.split("WIFI_EVENT_STA_DISCONNECTED", 1)[1]
     disconnect = disconnect.split("} else if (event_base == IP_EVENT", 1)[0]
 
-    assert "wifi_reconnect_delay_ms" in source
+    assert "vibe_wifi_reconnect_delay_ms" in source
     assert "s_wifi_reconnect_timer" in source
     assert "schedule_wifi_reconnect();" in disconnect
     assert "ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect())" not in disconnect

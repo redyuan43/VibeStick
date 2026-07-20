@@ -18,6 +18,7 @@
 #include "vibe_stick_anim_assets.h"
 #include "vibe_stick_config.h"
 #include "vibe_stick_pet_assets.h"
+#include "vibe_wifi_policy.h"
 #include "button_gpio.h"
 #include "cJSON.h"
 #include "driver/gpio.h"
@@ -147,8 +148,8 @@
 #define WIFI_PROFILE_MAGIC 0x56425746u
 #define WIFI_PROFILE_STORE_VERSION 1
 #define WIFI_PROFILE_MAX_COUNT 4
-#define WIFI_PROFILE_SSID_LEN 33
-#define WIFI_PROFILE_PASSWORD_LEN 65
+#define WIFI_PROFILE_SSID_LEN VIBE_WIFI_PROFILE_SSID_LEN
+#define WIFI_PROFILE_PASSWORD_LEN VIBE_WIFI_PROFILE_PASSWORD_LEN
 #define WIFI_PROFILE_RETRY_LIMIT 2
 #define DEVICE_PREF_NAMESPACE "vibe_prefs"
 #define DEVICE_PREF_RECORDING_MODE_KEY "rec_mode"
@@ -187,15 +188,10 @@
 static const char *TAG = "vibe_stick";
 
 typedef struct {
-    char ssid[WIFI_PROFILE_SSID_LEN];
-    char password[WIFI_PROFILE_PASSWORD_LEN];
-} wifi_profile_t;
-
-typedef struct {
     uint32_t magic;
     uint16_t version;
     uint16_t count;
-    wifi_profile_t profiles[WIFI_PROFILE_MAX_COUNT];
+    vibe_wifi_profile_t profiles[WIFI_PROFILE_MAX_COUNT];
 } wifi_profile_store_t;
 
 #ifndef VIBE_STICK_WIFI_PROFILES
@@ -203,7 +199,7 @@ typedef struct {
     { { VIBE_STICK_WIFI_SSID, VIBE_STICK_WIFI_PASSWORD } }
 #endif
 
-static const wifi_profile_t k_configured_wifi_profiles[] = VIBE_STICK_WIFI_PROFILES;
+static const vibe_wifi_profile_t k_configured_wifi_profiles[] = VIBE_STICK_WIFI_PROFILES;
 
 #ifndef VIBE_STICK_BRIDGE_PROFILES
 #define VIBE_STICK_BRIDGE_PROFILES \
@@ -390,7 +386,7 @@ static QueueHandle_t s_event_queue;
 static QueueHandle_t s_bridge_control_queue;
 static SemaphoreHandle_t s_lvgl_lock;
 static atomic_bool s_wifi_connected;
-static wifi_profile_t s_wifi_profiles[WIFI_PROFILE_MAX_COUNT];
+static vibe_wifi_profile_t s_wifi_profiles[WIFI_PROFILE_MAX_COUNT];
 static size_t s_wifi_profile_count;
 static size_t s_wifi_profile_index;
 static int s_wifi_profile_retry_count;
@@ -5647,43 +5643,26 @@ static void handle_recording_toggle(void)
     s_tap_recording_active = handle_recording_start("button_tap_start", "TAP TO SEND");
 }
 
-static bool wifi_profile_has_ssid(const wifi_profile_t *profile)
+static bool wifi_profile_merge(const vibe_wifi_profile_t *profile)
 {
-    return profile != NULL && profile->ssid[0] != '\0';
-}
-
-static void wifi_profile_copy(wifi_profile_t *dest, const wifi_profile_t *source)
-{
-    strlcpy(dest->ssid, source->ssid, sizeof(dest->ssid));
-    strlcpy(dest->password, source->password, sizeof(dest->password));
-}
-
-static bool wifi_profile_merge(const wifi_profile_t *profile)
-{
-    if (!wifi_profile_has_ssid(profile)) {
-        return false;
-    }
-
-    for (size_t i = 0; i < s_wifi_profile_count; i++) {
-        if (strcmp(s_wifi_profiles[i].ssid, profile->ssid) == 0) {
-            if (strcmp(s_wifi_profiles[i].password, profile->password) == 0) {
-                return false;
-            }
-            wifi_profile_copy(&s_wifi_profiles[i], profile);
+    vibe_wifi_profile_merge_result_t result =
+        vibe_wifi_profiles_merge(s_wifi_profiles, &s_wifi_profile_count,
+                                 WIFI_PROFILE_MAX_COUNT, profile);
+    switch (result) {
+        case VIBE_WIFI_PROFILE_UPDATED:
             ESP_LOGI(TAG, "updated stored Wi-Fi profile ssid=%s", profile->ssid);
             return true;
-        }
+        case VIBE_WIFI_PROFILE_ADDED:
+            ESP_LOGI(TAG, "added stored Wi-Fi profile ssid=%s", profile->ssid);
+            return true;
+        case VIBE_WIFI_PROFILE_FULL:
+            ESP_LOGW(TAG, "Wi-Fi profile store full; ignoring ssid=%s", profile->ssid);
+            return false;
+        case VIBE_WIFI_PROFILE_INVALID:
+        case VIBE_WIFI_PROFILE_UNCHANGED:
+        default:
+            return false;
     }
-
-    if (s_wifi_profile_count >= WIFI_PROFILE_MAX_COUNT) {
-        ESP_LOGW(TAG, "Wi-Fi profile store full; ignoring ssid=%s", profile->ssid);
-        return false;
-    }
-
-    wifi_profile_copy(&s_wifi_profiles[s_wifi_profile_count], profile);
-    s_wifi_profile_count++;
-    ESP_LOGI(TAG, "added stored Wi-Fi profile ssid=%s", profile->ssid);
-    return true;
 }
 
 static esp_err_t wifi_profiles_load_nvs(void)
@@ -5731,7 +5710,7 @@ static esp_err_t wifi_profiles_save_nvs(void)
         .count = (uint16_t)s_wifi_profile_count,
     };
     for (size_t i = 0; i < s_wifi_profile_count; i++) {
-        wifi_profile_copy(&store.profiles[i], &s_wifi_profiles[i]);
+        vibe_wifi_profile_copy(&store.profiles[i], &s_wifi_profiles[i]);
     }
 
     nvs_handle_t handle;
@@ -5765,7 +5744,7 @@ static bool wifi_profiles_merge_driver_config(void)
         return false;
     }
 
-    wifi_profile_t profile = {0};
+    vibe_wifi_profile_t profile = {0};
     strlcpy(profile.ssid, (const char *)config.sta.ssid, sizeof(profile.ssid));
     strlcpy(profile.password, (const char *)config.sta.password, sizeof(profile.password));
     return wifi_profile_merge(&profile);
@@ -5777,7 +5756,7 @@ static esp_err_t wifi_apply_profile(size_t index)
         return ESP_ERR_INVALID_STATE;
     }
 
-    const wifi_profile_t *profile = &s_wifi_profiles[index];
+    const vibe_wifi_profile_t *profile = &s_wifi_profiles[index];
     wifi_config_t wifi_config = {0};
     strlcpy((char *)wifi_config.sta.ssid, profile->ssid, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, profile->password, sizeof(wifi_config.sta.password));
@@ -5785,18 +5764,6 @@ static esp_err_t wifi_apply_profile(size_t index)
     ESP_LOGI(TAG, "using Wi-Fi profile %u/%u ssid=%s",
              (unsigned)(index + 1), (unsigned)s_wifi_profile_count, profile->ssid);
     return esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-}
-
-static uint32_t wifi_reconnect_delay_ms(unsigned int attempt)
-{
-    static const uint32_t delays_ms[] = {1000, 2000, 4000, 8000, 30000};
-    size_t index = attempt;
-    if (index >= sizeof(delays_ms) / sizeof(delays_ms[0])) {
-        index = sizeof(delays_ms) / sizeof(delays_ms[0]) - 1;
-    }
-    return delays_ms[index] > VIBE_STICK_WIFI_RECONNECT_MAX_MS
-               ? VIBE_STICK_WIFI_RECONNECT_MAX_MS
-               : delays_ms[index];
 }
 
 static void wifi_reconnect_timer_cb(void *arg)
@@ -5813,7 +5780,9 @@ static void schedule_wifi_reconnect(void)
     if (!s_wifi_reconnect_timer) {
         return;
     }
-    uint32_t delay_ms = wifi_reconnect_delay_ms(s_wifi_reconnect_attempt);
+    uint32_t delay_ms =
+        vibe_wifi_reconnect_delay_ms(s_wifi_reconnect_attempt,
+                                     VIBE_STICK_WIFI_RECONNECT_MAX_MS);
     if (s_wifi_reconnect_attempt < UINT32_MAX) {
         s_wifi_reconnect_attempt++;
     }
