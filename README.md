@@ -4,7 +4,7 @@
 
 ![VibeStick home screen showing Codex and Claude providers](assets/brand/home-screen-preview.png)
 
-VibeStick turns an M5Stack StickS3 or M5StickC Plus into a compact wireless
+VibeStick turns an M5Stack StickS3, M5StickC Plus, or M5StickC Plus SE into a compact wireless
 voice-input controller. The production bridge, OTA service, device registry,
 and desktop interaction run in CapsWriter on port `8765`.
 
@@ -12,7 +12,7 @@ The Python package in this repository is intentionally telemetry-only. It
 stores and serves battery-test data on port `8878`; it is not a second voice
 bridge.
 
-VibeStick targets M5Stack StickS3 and M5StickC Plus hardware and is not an official M5Stack project. Third-party agent names such as Codex and Claude describe compatible local tools and integrations only.
+VibeStick targets M5Stack StickS3, M5StickC Plus, and M5StickC Plus SE hardware and is not an official M5Stack project. Third-party agent names such as Codex and Claude describe compatible local tools and integrations only.
 
 ## Battery discharge telemetry
 
@@ -102,6 +102,9 @@ Or install via Espressif's [official guide](https://docs.espressif.com/projects/
 
 ```sh
 ./scripts/firmware.sh stickc_plus -p <port> build flash
+
+# M5StickC Plus SE (no IMU or lift-to-talk support)
+./scripts/firmware.sh stickc_plus_se -p <port> build flash
 ```
 
 For StickS3, replace `stickc_plus` with `sticks3`.

@@ -527,6 +527,7 @@ static esp_err_t init_i2c(void)
     };
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_i2c_bus, &rtc_config, &s_rtc_dev),
                         TAG, "add bm8563");
+
     return ESP_OK;
 }
 

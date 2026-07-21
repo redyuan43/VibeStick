@@ -5,7 +5,7 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 FIRMWARE_DIR="$ROOT_DIR/firmware/sticks3"
 
 usage() {
-  printf '%s\n' "Usage: scripts/firmware.sh <sticks3|stickc_plus> <build|flash|monitor|flash monitor|...> [idf.py args]" >&2
+  printf '%s\n' "Usage: scripts/firmware.sh <sticks3|stickc_plus|stickc_plus_se> <build|flash|monitor|flash monitor|...> [idf.py args]" >&2
 }
 
 if [ "$#" -lt 2 ]; then
@@ -17,7 +17,7 @@ BOARD="$1"
 shift
 
 case "$BOARD" in
-  sticks3|stickc_plus)
+  sticks3|stickc_plus|stickc_plus_se)
     ;;
   *)
     usage

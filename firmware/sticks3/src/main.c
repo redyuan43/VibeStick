@@ -1879,6 +1879,7 @@ static bool enter_deep_sleep(void)
                  esp_err_to_name(err));
         esp_restart();
     }
+#if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
     if (motion_wake_enabled) {
 #if defined(CONFIG_IDF_TARGET_ESP32)
         err = esp_sleep_enable_ext1_wakeup_io(
@@ -1895,6 +1896,9 @@ static bool enter_deep_sleep(void)
             esp_restart();
         }
     }
+#else
+    (void)motion_wake_enabled;
+#endif
     esp_deep_sleep_start();
     return true;
 }

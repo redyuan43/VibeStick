@@ -6,6 +6,8 @@ idf_component_register(
 
 if(VIBE_BOARD STREQUAL "stickc_plus")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE VIBE_BOARD_STICKC_PLUS=1)
+elseif(VIBE_BOARD STREQUAL "stickc_plus_se")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE VIBE_BOARD_STICKC_PLUS_SE=1)
 else()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE VIBE_BOARD_STICKS3=1)
 endif()
