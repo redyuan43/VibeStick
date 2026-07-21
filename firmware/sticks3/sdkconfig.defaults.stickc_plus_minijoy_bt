@@ -2,8 +2,8 @@ CONFIG_IDF_TARGET="esp32"
 CONFIG_IDF_TARGET_ESP32=y
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
-# Keep the normal StickC OTA-compatible flash layout. The dedicated firmware
-# does not start Wi-Fi or an OTA client.
+# Keep the normal StickC OTA-compatible flash layout. Wi-Fi starts only when
+# the user requests the dedicated maintenance-mode OTA flow at boot.
 # CONFIG_PARTITION_TABLE_SINGLE_APP is not set
 # CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE is not set
 CONFIG_PARTITION_TABLE_CUSTOM=y

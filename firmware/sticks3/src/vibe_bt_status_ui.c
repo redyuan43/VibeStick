@@ -240,6 +240,16 @@ static const char *status_text(void)
         return "LINK";
     case VIBE_BT_UI_RECORDING:
         return "REC";
+    case VIBE_BT_UI_OTA_CONNECTING:
+        return "WIFI";
+    case VIBE_BT_UI_OTA_CHECKING:
+        return "CHECK";
+    case VIBE_BT_UI_OTA_DOWNLOADING:
+        return "UPDATE";
+    case VIBE_BT_UI_OTA_CURRENT:
+        return "CURRENT";
+    case VIBE_BT_UI_OTA_FAILED:
+        return "ERROR";
     case VIBE_BT_UI_ERROR:
         return "ERROR";
     case VIBE_BT_UI_WAITING:
@@ -251,6 +261,8 @@ static const char *status_text(void)
 static uint16_t status_color(void)
 {
     return (s_status == VIBE_BT_UI_RECORDING ||
+            s_status == VIBE_BT_UI_OTA_DOWNLOADING ||
+            s_status == VIBE_BT_UI_OTA_FAILED ||
             s_status == VIBE_BT_UI_ERROR)
                ? color_warning()
                : color_accent();
@@ -307,20 +319,40 @@ static void draw_bottom_bar(void)
 {
     fill_rect(0, 151, VIBE_BOARD_LCD_H_RES,
               VIBE_BOARD_LCD_V_RES - 151, color_background());
-    const char *joy_text = s_status == VIBE_BT_UI_RECORDING
-                               ? "JOY MIC"
-                               : (s_minijoy_ready ? "JOY OK" : "JOY OFF");
+    const bool ota_status = s_status >= VIBE_BT_UI_OTA_CONNECTING &&
+                            s_status <= VIBE_BT_UI_OTA_FAILED;
+    const char *joy_text = ota_status
+                               ? "OTA MODE"
+                               : (s_status == VIBE_BT_UI_RECORDING
+                                      ? "JOY MIC"
+                                      : (s_minijoy_ready ? "JOY OK" : "JOY OFF"));
     draw_text_centered(166, joy_text,
-                       s_minijoy_ready || s_status == VIBE_BT_UI_RECORDING
+                       ota_status || s_minijoy_ready ||
+                               s_status == VIBE_BT_UI_RECORDING
                            ? color_foreground()
                            : color_warning(),
                        1);
-    const char *action_text = s_status == VIBE_BT_UI_RECORDING
-                                  ? "MIC LIVE"
-                                  : (s_confirm_window ? "ENTER" : "A MIC");
+    const char *action_text = "A MIC";
+    if (s_status == VIBE_BT_UI_RECORDING) {
+        action_text = "MIC LIVE";
+    } else if (s_status == VIBE_BT_UI_OTA_CONNECTING) {
+        action_text = "CONNECT";
+    } else if (s_status == VIBE_BT_UI_OTA_CHECKING) {
+        action_text = "CHECKING";
+    } else if (s_status == VIBE_BT_UI_OTA_DOWNLOADING) {
+        action_text = "UPDATING";
+    } else if (s_status == VIBE_BT_UI_OTA_CURRENT) {
+        action_text = "NO UPDATE";
+    } else if (s_status == VIBE_BT_UI_OTA_FAILED) {
+        action_text = "FAILED";
+    } else if (s_confirm_window) {
+        action_text = "ENTER";
+    }
     draw_text_centered(198, action_text,
-                       s_status == VIBE_BT_UI_RECORDING ? color_warning()
-                                                        : color_accent(),
+                       s_status == VIBE_BT_UI_RECORDING ||
+                               s_status == VIBE_BT_UI_OTA_DOWNLOADING
+                           ? color_warning()
+                           : color_accent(),
                        2);
 }
 
@@ -406,7 +438,8 @@ static void schedule_next_blink(int64_t now_ms)
 
 static vibe_minijoy_pet_frame_id_t pet_frame_for_status(int64_t now_ms)
 {
-    if (s_status == VIBE_BT_UI_ERROR) {
+    if (s_status == VIBE_BT_UI_ERROR ||
+        s_status == VIBE_BT_UI_OTA_FAILED) {
         return VIBE_MINIJOY_PET_FRAME_ERROR;
     }
     if (s_status != VIBE_BT_UI_CONNECTED) {

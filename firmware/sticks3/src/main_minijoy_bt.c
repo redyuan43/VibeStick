@@ -17,6 +17,7 @@
 #include "vibe_bt_status_ui.h"
 #include "vibe_input.h"
 #include "vibe_minijoyc.h"
+#include "vibe_minijoy_ota.h"
 #include "vibe_stick_config.h"
 
 #define APP_LOOP_MS 20
@@ -29,6 +30,10 @@
 #define PAIRING_LED_INTERVAL_MS 150
 #define STARTUP_PAIRING_DELAY_MS 1000
 #define CONFIRM_WINDOW_MS 5000
+#define STARTUP_OTA_HOLD_MS 600
+#define STARTUP_OTA_POLL_MS 40
+#define OTA_RESULT_DISPLAY_MS 2500
+#define OTA_TASK_STACK_BYTES 8192
 
 typedef enum {
     APP_EVENT_PTT_DOWN,
@@ -440,6 +445,67 @@ static esp_err_t init_nvs(void)
     return err;
 }
 
+static bool startup_ota_requested(void)
+{
+    if (vibe_minijoyc_open() != ESP_OK) {
+        ESP_LOGW(TAG, "MiniJoy unavailable for OTA startup gesture");
+        return false;
+    }
+    bool held = true;
+    int samples = STARTUP_OTA_HOLD_MS / STARTUP_OTA_POLL_MS;
+    for (int sample = 0; sample < samples; ++sample) {
+        vibe_minijoyc_state_t state = {0};
+        if (vibe_minijoyc_read(&state) != ESP_OK ||
+            !state.button_pressed) {
+            held = false;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(STARTUP_OTA_POLL_MS));
+    }
+    if (held) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_minijoyc_set_led(0xffa000));
+    }
+    vibe_minijoyc_close();
+    return held;
+}
+
+static void ota_status_callback(vibe_minijoy_ota_status_t status,
+                                void *context)
+{
+    (void)context;
+    vibe_bt_ui_status_t ui_status = VIBE_BT_UI_ERROR;
+    switch (status) {
+    case VIBE_MINIJOY_OTA_CONNECTING:
+        ui_status = VIBE_BT_UI_OTA_CONNECTING;
+        break;
+    case VIBE_MINIJOY_OTA_CHECKING:
+        ui_status = VIBE_BT_UI_OTA_CHECKING;
+        break;
+    case VIBE_MINIJOY_OTA_DOWNLOADING:
+        ui_status = VIBE_BT_UI_OTA_DOWNLOADING;
+        break;
+    case VIBE_MINIJOY_OTA_CURRENT:
+        ui_status = VIBE_BT_UI_OTA_CURRENT;
+        break;
+    case VIBE_MINIJOY_OTA_FAILED:
+        ui_status = VIBE_BT_UI_OTA_FAILED;
+        break;
+    }
+    vibe_bt_status_ui_set(ui_status, false);
+}
+
+static void ota_maintenance_task(void *context)
+{
+    (void)context;
+    esp_err_t ota_err = vibe_minijoy_ota_run(ota_status_callback, NULL);
+    if (ota_err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA maintenance failed: %s",
+                 esp_err_to_name(ota_err));
+    }
+    vTaskDelay(pdMS_TO_TICKS(OTA_RESULT_DISPLAY_MS));
+    esp_restart();
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(init_nvs());
@@ -449,6 +515,14 @@ void app_main(void)
     ESP_ERROR_CHECK(vibe_board_set_external_5v(true));
     vTaskDelay(pdMS_TO_TICKS(150));
     ESP_ERROR_CHECK(vibe_bt_status_ui_init());
+    if (startup_ota_requested()) {
+        ESP_LOGI(TAG, "startup gesture selected OTA maintenance mode");
+        BaseType_t created = xTaskCreatePinnedToCore(
+            ota_maintenance_task, "minijoy_ota", OTA_TASK_STACK_BYTES, NULL,
+            4, NULL, 0);
+        ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+        return;
+    }
     ESP_ERROR_CHECK(vibe_audio_init());
 
     s_event_queue = xQueueCreate(12, sizeof(app_event_t));

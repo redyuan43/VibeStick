@@ -157,6 +157,14 @@ Build and publish an OTA image for a board:
 
 For M5StickC Plus, replace `sticks3` with `stickc_plus`. Published files are written to `firmware/sticks3/ota/`; the bridge serves them through `/ota/manifest?board=...` and `/ota/bin?board=...`. Once the device is on Wi-Fi, it installs an image only when the manifest has a strictly higher semantic version than the running firmware. Equal or lower versions are rejected even when their build IDs or hashes differ. Accepted images are downloaded to the inactive OTA slot before the device switches boot partitions and restarts.
 
+The dedicated M5StickC Plus + MiniJoy Bluetooth firmware uses a maintenance
+mode so Wi-Fi does not compete with the Bluetooth mouse and microphone during
+normal use. Hold the MiniJoy center button while powering on the device until
+`OTA MODE` appears. The device temporarily starts Wi-Fi, checks the
+`stickc_plus_minijoy_bt` manifest, installs a newer semantic version, and
+restarts into Bluetooth mode. `NO UPDATE` or `FAILED` is shown briefly before
+the device restarts normally.
+
 ## Troubleshooting
 
 ### `command not found: idf.py`
