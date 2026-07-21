@@ -96,6 +96,7 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 #define BM8563_REG_CONTROL_STATUS2 0x01
 #define AXP192_OUTPUT_CTRL_LDO2 BIT(2)
 #define AXP192_OUTPUT_CTRL_LDO3 BIT(3)
+#define AXP192_OUTPUT_CTRL_EXTEN BIT(6)
 #define AXP192_INPUT_STATUS_VBUS_PRESENT BIT(5)
 #define AXP192_INPUT_STATUS_VBUS_VALID BIT(4)
 
@@ -719,6 +720,20 @@ esp_err_t vibe_board_prepare_deep_sleep(void)
 }
 
 #endif
+
+esp_err_t vibe_board_set_external_5v(bool enabled)
+{
+#if VIBE_BOARD_HAS_ES8311
+    (void)enabled;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "pmic missing");
+    return update_reg(AXP192_REG_OUTPUT_CTRL,
+                      enabled ? 0 : AXP192_OUTPUT_CTRL_EXTEN,
+                      enabled ? AXP192_OUTPUT_CTRL_EXTEN : 0);
+#endif
+}
 
 vibe_board_boot_power_status_t vibe_board_boot_power_status(void)
 {

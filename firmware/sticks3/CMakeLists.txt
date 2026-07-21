@@ -10,7 +10,9 @@ endif()
 set(VIBE_BOARD "${VIBE_BOARD}" CACHE STRING "VibeStick board target")
 option(VIBE_SERIAL_DEBUG "Enable serial commands that simulate hardware buttons" OFF)
 
-if(VIBE_BOARD STREQUAL "stickc_plus" OR VIBE_BOARD STREQUAL "stickc_plus_se")
+if(VIBE_BOARD STREQUAL "stickc_plus" OR
+   VIBE_BOARD STREQUAL "stickc_plus_se" OR
+   VIBE_BOARD STREQUAL "stickc_plus_minijoy_bt")
     set(IDF_TARGET "esp32")
     set(SDKCONFIG_DEFAULTS "sdkconfig.defaults;sdkconfig.defaults.${VIBE_BOARD}")
 elseif(VIBE_BOARD STREQUAL "sticks3")
@@ -22,7 +24,9 @@ endif()
 
 set(EXTRA_COMPONENT_DIRS src)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-if(VIBE_BOARD STREQUAL "stickc_plus" OR VIBE_BOARD STREQUAL "stickc_plus_se")
+if(VIBE_BOARD STREQUAL "stickc_plus" OR
+   VIBE_BOARD STREQUAL "stickc_plus_se" OR
+   VIBE_BOARD STREQUAL "stickc_plus_minijoy_bt")
     idf_build_set_property(DEPENDENCIES_LOCK dependencies.lock.esp32)
 endif()
 project(vibe_stick_${VIBE_BOARD})

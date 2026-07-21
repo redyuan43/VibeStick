@@ -1,0 +1,409 @@
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "esp_check.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "vibe_audio.h"
+#include "vibe_board.h"
+#include "vibe_bt_composite.h"
+#include "vibe_bt_status_ui.h"
+#include "vibe_input.h"
+#include "vibe_minijoyc.h"
+#include "vibe_stick_config.h"
+
+#define APP_LOOP_MS 20
+#define PAIRING_WINDOW_MS 120000
+#define SIDE_CLEAR_HOLD_MS 5000
+#define JOY_RETRY_MS 1000
+#define JOY_DEADZONE 82
+#define JOY_MAX_STEP 12
+#define PCM_STAGING_BYTES 2048
+
+typedef enum {
+    APP_EVENT_PTT_DOWN,
+    APP_EVENT_PTT_UP,
+    APP_EVENT_CLEAR_BONDS,
+    APP_EVENT_WAKE_DISPLAY,
+} app_event_t;
+
+static const char *TAG = "minijoy_bt";
+static QueueHandle_t s_event_queue;
+static atomic_bool s_ptt_active;
+static atomic_bool s_side_long_handled;
+static portMUX_TYPE s_bt_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static vibe_bt_composite_state_t s_bt_state;
+static uint8_t s_pcm_staging[PCM_STAGING_BYTES];
+static size_t s_pcm_staging_offset;
+static size_t s_pcm_staging_length;
+static uint8_t s_resample_staging[PCM_STAGING_BYTES];
+static bool s_minijoy_ready;
+static bool s_minijoy_button_down;
+static int64_t s_minijoy_retry_ms;
+static int64_t s_pairing_deadline_ms;
+
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static void queue_app_event(app_event_t event)
+{
+    if (s_event_queue) {
+        xQueueSend(s_event_queue, &event, 0);
+    }
+}
+
+static void front_down_callback(void *button, void *context)
+{
+    (void)button;
+    (void)context;
+    queue_app_event(APP_EVENT_PTT_DOWN);
+}
+
+static void front_up_callback(void *button, void *context)
+{
+    (void)button;
+    (void)context;
+    queue_app_event(APP_EVENT_PTT_UP);
+}
+
+static void side_long_callback(void *button, void *context)
+{
+    (void)button;
+    (void)context;
+    atomic_store(&s_side_long_handled, true);
+    queue_app_event(APP_EVENT_CLEAR_BONDS);
+}
+
+static void side_up_callback(void *button, void *context)
+{
+    (void)button;
+    (void)context;
+    if (atomic_exchange(&s_side_long_handled, false)) {
+        return;
+    }
+    queue_app_event(APP_EVENT_WAKE_DISPLAY);
+}
+
+static void bt_state_callback(const vibe_bt_composite_state_t *state,
+                              void *context)
+{
+    (void)context;
+    portENTER_CRITICAL(&s_bt_state_lock);
+    s_bt_state = *state;
+    portEXIT_CRITICAL(&s_bt_state_lock);
+}
+
+static vibe_bt_composite_state_t bt_state(void)
+{
+    vibe_bt_composite_state_t state;
+    portENTER_CRITICAL(&s_bt_state_lock);
+    state = s_bt_state;
+    portEXIT_CRITICAL(&s_bt_state_lock);
+    return state;
+}
+
+static size_t read_raw_pcm(uint8_t *buffer, size_t length)
+{
+    size_t copied = 0;
+    while (copied < length) {
+        if (s_pcm_staging_offset >= s_pcm_staging_length) {
+            size_t chunk_length = 0;
+            if (vibe_audio_read(s_pcm_staging, sizeof(s_pcm_staging),
+                                &chunk_length, 0) != ESP_OK) {
+                break;
+            }
+            s_pcm_staging_offset = 0;
+            s_pcm_staging_length = chunk_length;
+        }
+        size_t available = s_pcm_staging_length - s_pcm_staging_offset;
+        size_t requested = length - copied;
+        size_t part = available < requested ? available : requested;
+        memcpy(buffer + copied, s_pcm_staging + s_pcm_staging_offset, part);
+        s_pcm_staging_offset += part;
+        copied += part;
+    }
+    return copied;
+}
+
+static size_t read_hfp_pcm(uint8_t *buffer, size_t length, void *context)
+{
+    (void)context;
+    if (!atomic_load(&s_ptt_active)) {
+        return 0;
+    }
+    vibe_bt_composite_state_t state = bt_state();
+    if (state.wideband) {
+        return read_raw_pcm(buffer, length);
+    }
+
+    if (length * 2 > sizeof(s_resample_staging) || (length & 1u)) {
+        return 0;
+    }
+    size_t source_length = read_raw_pcm(s_resample_staging, length * 2);
+    if (source_length < length * 2) {
+        return 0;
+    }
+    int16_t *source = (int16_t *)s_resample_staging;
+    int16_t *target = (int16_t *)buffer;
+    size_t samples = length / sizeof(int16_t);
+    for (size_t i = 0; i < samples; ++i) {
+        target[i] = (int16_t)(((int32_t)source[i * 2] +
+                               (int32_t)source[i * 2 + 1]) /
+                              2);
+    }
+    return length;
+}
+
+static int8_t joystick_axis(int16_t value)
+{
+    int magnitude = value < 0 ? -value : value;
+    if (magnitude <= JOY_DEADZONE) {
+        return 0;
+    }
+    if (magnitude > 511) {
+        magnitude = 511;
+    }
+    int linear = (magnitude - JOY_DEADZONE) * JOY_MAX_STEP /
+                 (511 - JOY_DEADZONE);
+    int curved = linear * linear / JOY_MAX_STEP;
+    if (curved < 1) {
+        curved = 1;
+    } else if (curved > JOY_MAX_STEP) {
+        curved = JOY_MAX_STEP;
+    }
+    return (int8_t)(value < 0 ? -curved : curved);
+}
+
+static void close_minijoy(void)
+{
+    if (s_minijoy_ready) {
+        vibe_bt_composite_send_mouse(0, 0, false);
+        vibe_minijoyc_close();
+        s_minijoy_ready = false;
+        s_minijoy_button_down = false;
+    }
+}
+
+static void open_minijoy(void)
+{
+    if (atomic_load(&s_ptt_active) || s_minijoy_ready ||
+        now_ms() < s_minijoy_retry_ms) {
+        return;
+    }
+    esp_err_t err = vibe_minijoyc_open();
+    if (err == ESP_OK) {
+        s_minijoy_ready = true;
+        vibe_bt_composite_state_t state = bt_state();
+        vibe_minijoyc_set_led(state.hid_connected ? 0x00ff00 : 0x0000ff);
+        ESP_LOGI(TAG, "MiniJoy ready on GPIO0/GPIO26");
+    } else {
+        s_minijoy_retry_ms = now_ms() + JOY_RETRY_MS;
+        ESP_LOGW(TAG, "MiniJoy open failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void start_ptt(void)
+{
+    if (atomic_load(&s_ptt_active)) {
+        return;
+    }
+    close_minijoy();
+    esp_err_t err = vibe_minijoyc_suspend_for_microphone();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MiniJoy suspend failed: %s", esp_err_to_name(err));
+        s_minijoy_retry_ms = now_ms() + 20;
+        open_minijoy();
+        vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+    s_pcm_staging_offset = 0;
+    s_pcm_staging_length = 0;
+    err = vibe_audio_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "microphone start failed: %s", esp_err_to_name(err));
+        s_minijoy_retry_ms = now_ms() + 20;
+        open_minijoy();
+        vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
+        return;
+    }
+    atomic_store(&s_ptt_active, true);
+    err = vibe_bt_composite_send_right_shift(true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Right Shift down failed: %s", esp_err_to_name(err));
+    }
+    vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
+    ESP_LOGI(TAG, "PTT started; MiniJoy paused");
+}
+
+static void stop_ptt(void)
+{
+    if (!atomic_load(&s_ptt_active)) {
+        return;
+    }
+    esp_err_t err = vibe_bt_composite_send_right_shift(false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Right Shift up failed: %s", esp_err_to_name(err));
+    }
+    atomic_store(&s_ptt_active, false);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_audio_stop());
+    s_pcm_staging_offset = 0;
+    s_pcm_staging_length = 0;
+    s_minijoy_retry_ms = now_ms() + 20;
+    open_minijoy();
+    ESP_LOGI(TAG, "PTT stopped; MiniJoy resumed=%d", s_minijoy_ready);
+}
+
+static void handle_event(app_event_t event)
+{
+    switch (event) {
+    case APP_EVENT_PTT_DOWN:
+        start_ptt();
+        break;
+    case APP_EVENT_PTT_UP:
+        stop_ptt();
+        break;
+    case APP_EVENT_CLEAR_BONDS:
+        stop_ptt();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_clear_bonds());
+        s_pairing_deadline_ms = 0;
+        if (s_minijoy_ready) {
+            vibe_minijoyc_set_led(0x0000ff);
+        }
+        vibe_bt_status_ui_set(VIBE_BT_UI_WAITING, s_minijoy_ready);
+        ESP_LOGI(TAG, "Bluetooth bonds cleared; press MiniJoy to pair");
+        break;
+    case APP_EVENT_WAKE_DISPLAY:
+        vibe_bt_status_ui_activity();
+        break;
+    }
+}
+
+static void poll_minijoy(void)
+{
+    if (atomic_load(&s_ptt_active)) {
+        return;
+    }
+    open_minijoy();
+    if (!s_minijoy_ready) {
+        return;
+    }
+    vibe_minijoyc_state_t joy = {0};
+    esp_err_t err = vibe_minijoyc_read(&joy);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "MiniJoy read failed: %s", esp_err_to_name(err));
+        close_minijoy();
+        s_minijoy_retry_ms = now_ms() + JOY_RETRY_MS;
+        return;
+    }
+
+    vibe_bt_composite_state_t state = bt_state();
+    bool button_changed = joy.button_pressed != s_minijoy_button_down;
+    if (button_changed && joy.button_pressed && !state.hid_connected) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
+        s_pairing_deadline_ms = now_ms() + PAIRING_WINDOW_MS;
+        vibe_minijoyc_set_led(0x0000ff);
+        vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, true);
+        vibe_bt_status_ui_activity();
+    } else if (state.hid_connected) {
+        int8_t dx = joystick_axis(joy.x);
+        int8_t dy = (int8_t)-joystick_axis(joy.y);
+        if (dx != 0 || dy != 0 || button_changed) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_send_mouse(
+                dx, dy, joy.button_pressed));
+            vibe_bt_status_ui_activity();
+        }
+    }
+    s_minijoy_button_down = joy.button_pressed;
+}
+
+static void update_status(void)
+{
+    vibe_bt_composite_state_t state = bt_state();
+    if (atomic_load(&s_ptt_active)) {
+        vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
+    } else if (state.pairing) {
+        vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
+    } else if (state.hid_connected || state.hfp_connected) {
+        vibe_bt_status_ui_set(VIBE_BT_UI_CONNECTED, s_minijoy_ready);
+    } else {
+        vibe_bt_status_ui_set(VIBE_BT_UI_WAITING, s_minijoy_ready);
+    }
+
+    static bool last_hid_connected;
+    if (state.hid_connected != last_hid_connected && s_minijoy_ready) {
+        vibe_minijoyc_set_led(state.hid_connected ? 0x00ff00 : 0x0000ff);
+        last_hid_connected = state.hid_connected;
+    }
+}
+
+static esp_err_t init_nvs(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "erase NVS");
+        err = nvs_flash_init();
+    }
+    return err;
+}
+
+void app_main(void)
+{
+    ESP_ERROR_CHECK(init_nvs());
+    ESP_ERROR_CHECK(vibe_board_init_power());
+    ESP_ERROR_CHECK(vibe_board_set_external_5v(false));
+    vTaskDelay(pdMS_TO_TICKS(80));
+    ESP_ERROR_CHECK(vibe_board_set_external_5v(true));
+    vTaskDelay(pdMS_TO_TICKS(150));
+    ESP_ERROR_CHECK(vibe_bt_status_ui_init());
+    ESP_ERROR_CHECK(vibe_audio_init());
+
+    s_event_queue = xQueueCreate(12, sizeof(app_event_t));
+    ESP_ERROR_CHECK(s_event_queue ? ESP_OK : ESP_ERR_NO_MEM);
+    vibe_bt_composite_set_pcm_reader(read_hfp_pcm, NULL);
+    ESP_ERROR_CHECK(vibe_bt_composite_init(bt_state_callback, NULL));
+
+    const vibe_input_config_t input_config = {
+        .front_long_ms = 60000,
+        .front_confirm_ms = 60000,
+        .side_mode_ms = SIDE_CLEAR_HOLD_MS,
+        .side_calibration_ms = 60000,
+    };
+    const vibe_input_callbacks_t input_callbacks = {
+        .front_down = front_down_callback,
+        .front_up = front_up_callback,
+        .side_up = side_up_callback,
+        .side_mode_hold = side_long_callback,
+    };
+    ESP_ERROR_CHECK(vibe_input_init(&input_config, &input_callbacks));
+    open_minijoy();
+    update_status();
+
+    ESP_LOGI(TAG, "dedicated MiniJoy BT firmware ready version=%s",
+             FIRMWARE_VERSION);
+    for (;;) {
+        app_event_t event;
+        while (xQueueReceive(s_event_queue, &event, 0) == pdTRUE) {
+            handle_event(event);
+        }
+        poll_minijoy();
+        int64_t current_ms = now_ms();
+        if (s_pairing_deadline_ms > 0 && current_ms >= s_pairing_deadline_ms) {
+            vibe_bt_composite_end_pairing();
+            s_pairing_deadline_ms = 0;
+        }
+        update_status();
+        vibe_bt_status_ui_tick(current_ms);
+        vTaskDelay(pdMS_TO_TICKS(APP_LOOP_MS));
+    }
+}

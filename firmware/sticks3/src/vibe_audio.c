@@ -25,11 +25,18 @@
 #include "esp_codec_dev_defaults.h"
 #endif
 
+#if defined(VIBE_BOARD_MINIJOYC_BT)
+#define AUDIO_FRAME_MS 15
+#define AUDIO_QUEUE_DEPTH 6
+#define AUDIO_TASK_STACK_BYTES 4096
+#else
 #define AUDIO_FRAME_MS 60
+#define AUDIO_QUEUE_DEPTH 12
+#define AUDIO_TASK_STACK_BYTES 8192
+#endif
 #define AUDIO_FRAME_SAMPLES ((VIBE_STICK_AUDIO_SAMPLE_RATE * AUDIO_FRAME_MS) / 1000)
 #define AUDIO_CHUNK_BYTES (AUDIO_FRAME_SAMPLES * VIBE_STICK_AUDIO_CHANNELS * \
                            (VIBE_STICK_AUDIO_BITS_PER_SAMPLE / 8))
-#define AUDIO_QUEUE_DEPTH 12
 #define AUDIO_READ_WAIT_MS (AUDIO_FRAME_MS + 50)
 #define TASK_EXIT_WAIT_MS 1200
 #define VIBE_STICK_SOUND_FRAME_SAMPLES 160
@@ -693,7 +700,8 @@ esp_err_t vibe_audio_start(void)
     }
 
     atomic_store(&s_running, true);
-    BaseType_t ok = xTaskCreatePinnedToCore(audio_task, "vibe_audio", 8192, NULL, 5,
+    BaseType_t ok = xTaskCreatePinnedToCore(audio_task, "vibe_audio",
+                                            AUDIO_TASK_STACK_BYTES, NULL, 5,
                                             &s_audio_task, VIBE_STICK_AUDIO_CORE);
     if (ok != pdPASS) {
         atomic_store(&s_running, false);
