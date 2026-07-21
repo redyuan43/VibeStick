@@ -122,6 +122,8 @@ static void set_scan_mode(bool pairing)
         pairing ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "set scan mode failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "scan mode pairing=%d", pairing);
     }
     notify_state();
 }
@@ -384,14 +386,25 @@ vibe_bt_composite_state_t vibe_bt_composite_state(void)
     return s_state;
 }
 
-esp_err_t vibe_bt_composite_send_right_shift(bool pressed)
+static esp_err_t send_keyboard_report(uint8_t modifier, uint8_t keycode)
 {
     ESP_RETURN_ON_FALSE(s_hid && esp_hidd_dev_connected(s_hid),
                         ESP_ERR_INVALID_STATE, TAG, "HID disconnected");
     uint8_t report[8] = {0};
-    report[0] = pressed ? 0x20 : 0x00;
+    report[0] = modifier;
+    report[2] = keycode;
     return esp_hidd_dev_input_set(s_hid, 0, HID_REPORT_ID_KEYBOARD,
                                   report, sizeof(report));
+}
+
+esp_err_t vibe_bt_composite_send_right_shift(bool pressed)
+{
+    return send_keyboard_report(pressed ? 0x20 : 0x00, 0x00);
+}
+
+esp_err_t vibe_bt_composite_send_enter(bool pressed)
+{
+    return send_keyboard_report(0x00, pressed ? 0x28 : 0x00);
 }
 
 esp_err_t vibe_bt_composite_send_mouse(int8_t dx, int8_t dy,

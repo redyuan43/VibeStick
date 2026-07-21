@@ -5,6 +5,7 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -23,8 +24,11 @@
 #define SIDE_CLEAR_HOLD_MS 5000
 #define JOY_RETRY_MS 1000
 #define JOY_DEADZONE 82
-#define JOY_MAX_STEP 12
+#define JOY_MAX_STEP 24
 #define PCM_STAGING_BYTES 2048
+#define PAIRING_LED_INTERVAL_MS 150
+#define STARTUP_PAIRING_DELAY_MS 1000
+#define CONFIRM_WINDOW_MS 5000
 
 typedef enum {
     APP_EVENT_PTT_DOWN,
@@ -47,6 +51,12 @@ static bool s_minijoy_ready;
 static bool s_minijoy_button_down;
 static int64_t s_minijoy_retry_ms;
 static int64_t s_pairing_deadline_ms;
+static int64_t s_startup_pairing_due_ms;
+static int64_t s_pairing_led_toggle_ms;
+static uint32_t s_minijoy_led_color = UINT32_MAX;
+static bool s_pairing_led_on;
+static bool s_confirm_key_down;
+static int64_t s_confirm_deadline_ms;
 
 static int64_t now_ms(void)
 {
@@ -108,6 +118,16 @@ static vibe_bt_composite_state_t bt_state(void)
     state = s_bt_state;
     portEXIT_CRITICAL(&s_bt_state_lock);
     return state;
+}
+
+static void clear_confirm_window(void)
+{
+    if (s_confirm_key_down) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_send_enter(false));
+        s_confirm_key_down = false;
+    }
+    s_confirm_deadline_ms = 0;
+    vibe_bt_status_ui_set_confirm_window(false);
 }
 
 static size_t read_raw_pcm(uint8_t *buffer, size_t length)
@@ -189,7 +209,40 @@ static void close_minijoy(void)
         vibe_minijoyc_close();
         s_minijoy_ready = false;
         s_minijoy_button_down = false;
+        s_minijoy_led_color = UINT32_MAX;
+        s_pairing_led_toggle_ms = 0;
     }
+}
+
+static void set_minijoy_led(uint32_t color)
+{
+    if (!s_minijoy_ready || color == s_minijoy_led_color) {
+        return;
+    }
+    if (vibe_minijoyc_set_led(color) == ESP_OK) {
+        s_minijoy_led_color = color;
+    }
+}
+
+static void update_minijoy_led(int64_t current_ms)
+{
+    if (!s_minijoy_ready) {
+        return;
+    }
+    vibe_bt_composite_state_t state = bt_state();
+    if (state.pairing) {
+        if (s_pairing_led_toggle_ms == 0 ||
+            current_ms >= s_pairing_led_toggle_ms) {
+            s_pairing_led_on = !s_pairing_led_on;
+            s_pairing_led_toggle_ms =
+                current_ms + PAIRING_LED_INTERVAL_MS;
+            set_minijoy_led(s_pairing_led_on ? 0x0000ff : 0x000000);
+        }
+        return;
+    }
+    s_pairing_led_toggle_ms = 0;
+    s_pairing_led_on = false;
+    set_minijoy_led(state.hid_connected ? 0x00ff00 : 0x0000ff);
 }
 
 static void open_minijoy(void)
@@ -202,7 +255,8 @@ static void open_minijoy(void)
     if (err == ESP_OK) {
         s_minijoy_ready = true;
         vibe_bt_composite_state_t state = bt_state();
-        vibe_minijoyc_set_led(state.hid_connected ? 0x00ff00 : 0x0000ff);
+        s_minijoy_led_color = UINT32_MAX;
+        set_minijoy_led(state.hid_connected ? 0x00ff00 : 0x0000ff);
         ESP_LOGI(TAG, "MiniJoy ready on GPIO0/GPIO26");
     } else {
         s_minijoy_retry_ms = now_ms() + JOY_RETRY_MS;
@@ -215,6 +269,7 @@ static void start_ptt(void)
     if (atomic_load(&s_ptt_active)) {
         return;
     }
+    clear_confirm_window();
     close_minijoy();
     esp_err_t err = vibe_minijoyc_suspend_for_microphone();
     if (err != ESP_OK) {
@@ -241,7 +296,10 @@ static void start_ptt(void)
         ESP_LOGW(TAG, "Right Shift down failed: %s", esp_err_to_name(err));
     }
     vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
-    ESP_LOGI(TAG, "PTT started; MiniJoy paused");
+    ESP_LOGI(TAG,
+             "PTT started; MiniJoy paused free_heap=%u min_free_heap=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size());
 }
 
 static void stop_ptt(void)
@@ -260,7 +318,13 @@ static void stop_ptt(void)
     s_pcm_staging_length = 0;
     s_minijoy_retry_ms = now_ms() + 20;
     open_minijoy();
-    ESP_LOGI(TAG, "PTT stopped; MiniJoy resumed=%d", s_minijoy_ready);
+    s_confirm_deadline_ms = now_ms() + CONFIRM_WINDOW_MS;
+    vibe_bt_status_ui_set_confirm_window(true);
+    ESP_LOGI(TAG,
+             "PTT stopped; MiniJoy resumed=%d confirm_window_ms=%d free_heap=%u min_free_heap=%u",
+             s_minijoy_ready, CONFIRM_WINDOW_MS,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size());
 }
 
 static void handle_event(app_event_t event)
@@ -274,13 +338,14 @@ static void handle_event(app_event_t event)
         break;
     case APP_EVENT_CLEAR_BONDS:
         stop_ptt();
+        clear_confirm_window();
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_clear_bonds());
-        s_pairing_deadline_ms = 0;
-        if (s_minijoy_ready) {
-            vibe_minijoyc_set_led(0x0000ff);
-        }
-        vibe_bt_status_ui_set(VIBE_BT_UI_WAITING, s_minijoy_ready);
-        ESP_LOGI(TAG, "Bluetooth bonds cleared; press MiniJoy to pair");
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
+        s_pairing_deadline_ms = now_ms() + PAIRING_WINDOW_MS;
+        s_startup_pairing_due_ms = 0;
+        s_pairing_led_toggle_ms = 0;
+        vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
+        ESP_LOGI(TAG, "Bluetooth bonds cleared; pairing window started");
         break;
     case APP_EVENT_WAKE_DISPLAY:
         vibe_bt_status_ui_activity();
@@ -311,15 +376,33 @@ static void poll_minijoy(void)
     if (button_changed && joy.button_pressed && !state.hid_connected) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
         s_pairing_deadline_ms = now_ms() + PAIRING_WINDOW_MS;
-        vibe_minijoyc_set_led(0x0000ff);
+        s_startup_pairing_due_ms = 0;
+        s_pairing_led_toggle_ms = 0;
         vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, true);
         vibe_bt_status_ui_activity();
     } else if (state.hid_connected) {
         int8_t dx = joystick_axis(joy.x);
         int8_t dy = (int8_t)-joystick_axis(joy.y);
+        if (button_changed && joy.button_pressed &&
+            s_confirm_deadline_ms > now_ms()) {
+            esp_err_t enter_err = vibe_bt_composite_send_enter(true);
+            if (enter_err == ESP_OK) {
+                s_confirm_key_down = true;
+                s_confirm_deadline_ms = 0;
+                vibe_bt_status_ui_set_confirm_window(false);
+                ESP_LOGI(TAG, "confirm window sent Enter");
+            } else {
+                ESP_LOGW(TAG, "Enter down failed: %s",
+                         esp_err_to_name(enter_err));
+            }
+        } else if (button_changed && !joy.button_pressed &&
+                   s_confirm_key_down) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_send_enter(false));
+            s_confirm_key_down = false;
+        }
         if (dx != 0 || dy != 0 || button_changed) {
             ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_send_mouse(
-                dx, dy, joy.button_pressed));
+                dx, dy, s_confirm_key_down ? false : joy.button_pressed));
             vibe_bt_status_ui_activity();
         }
     }
@@ -329,6 +412,11 @@ static void poll_minijoy(void)
 static void update_status(void)
 {
     vibe_bt_composite_state_t state = bt_state();
+    if (state.pairing && (state.hid_connected || state.hfp_connected)) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_end_pairing());
+        s_pairing_deadline_ms = 0;
+        state = bt_state();
+    }
     if (atomic_load(&s_ptt_active)) {
         vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
     } else if (state.pairing) {
@@ -339,11 +427,6 @@ static void update_status(void)
         vibe_bt_status_ui_set(VIBE_BT_UI_WAITING, s_minijoy_ready);
     }
 
-    static bool last_hid_connected;
-    if (state.hid_connected != last_hid_connected && s_minijoy_ready) {
-        vibe_minijoyc_set_led(state.hid_connected ? 0x00ff00 : 0x0000ff);
-        last_hid_connected = state.hid_connected;
-    }
 }
 
 static esp_err_t init_nvs(void)
@@ -387,6 +470,11 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(vibe_input_init(&input_config, &input_callbacks));
     open_minijoy();
+    vibe_bt_composite_state_t initial_state = bt_state();
+    if (!initial_state.hid_connected && !initial_state.hfp_connected) {
+        s_startup_pairing_due_ms = now_ms() + STARTUP_PAIRING_DELAY_MS;
+        ESP_LOGI(TAG, "startup pairing window scheduled");
+    }
     update_status();
 
     ESP_LOGI(TAG, "dedicated MiniJoy BT firmware ready version=%s",
@@ -398,12 +486,27 @@ void app_main(void)
         }
         poll_minijoy();
         int64_t current_ms = now_ms();
+        if (s_confirm_deadline_ms > 0 &&
+            current_ms >= s_confirm_deadline_ms) {
+            s_confirm_deadline_ms = 0;
+            vibe_bt_status_ui_set_confirm_window(false);
+            ESP_LOGI(TAG, "confirm window expired");
+        }
+        if (s_startup_pairing_due_ms > 0 &&
+            current_ms >= s_startup_pairing_due_ms) {
+            s_startup_pairing_due_ms = 0;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
+            s_pairing_deadline_ms = current_ms + PAIRING_WINDOW_MS;
+            s_pairing_led_toggle_ms = 0;
+            ESP_LOGI(TAG, "startup pairing window started");
+        }
         if (s_pairing_deadline_ms > 0 && current_ms >= s_pairing_deadline_ms) {
             vibe_bt_composite_end_pairing();
             s_pairing_deadline_ms = 0;
         }
         update_status();
-        vibe_bt_status_ui_tick(current_ms);
+        update_minijoy_led(current_ms);
+        vibe_bt_status_ui_tick(current_ms, vibe_audio_level_percent());
         vTaskDelay(pdMS_TO_TICKS(APP_LOOP_MS));
     }
 }

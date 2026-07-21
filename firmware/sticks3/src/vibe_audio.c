@@ -100,6 +100,7 @@ typedef struct {
 static const char *TAG = "vibe_audio";
 
 static atomic_bool s_running;
+static atomic_uchar s_level_percent;
 static bool s_initialized;
 static SemaphoreHandle_t s_audio_mutex;
 static QueueHandle_t s_audio_queue;
@@ -582,6 +583,36 @@ static esp_err_t read_audio_chunk(audio_chunk_t *chunk)
 #endif
 }
 
+static void update_audio_level(const audio_chunk_t *chunk)
+{
+    const int16_t *samples = (const int16_t *)chunk->data;
+    size_t sample_count = chunk->len / sizeof(*samples);
+    if (sample_count == 0) {
+        atomic_store(&s_level_percent, 0);
+        return;
+    }
+
+    uint32_t magnitude_sum = 0;
+    for (size_t i = 0; i < sample_count; ++i) {
+        int32_t sample = samples[i];
+        magnitude_sum += (uint32_t)(sample < 0 ? -sample : sample);
+    }
+    uint32_t mean_magnitude = magnitude_sum / sample_count;
+    uint32_t target = 0;
+    if (mean_magnitude > 100) {
+        target = (mean_magnitude - 100) * 100 / 2900;
+        if (target > 100) {
+            target = 100;
+        }
+    }
+
+    uint32_t previous = atomic_load(&s_level_percent);
+    uint32_t filtered = target > previous
+                            ? (previous + target * 3 + 2) / 4
+                            : (previous * 7 + target + 4) / 8;
+    atomic_store(&s_level_percent, (uint8_t)filtered);
+}
+
 static void audio_task(void *arg)
 {
     (void)arg;
@@ -598,6 +629,7 @@ static void audio_task(void *arg)
         if (chunk.len == 0) {
             continue;
         }
+        update_audio_level(&chunk);
         s_audio_stats.chunks_read++;
         s_audio_stats.bytes_read += chunk.len;
         if (xQueueSend(s_audio_queue, &chunk, 0) != pdTRUE) {
@@ -683,6 +715,7 @@ esp_err_t vibe_audio_start(void)
 
     vibe_audio_clear();
     memset(&s_audio_stats, 0, sizeof(s_audio_stats));
+    atomic_store(&s_level_percent, 0);
 
     esp_err_t err = ESP_OK;
 #if VIBE_BOARD_HAS_ES8311
@@ -717,9 +750,11 @@ esp_err_t vibe_audio_start(void)
 esp_err_t vibe_audio_stop(void)
 {
     if (!atomic_load(&s_running) && s_audio_task == NULL) {
+        atomic_store(&s_level_percent, 0);
         return ESP_OK;
     }
     atomic_store(&s_running, false);
+    atomic_store(&s_level_percent, 0);
     if (s_audio_mutex && xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(250)) == pdTRUE) {
         signal_capture_stop_locked();
         xSemaphoreGive(s_audio_mutex);
@@ -750,6 +785,11 @@ esp_err_t vibe_audio_stop(void)
 bool vibe_audio_is_recording(void)
 {
     return atomic_load(&s_running) || s_audio_task != NULL;
+}
+
+uint8_t vibe_audio_level_percent(void)
+{
+    return atomic_load(&s_level_percent);
 }
 
 esp_err_t vibe_audio_play_sound(agent_sound_t sound)

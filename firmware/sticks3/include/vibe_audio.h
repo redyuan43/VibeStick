@@ -41,5 +41,6 @@ esp_err_t vibe_audio_read_batch(uint8_t *buffer, size_t capacity, size_t *len,
 size_t vibe_audio_pending_chunks(void);
 void vibe_audio_stats(vibe_audio_stats_t *stats);
 bool vibe_audio_is_recording(void);
+uint8_t vibe_audio_level_percent(void);
 const uint8_t *vibe_audio_data(size_t *len);
 void vibe_audio_clear(void);
