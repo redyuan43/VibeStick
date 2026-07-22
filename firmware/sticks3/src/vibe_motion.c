@@ -137,6 +137,7 @@ static vec3f_t s_gyro_bias;
 static vec3f_t s_gravity_lp;
 static bool s_gravity_ready;
 static bool s_calibration_valid;
+static bool s_flat_stable;
 
 static esp_err_t add_imu_device(uint8_t address)
 {
@@ -296,6 +297,7 @@ static void reset_tracking_state(void)
     s_gyro_bias_sum = (vec3f_t){0};
     s_gravity_lp = (vec3f_t){0};
     s_gravity_ready = false;
+    s_flat_stable = false;
 }
 
 static void reset_calibration_state(void)
@@ -762,6 +764,16 @@ bool vibe_motion_is_lifted(void)
 #endif
 }
 
+bool vibe_motion_is_flat_stable(void)
+{
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    return s_available && !s_suspended && s_calibration_valid &&
+           s_state == MOTION_STATE_FLAT && s_flat_stable;
+#else
+    return false;
+#endif
+}
+
 vibe_motion_event_t vibe_motion_poll(int64_t now_ms)
 {
 #if VIBE_BOARD_HAS_LIFT_TO_TALK
@@ -804,6 +816,7 @@ vibe_motion_event_t vibe_motion_poll(int64_t now_ms)
             s_calibration_valid = true;
             s_state = MOTION_STATE_FLAT;
             s_flat_since_ms = now_ms;
+            s_flat_stable = true;
             ESP_LOGI(TAG, "flat baseline calibrated g=(%.3f,%.3f,%.3f) gyro_bias=(%.2f,%.2f,%.2f)",
                      s_baseline.x, s_baseline.y, s_baseline.z,
                      s_gyro_bias.x, s_gyro_bias.y, s_gyro_bias.z);
@@ -824,6 +837,19 @@ vibe_motion_event_t vibe_motion_poll(int64_t now_ms)
     const bool pickup_motion = is_pickup_motion(accel_g, gyro_dps);
 
     if (s_state == MOTION_STATE_FLAT) {
+        if (!s_flat_stable) {
+            if (flat_stable || return_flat) {
+                if (s_flat_since_ms < 0) {
+                    s_flat_since_ms = now_ms;
+                }
+                if ((now_ms - s_flat_since_ms) >= MOTION_FLAT_CONFIRM_MS) {
+                    s_flat_stable = true;
+                    ESP_LOGI(TAG, "motion flat posture confirmed dot=%.3f", flat_dot);
+                }
+            } else {
+                s_flat_since_ms = -1;
+            }
+        }
         if (pickup_motion) {
             s_candidate_since_ms = -1;
             ESP_LOGD(TAG, "motion pickup ignored until orientation changes dot=%.3f gyro=%.2f accel=%.2f",
@@ -838,6 +864,7 @@ vibe_motion_event_t vibe_motion_poll(int64_t now_ms)
                 s_lifted_since_ms = now_ms;
                 s_candidate_since_ms = -1;
                 s_flat_since_ms = -1;
+                s_flat_stable = false;
                 ESP_LOGI(TAG, "motion lifted dot=%.3f gyro=%.2f", flat_dot, vec_norm(gyro_dps));
                 return VIBE_MOTION_EVENT_LIFTED;
             }
@@ -855,6 +882,7 @@ vibe_motion_event_t vibe_motion_poll(int64_t now_ms)
             (now_ms - s_flat_since_ms) >= MOTION_FLAT_CONFIRM_MS) {
             s_state = MOTION_STATE_FLAT;
             s_flat_since_ms = now_ms;
+            s_flat_stable = true;
             ESP_LOGI(TAG, "motion flat dot=%.3f", flat_dot);
             return VIBE_MOTION_EVENT_FLAT;
         }

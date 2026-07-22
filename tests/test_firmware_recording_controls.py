@@ -757,6 +757,41 @@ def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
     assert "queue_event(VIBE_STICK_EVENT_MOTION_START)" in source
 
 
+def test_lift_requires_a_real_flat_posture_before_arming() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    motion_source = MOTION_C.read_text(encoding="utf-8")
+    motion_header = MOTION_H.read_text(encoding="utf-8")
+    lift_mode = source.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[1]
+    lift_mode = lift_mode.split("static void start_manual_motion_calibration", 1)[0]
+    app_task = source.split("static void app_task(void *arg)", 1)[1]
+    app_task = app_task.split("#if VIBE_STICK_SERIAL_DEBUG_ENABLED", 1)[0]
+
+    assert "bool vibe_motion_is_flat_stable(void);" in motion_header
+    assert "static bool s_flat_stable;" in motion_source
+    assert "s_flat_stable = false;" in motion_source
+    assert "s_flat_stable = true;" in motion_source
+    assert "s_motion_lift_armed = false;" in lift_mode
+    assert 'set_motion_arm_prompt(true);' in lift_mode
+    assert '"PLACE FLAT"' in source
+    assert "vibe_motion_is_flat_stable()" in app_task
+    assert "lift recording armed after stable flat posture" in app_task
+
+
+def test_front_tap_stops_lift_recording_and_requires_rearming() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    handle_toggle = source.split("static void handle_recording_toggle", 1)[1]
+    handle_toggle = handle_toggle.split("static bool wifi_profile_merge", 1)[0]
+    motion_start = source.split("case VIBE_STICK_EVENT_MOTION_START:", 1)[1]
+    motion_start = motion_start.split("case VIBE_STICK_EVENT_MOTION_STOP:", 1)[0]
+
+    assert "s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK" in handle_toggle
+    assert "front tap stopping active LIFT recording" in handle_toggle
+    assert 'handle_recording_stop("motion_button_stop")' in handle_toggle
+    assert "front tap cancelling pending LIFT recording" in handle_toggle
+    assert "s_motion_lift_armed = false;" in handle_toggle
+    assert "s_motion_lift_armed = false;" in motion_start
+
+
 def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     enter_sleep = source.split("static bool enter_deep_sleep(void)", 1)[1]
@@ -1294,7 +1329,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.50"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.51"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.38"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher

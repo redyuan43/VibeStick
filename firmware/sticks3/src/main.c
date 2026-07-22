@@ -417,6 +417,7 @@ static int64_t s_motion_calibration_deadline_ms;
 static bool s_motion_calibration_had_previous;
 static vibe_motion_calibration_t s_motion_previous_calibration;
 static bool s_motion_lift_armed;
+static bool s_motion_arm_prompt_visible;
 static bool s_motion_start_pending;
 static bool s_motion_wake_confirm_pending;
 static int64_t s_motion_wake_confirm_deadline_ms;
@@ -850,6 +851,17 @@ static bool recording_animation_preview_active(void)
 }
 #endif
 
+static void set_motion_arm_prompt(bool visible)
+{
+    if (!s_ui_ready || s_motion_arm_prompt_visible == visible) {
+        return;
+    }
+    s_motion_arm_prompt_visible = visible;
+    show_recording_overlay(visible ? "PLACE FLAT" : NULL,
+                           visible ? "TO ARM LIFT" : NULL,
+                           visible);
+}
+
 static void reset_recording_trigger_runtime_state(void)
 {
     s_motion_recording_active = false;
@@ -870,6 +882,7 @@ static void set_push_to_talk_trigger_mode(void)
 {
     s_recording_trigger_mode = RECORDING_TRIGGER_PUSH_TO_TALK;
     reset_recording_trigger_runtime_state();
+    set_motion_arm_prompt(false);
     if (vibe_motion_available()) {
         esp_err_t err = vibe_motion_suspend();
         if (err != ESP_OK) {
@@ -1004,8 +1017,9 @@ static esp_err_t set_lift_to_talk_trigger_mode(const char *reason)
     s_motion_calibrating = false;
     s_motion_calibration_deadline_ms = 0;
     s_motion_calibration_had_previous = false;
-    s_motion_lift_armed = true;
+    s_motion_lift_armed = false;
     s_motion_start_pending = false;
+    set_motion_arm_prompt(true);
     ESP_LOGI(TAG, "%s lift recording mode using persisted calibration", reason);
     return ESP_OK;
 }
@@ -1521,6 +1535,7 @@ static void update_power_saving(int64_t now_ms)
 static void request_motion_recording_start(void)
 {
     s_motion_false_wake_sleep_deadline_ms = 0;
+    set_motion_arm_prompt(false);
     if (s_motion_recording_active) {
         s_motion_start_pending = false;
         return;
@@ -5423,8 +5438,31 @@ static void handle_recording_toggle(void)
              s_tap_recording_active ? 1 : 0,
              vibe_audio_is_recording() ? 1 : 0,
              s_recording_session_id[0] == '\0' ? "-" : s_recording_session_id);
-    if (s_recording_trigger_mode != RECORDING_TRIGGER_PUSH_TO_TALK) {
-        ESP_LOGI(TAG, "front tap ignored in %s mode", recording_mode_label());
+    if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK) {
+        if (s_motion_recording_active) {
+            ESP_LOGI(TAG, "front tap stopping active LIFT recording");
+            s_motion_recording_active = false;
+            s_motion_lift_armed = false;
+            s_motion_start_pending = false;
+            s_motion_wake_confirm_pending = false;
+            s_motion_wake_confirm_deadline_ms = 0;
+            s_motion_wake_network_pending = false;
+            s_motion_wake_network_deadline_ms = 0;
+            set_motion_arm_prompt(false);
+            handle_recording_stop("motion_button_stop");
+        } else if (s_motion_start_pending || s_motion_wake_confirm_pending ||
+                   s_motion_wake_network_pending) {
+            ESP_LOGI(TAG, "front tap cancelling pending LIFT recording");
+            s_motion_lift_armed = false;
+            s_motion_start_pending = false;
+            s_motion_wake_confirm_pending = false;
+            s_motion_wake_confirm_deadline_ms = 0;
+            s_motion_wake_network_pending = false;
+            s_motion_wake_network_deadline_ms = 0;
+            show_recording_overlay(NULL, NULL, false);
+        } else {
+            ESP_LOGI(TAG, "front tap ignored while LIFT is waiting for motion");
+        }
         return;
     }
     if (s_tap_recording_active || vibe_audio_is_recording() || s_recording_session_id[0] != '\0') {
@@ -6065,7 +6103,7 @@ static void maybe_timeout_motion_calibration(int64_t now_ms)
         s_motion_calibrating = false;
         s_motion_calibration_deadline_ms = 0;
         s_motion_calibration_had_previous = false;
-        s_motion_lift_armed = true;
+        s_motion_lift_armed = false;
         s_motion_start_pending = false;
         ESP_LOGW(TAG, "lift calibration timed out; restored previous calibration");
         render_state();
@@ -6150,7 +6188,7 @@ static void app_task(void *arg)
             s_motion_wake_network_pending = false;
             s_motion_wake_network_deadline_ms = 0;
             s_motion_start_pending = false;
-            s_motion_lift_armed = true;
+            s_motion_lift_armed = false;
             show_recording_overlay("CONNECT FAILED", "", true);
             vTaskDelay(pdMS_TO_TICKS(700));
             show_recording_overlay(NULL, NULL, false);
@@ -6164,10 +6202,24 @@ static void app_task(void *arg)
                 s_motion_calibration_had_previous = false;
                 s_motion_lift_armed = true;
                 s_motion_start_pending = false;
+                set_motion_arm_prompt(false);
                 ESP_ERROR_CHECK_WITHOUT_ABORT(save_motion_calibration());
                 ESP_LOGI(TAG, "lift recording mode calibration complete");
                 render_state();
             }
+            const bool motion_arm_idle =
+                !s_motion_calibrating &&
+                !s_motion_wake_confirm_pending &&
+                !s_motion_wake_network_pending &&
+                !s_motion_start_pending &&
+                !s_motion_recording_active &&
+                !recording_finalize_active();
+            if (motion_arm_idle && !s_motion_lift_armed &&
+                vibe_motion_is_flat_stable()) {
+                s_motion_lift_armed = true;
+                ESP_LOGI(TAG, "lift recording armed after stable flat posture");
+            }
+            set_motion_arm_prompt(motion_arm_idle && !s_motion_lift_armed);
             bool motion_wake_handled = false;
             if (!s_motion_calibrating && s_motion_wake_confirm_pending) {
                 motion_wake_handled = true;
@@ -6264,7 +6316,7 @@ static void app_task(void *arg)
                 s_motion_recording_active =
                     handle_recording_start("motion_lift_start", "PLACE DOWN");
                 if (!s_motion_recording_active) {
-                    s_motion_lift_armed = true;
+                    s_motion_lift_armed = false;
                 }
             }
             break;

@@ -30,4 +30,5 @@ esp_err_t vibe_motion_prepare_deep_sleep(void);
 esp_err_t vibe_motion_prepare_deep_sleep_wake(void);
 bool vibe_motion_is_calibrating(void);
 bool vibe_motion_is_lifted(void);
+bool vibe_motion_is_flat_stable(void);
 vibe_motion_event_t vibe_motion_poll(int64_t now_ms);
