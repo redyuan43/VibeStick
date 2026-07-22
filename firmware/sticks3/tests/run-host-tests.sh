@@ -23,3 +23,10 @@ cc -std=c11 -Wall -Wextra -Werror \
   generated/vibe_minijoy_pet_assets.c \
   -o build-host-tests/test_vibe_bt_ui_renderer
 ./build-host-tests/test_vibe_bt_ui_renderer
+
+cc -std=c11 -Wall -Wextra -Werror \
+  -I include \
+  tests/test_vibe_audio_pdm_filter.c \
+  src/vibe_audio_pdm_filter.c \
+  -o build-host-tests/test_vibe_audio_pdm_filter
+./build-host-tests/test_vibe_audio_pdm_filter

@@ -1,5 +1,9 @@
 #include "vibe_audio.h"
+#if defined(VIBE_BOARD_MINIJOYC_BT)
+#include "vibe_audio_pdm_filter.h"
+#endif
 
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -44,6 +48,19 @@
 #define VIBE_STICK_TWO_PI 6.28318530717958647692f
 #define VIBE_STICK_TONE_DUTY ((1 << 9) - 1)
 #define VIBE_STICK_AUDIO_CORE 1
+
+#if VIBE_BOARD_HAS_PDM_MIC
+#if defined(VIBE_BOARD_MINIJOYC_BT)
+#define PDM_OVERSAMPLING 2
+#define PDM_NOISE_FILTER_LEVEL 32
+#define PDM_CAPTURE_SAMPLE_RATE (VIBE_STICK_AUDIO_SAMPLE_RATE * PDM_OVERSAMPLING)
+#define PDM_INPUT_FRAME_SAMPLES (AUDIO_FRAME_SAMPLES * PDM_OVERSAMPLING)
+#define PDM_WARMUP_READS 2
+#define PDM_WARMUP_SAMPLES 128
+#else
+#define PDM_CAPTURE_SAMPLE_RATE VIBE_STICK_AUDIO_SAMPLE_RATE
+#endif
+#endif
 
 #if VIBE_BOARD_HAS_ES8311
 /* The StickS3's amplified speaker needs a softer profile than the Plus buzzer. */
@@ -110,6 +127,20 @@ static i2s_chan_handle_t s_rx_handle;
 static bool s_tx_enabled;
 static bool s_rx_enabled;
 static vibe_audio_stats_t s_audio_stats;
+
+#if VIBE_BOARD_HAS_PDM_MIC && defined(VIBE_BOARD_MINIJOYC_BT)
+static int16_t s_pdm_input[PDM_INPUT_FRAME_SAMPLES];
+static vibe_audio_pdm_filter_t s_pdm_filter;
+typedef struct {
+    int16_t raw_min;
+    int16_t raw_max;
+    int16_t output_min;
+    int16_t output_max;
+    uint32_t raw_near_clip_samples;
+    uint32_t output_near_clip_samples;
+} pdm_level_stats_t;
+static pdm_level_stats_t s_pdm_level_stats;
+#endif
 
 #if VIBE_BOARD_HAS_ES8311
 static esp_codec_dev_handle_t s_codec;
@@ -235,6 +266,38 @@ static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mo
 }
 #endif
 
+#if VIBE_BOARD_HAS_PDM_MIC && defined(VIBE_BOARD_MINIJOYC_BT)
+static void reset_pdm_level_stats(void)
+{
+    s_pdm_level_stats = (pdm_level_stats_t){
+        .raw_min = INT16_MAX,
+        .raw_max = INT16_MIN,
+        .output_min = INT16_MAX,
+        .output_max = INT16_MIN,
+    };
+}
+
+static void update_pdm_level_range(const int16_t *samples,
+                                   size_t sample_count,
+                                   int16_t *minimum,
+                                   int16_t *maximum,
+                                   uint32_t *near_clip_samples)
+{
+    for (size_t index = 0; index < sample_count; ++index) {
+        int16_t sample = samples[index];
+        if (sample < *minimum) {
+            *minimum = sample;
+        }
+        if (sample > *maximum) {
+            *maximum = sample;
+        }
+        if (sample <= -32000 || sample >= 32000) {
+            (*near_clip_samples)++;
+        }
+    }
+}
+#endif
+
 #if VIBE_BOARD_HAS_PDM_MIC
 static esp_err_t init_i2s_pdm_rx(void)
 {
@@ -243,7 +306,7 @@ static esp_err_t init_i2s_pdm_rx(void)
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &s_rx_handle), TAG, "create pdm rx");
 
     i2s_pdm_rx_config_t pdm_cfg = {
-        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(VIBE_STICK_AUDIO_SAMPLE_RATE),
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(PDM_CAPTURE_SAMPLE_RATE),
         .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .clk = VIBE_BOARD_PIN_PDM_CLK,
@@ -256,6 +319,24 @@ static esp_err_t init_i2s_pdm_rx(void)
     ESP_RETURN_ON_ERROR(i2s_channel_init_pdm_rx_mode(s_rx_handle, &pdm_cfg), TAG, "init pdm rx");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx_handle), TAG, "enable pdm rx");
     s_rx_enabled = true;
+
+#if defined(VIBE_BOARD_MINIJOYC_BT)
+    for (unsigned read_index = 0; read_index < PDM_WARMUP_READS; ++read_index) {
+        size_t bytes_read = 0;
+        ESP_RETURN_ON_ERROR(
+            i2s_channel_read(s_rx_handle, s_pdm_input,
+                             PDM_WARMUP_SAMPLES * sizeof(s_pdm_input[0]),
+                             &bytes_read, pdMS_TO_TICKS(AUDIO_READ_WAIT_MS)),
+            TAG, "PDM warmup read");
+    }
+    ESP_LOGI(TAG,
+             "PDM capture ready input_rate=%u output_rate=%u oversampling=%u filter=%u warmup=%u",
+             (unsigned)PDM_CAPTURE_SAMPLE_RATE,
+             (unsigned)VIBE_STICK_AUDIO_SAMPLE_RATE,
+             (unsigned)PDM_OVERSAMPLING,
+             (unsigned)PDM_NOISE_FILTER_LEVEL,
+             (unsigned)PDM_WARMUP_READS);
+#endif
     return ESP_OK;
 }
 #endif
@@ -570,6 +651,35 @@ static esp_err_t read_audio_chunk(audio_chunk_t *chunk)
     }
     return ESP_OK;
 #else
+#if defined(VIBE_BOARD_MINIJOYC_BT)
+    size_t bytes_read = 0;
+    esp_err_t err = i2s_channel_read(s_rx_handle, s_pdm_input, sizeof(s_pdm_input),
+                                     &bytes_read, pdMS_TO_TICKS(AUDIO_READ_WAIT_MS));
+    if (err == ESP_ERR_TIMEOUT) {
+        chunk->len = 0;
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "audio read");
+    size_t input_samples = bytes_read / sizeof(s_pdm_input[0]);
+    update_pdm_level_range(s_pdm_input, input_samples,
+                           &s_pdm_level_stats.raw_min,
+                           &s_pdm_level_stats.raw_max,
+                           &s_pdm_level_stats.raw_near_clip_samples);
+    size_t output_samples = vibe_audio_pdm_filter_process(
+        &s_pdm_filter,
+        s_pdm_input,
+        input_samples,
+        (int16_t *)chunk->data,
+        sizeof(chunk->data) / sizeof(int16_t),
+        PDM_OVERSAMPLING,
+        PDM_NOISE_FILTER_LEVEL);
+    chunk->len = output_samples * sizeof(int16_t);
+    update_pdm_level_range((const int16_t *)chunk->data, output_samples,
+                           &s_pdm_level_stats.output_min,
+                           &s_pdm_level_stats.output_max,
+                           &s_pdm_level_stats.output_near_clip_samples);
+    return ESP_OK;
+#else
     size_t bytes_read = 0;
     esp_err_t err = i2s_channel_read(s_rx_handle, chunk->data, sizeof(chunk->data),
                                      &bytes_read, pdMS_TO_TICKS(AUDIO_READ_WAIT_MS));
@@ -580,6 +690,7 @@ static esp_err_t read_audio_chunk(audio_chunk_t *chunk)
     ESP_RETURN_ON_ERROR(err, TAG, "audio read");
     chunk->len = bytes_read;
     return ESP_OK;
+#endif
 #endif
 }
 
@@ -647,6 +758,16 @@ static void audio_task(void *arg)
              (unsigned)s_audio_stats.chunks_dropped,
              (unsigned)s_audio_stats.bytes_dropped,
              (unsigned)uxQueueMessagesWaiting(s_audio_queue));
+#if VIBE_BOARD_HAS_PDM_MIC && defined(VIBE_BOARD_MINIJOYC_BT)
+    ESP_LOGI(TAG,
+             "PDM levels raw=[%d,%d] raw_near_clip=%u output=[%d,%d] output_near_clip=%u",
+             (int)s_pdm_level_stats.raw_min,
+             (int)s_pdm_level_stats.raw_max,
+             (unsigned)s_pdm_level_stats.raw_near_clip_samples,
+             (int)s_pdm_level_stats.output_min,
+             (int)s_pdm_level_stats.output_max,
+             (unsigned)s_pdm_level_stats.output_near_clip_samples);
+#endif
     if (s_audio_mutex && xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(250)) == pdTRUE) {
         release_session_resources();
         s_audio_task = NULL;
@@ -716,6 +837,10 @@ esp_err_t vibe_audio_start(void)
     vibe_audio_clear();
     memset(&s_audio_stats, 0, sizeof(s_audio_stats));
     atomic_store(&s_level_percent, 0);
+#if VIBE_BOARD_HAS_PDM_MIC && defined(VIBE_BOARD_MINIJOYC_BT)
+    vibe_audio_pdm_filter_reset(&s_pdm_filter);
+    reset_pdm_level_stats();
+#endif
 
     esp_err_t err = ESP_OK;
 #if VIBE_BOARD_HAS_ES8311
