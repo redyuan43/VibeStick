@@ -21,7 +21,7 @@
 
 #define HID_REPORT_ID_KEYBOARD 1
 #define HID_REPORT_ID_MOUSE 2
-#define AUDIO_PUMP_PERIOD_MS 5
+#define AUDIO_PUMP_PERIOD_MS 8
 
 static const char *TAG = "vibe_bt_composite";
 static const char *DEVICE_NAME = "VibeStick MiniJoy";
@@ -232,12 +232,12 @@ static void hfp_incoming_audio(const uint8_t *buffer, uint32_t length)
 
 static uint32_t hfp_outgoing_audio(uint8_t *buffer, uint32_t length)
 {
-    if (!buffer || length == 0) {
+    if (!buffer || length == 0 || !s_pcm_reader) {
         return 0;
     }
-    size_t copied = 0;
-    if (s_pcm_reader) {
-        copied = s_pcm_reader(buffer, length, s_pcm_context);
+    size_t copied = s_pcm_reader(buffer, length, s_pcm_context);
+    if (copied == 0) {
+        return 0;
     }
     if (copied < length) {
         memset(buffer + copied, 0, length - copied);
