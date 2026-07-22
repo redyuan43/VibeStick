@@ -28,6 +28,11 @@
 #define JOY_MAX_STEP 24
 #define PCM_STAGING_BYTES 2048
 #define PAIRING_LED_INTERVAL_MS 150
+#define JOYSTICK_LED_HOLD_MS 200
+#define MINIJOY_LED_OFF 0x000000
+#define MINIJOY_LED_PAIRING 0x0000ff
+#define MINIJOY_LED_MICROPHONE 0x400000
+#define MINIJOY_LED_JOYSTICK 0x004000
 #define STARTUP_PAIRING_DELAY_MS 1000
 #define CONFIRM_WINDOW_MS 5000
 #define STARTUP_OTA_HOLD_MS 600
@@ -58,6 +63,7 @@ static int64_t s_minijoy_retry_ms;
 static int64_t s_pairing_deadline_ms;
 static int64_t s_startup_pairing_due_ms;
 static int64_t s_pairing_led_toggle_ms;
+static int64_t s_joystick_led_until_ms;
 static uint32_t s_minijoy_led_color = UINT32_MAX;
 static bool s_pairing_led_on;
 static bool s_confirm_key_down;
@@ -241,13 +247,16 @@ static void update_minijoy_led(int64_t current_ms)
             s_pairing_led_on = !s_pairing_led_on;
             s_pairing_led_toggle_ms =
                 current_ms + PAIRING_LED_INTERVAL_MS;
-            set_minijoy_led(s_pairing_led_on ? 0x0000ff : 0x000000);
+            set_minijoy_led(s_pairing_led_on ? MINIJOY_LED_PAIRING
+                                             : MINIJOY_LED_OFF);
         }
         return;
     }
     s_pairing_led_toggle_ms = 0;
     s_pairing_led_on = false;
-    set_minijoy_led(state.hid_connected ? 0x00ff00 : 0x0000ff);
+    set_minijoy_led(current_ms < s_joystick_led_until_ms
+                        ? MINIJOY_LED_JOYSTICK
+                        : MINIJOY_LED_OFF);
 }
 
 static void open_minijoy(void)
@@ -259,9 +268,8 @@ static void open_minijoy(void)
     esp_err_t err = vibe_minijoyc_open();
     if (err == ESP_OK) {
         s_minijoy_ready = true;
-        vibe_bt_composite_state_t state = bt_state();
         s_minijoy_led_color = UINT32_MAX;
-        set_minijoy_led(state.hid_connected ? 0x00ff00 : 0x0000ff);
+        set_minijoy_led(MINIJOY_LED_OFF);
         ESP_LOGI(TAG, "MiniJoy ready on GPIO0/GPIO26");
     } else {
         s_minijoy_retry_ms = now_ms() + JOY_RETRY_MS;
@@ -275,6 +283,8 @@ static void start_ptt(void)
         return;
     }
     clear_confirm_window();
+    set_minijoy_led(MINIJOY_LED_MICROPHONE);
+    s_joystick_led_until_ms = 0;
     close_minijoy();
     esp_err_t err = vibe_minijoyc_suspend_for_microphone();
     if (err != ESP_OK) {
@@ -371,6 +381,7 @@ static void poll_minijoy(void)
     esp_err_t err = vibe_minijoyc_read(&joy);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "MiniJoy read failed: %s", esp_err_to_name(err));
+        set_minijoy_led(MINIJOY_LED_OFF);
         close_minijoy();
         s_minijoy_retry_ms = now_ms() + JOY_RETRY_MS;
         return;
@@ -409,6 +420,9 @@ static void poll_minijoy(void)
             ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_send_mouse(
                 dx, dy, s_confirm_key_down ? false : joy.button_pressed));
             vibe_bt_status_ui_activity();
+        }
+        if (dx != 0 || dy != 0 || joy.button_pressed || button_changed) {
+            s_joystick_led_until_ms = now_ms() + JOYSTICK_LED_HOLD_MS;
         }
     }
     s_minijoy_button_down = joy.button_pressed;
