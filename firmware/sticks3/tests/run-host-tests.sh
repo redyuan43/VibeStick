@@ -14,3 +14,12 @@ cc -std=c11 -Wall -Wextra -Werror \
   src/vibe_wav.c \
   -o build-host-tests/test_vibe_policies
 ./build-host-tests/test_vibe_policies
+
+cc -std=c11 -Wall -Wextra -Werror \
+  -I include \
+  -I generated \
+  tests/test_vibe_bt_ui_renderer.c \
+  src/vibe_bt_ui_renderer.c \
+  generated/vibe_minijoy_pet_assets.c \
+  -o build-host-tests/test_vibe_bt_ui_renderer
+./build-host-tests/test_vibe_bt_ui_renderer
