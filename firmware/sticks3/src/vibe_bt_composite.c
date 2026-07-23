@@ -12,16 +12,23 @@
 #include "esp_gap_bt_api.h"
 #include "esp_hf_client_api.h"
 #include "esp_hidd.h"
+#include "esp_hidd_api.h"
 #include "esp_hid_common.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #define HID_REPORT_ID_KEYBOARD 1
 #define HID_REPORT_ID_MOUSE 2
 #define AUDIO_PUMP_PERIOD_MS 8
+#define RECONNECT_TASK_PERIOD_MS 250
+#define RECONNECT_REQUEST_GAP_MS 1000
+#define RECONNECT_INITIAL_DELAY_MS 750
+#define RECONNECT_ATTEMPT_TIMEOUT_MS 8000
+#define RECONNECT_BACKOFF_MAX_MS 30000
 
 static const char *TAG = "vibe_bt_composite";
 static const char *DEVICE_NAME = "VibeStick MiniJoy";
@@ -33,9 +40,51 @@ static void *s_state_context;
 static vibe_bt_pcm_read_fn s_pcm_reader;
 static void *s_pcm_context;
 static TaskHandle_t s_audio_pump_task;
+static TaskHandle_t s_reconnect_task;
 static char s_serial[20];
 static esp_bd_addr_t s_reconnect_address;
-static bool s_reconnect_pending;
+static portMUX_TYPE s_reconnect_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_reconnect_target_valid;
+static bool s_hid_ready;
+static bool s_hid_connecting;
+static bool s_hfp_ready;
+static bool s_hfp_connecting;
+static int64_t s_hid_retry_at_ms;
+static int64_t s_hfp_retry_at_ms;
+static int64_t s_last_reconnect_request_ms;
+static uint32_t s_hid_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+static uint32_t s_hfp_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static uint32_t next_retry_delay(uint32_t current)
+{
+    uint32_t doubled = current * 2;
+    return doubled > RECONNECT_BACKOFF_MAX_MS
+               ? RECONNECT_BACKOFF_MAX_MS
+               : doubled;
+}
+
+static void schedule_hid_retry(int64_t current_ms, bool reset_backoff)
+{
+    if (reset_backoff) {
+        s_hid_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+    }
+    s_hid_retry_at_ms = current_ms + s_hid_retry_delay_ms;
+    s_hid_retry_delay_ms = next_retry_delay(s_hid_retry_delay_ms);
+}
+
+static void schedule_hfp_retry(int64_t current_ms, bool reset_backoff)
+{
+    if (reset_backoff) {
+        s_hfp_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+    }
+    s_hfp_retry_at_ms = current_ms + s_hfp_retry_delay_ms;
+    s_hfp_retry_delay_ms = next_retry_delay(s_hfp_retry_delay_ms);
+}
 
 static const uint8_t k_report_map[] = {
     0x05, 0x01,       // Usage Page (Generic Desktop)
@@ -128,6 +177,21 @@ static void set_scan_mode(bool pairing)
     notify_state();
 }
 
+static void set_reconnect_target(const esp_bd_addr_t address)
+{
+    int64_t current_ms = now_ms();
+    portENTER_CRITICAL(&s_reconnect_lock);
+    memcpy(s_reconnect_address, address, sizeof(s_reconnect_address));
+    s_reconnect_target_valid = true;
+    s_hid_connecting = false;
+    s_hfp_connecting = false;
+    s_hid_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+    s_hfp_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+    s_hid_retry_at_ms = current_ms + RECONNECT_INITIAL_DELAY_MS;
+    s_hfp_retry_at_ms = current_ms + RECONNECT_INITIAL_DELAY_MS;
+    portEXIT_CRITICAL(&s_reconnect_lock);
+}
+
 static void gap_callback(esp_bt_gap_cb_event_t event,
                          esp_bt_gap_cb_param_t *param)
 {
@@ -135,13 +199,9 @@ static void gap_callback(esp_bt_gap_cb_event_t event,
     case ESP_BT_GAP_AUTH_CMPL_EVT:
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
             s_state.paired = true;
+            set_reconnect_target(param->auth_cmpl.bda);
             set_scan_mode(false);
             ESP_LOGI(TAG, "bonded with %s", param->auth_cmpl.device_name);
-            esp_err_t err = esp_hf_client_connect(param->auth_cmpl.bda);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "HFP connect after bonding failed: %s",
-                         esp_err_to_name(err));
-            }
         } else {
             ESP_LOGW(TAG, "authentication failed status=%d",
                      param->auth_cmpl.stat);
@@ -172,14 +232,33 @@ static void hid_callback(void *arg, esp_event_base_t base, int32_t id,
         if (data && data->start.status != ESP_OK) {
             ESP_LOGE(TAG, "HID start failed: %s",
                      esp_err_to_name(data->start.status));
+        } else {
+            portENTER_CRITICAL(&s_reconnect_lock);
+            s_hid_ready = true;
+            s_hid_retry_at_ms = now_ms() + RECONNECT_INITIAL_DELAY_MS;
+            portEXIT_CRITICAL(&s_reconnect_lock);
         }
         break;
     case ESP_HIDD_CONNECT_EVENT:
         s_state.hid_connected = !data || data->connect.status == ESP_OK;
+        portENTER_CRITICAL(&s_reconnect_lock);
+        s_hid_connecting = false;
+        if (s_state.hid_connected) {
+            s_hid_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+        } else {
+            schedule_hid_retry(now_ms(), false);
+        }
+        portEXIT_CRITICAL(&s_reconnect_lock);
+        ESP_LOGI(TAG, "HID connected=%d", s_state.hid_connected);
         notify_state();
         break;
     case ESP_HIDD_DISCONNECT_EVENT:
         s_state.hid_connected = false;
+        portENTER_CRITICAL(&s_reconnect_lock);
+        s_hid_connecting = false;
+        schedule_hid_retry(now_ms(), true);
+        portEXIT_CRITICAL(&s_reconnect_lock);
+        ESP_LOGI(TAG, "HID disconnected; automatic reconnect scheduled");
         notify_state();
         break;
     default:
@@ -192,20 +271,32 @@ static void hfp_callback(esp_hf_client_cb_event_t event,
 {
     switch (event) {
     case ESP_HF_CLIENT_PROF_STATE_EVT:
-        if (param->prof_stat.state == ESP_HF_INIT_SUCCESS &&
-            s_reconnect_pending) {
-            s_reconnect_pending = false;
-            esp_err_t err = esp_hf_client_connect(s_reconnect_address);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "HFP reconnect request failed: %s",
-                         esp_err_to_name(err));
-            }
+        if (param->prof_stat.state == ESP_HF_INIT_SUCCESS) {
+            portENTER_CRITICAL(&s_reconnect_lock);
+            s_hfp_ready = true;
+            s_hfp_retry_at_ms = now_ms() + RECONNECT_INITIAL_DELAY_MS;
+            portEXIT_CRITICAL(&s_reconnect_lock);
         }
         break;
     case ESP_HF_CLIENT_CONNECTION_STATE_EVT:
         s_state.hfp_connected =
             param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED ||
             param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED;
+        portENTER_CRITICAL(&s_reconnect_lock);
+        s_hfp_connecting =
+            param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTING;
+        if (s_state.hfp_connected) {
+            s_hfp_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+        } else if (param->conn_stat.state ==
+                   ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {
+            s_hfp_connecting = false;
+            schedule_hfp_retry(now_ms(), true);
+            s_state.audio_connected = false;
+            s_state.wideband = false;
+        }
+        portEXIT_CRITICAL(&s_reconnect_lock);
+        ESP_LOGI(TAG, "HFP state=%d connected=%d",
+                 param->conn_stat.state, s_state.hfp_connected);
         notify_state();
         break;
     case ESP_HF_CLIENT_AUDIO_STATE_EVT:
@@ -253,6 +344,73 @@ static void audio_pump_task(void *arg)
             esp_hf_client_outgoing_data_ready();
         }
         vTaskDelay(pdMS_TO_TICKS(AUDIO_PUMP_PERIOD_MS));
+    }
+}
+
+static void reconnect_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        bool connect_hid = false;
+        bool connect_hfp = false;
+        esp_bd_addr_t address = {0};
+        int64_t current_ms = now_ms();
+
+        portENTER_CRITICAL(&s_reconnect_lock);
+        if (s_reconnect_target_valid && !s_state.pairing &&
+            current_ms - s_last_reconnect_request_ms >=
+                RECONNECT_REQUEST_GAP_MS) {
+            if (s_hid_connecting && current_ms >= s_hid_retry_at_ms) {
+                s_hid_connecting = false;
+                schedule_hid_retry(current_ms, false);
+            }
+            if (s_hfp_connecting && current_ms >= s_hfp_retry_at_ms) {
+                s_hfp_connecting = false;
+                schedule_hfp_retry(current_ms, false);
+            }
+            if (s_hid_ready && !s_state.hid_connected &&
+                !s_hid_connecting && current_ms >= s_hid_retry_at_ms) {
+                s_hid_connecting = true;
+                s_hid_retry_at_ms =
+                    current_ms + RECONNECT_ATTEMPT_TIMEOUT_MS;
+                s_last_reconnect_request_ms = current_ms;
+                connect_hid = true;
+                memcpy(address, s_reconnect_address, sizeof(address));
+            } else if (s_hfp_ready && !s_state.hfp_connected &&
+                       !s_hfp_connecting &&
+                       current_ms >= s_hfp_retry_at_ms) {
+                s_hfp_connecting = true;
+                s_hfp_retry_at_ms =
+                    current_ms + RECONNECT_ATTEMPT_TIMEOUT_MS;
+                s_last_reconnect_request_ms = current_ms;
+                connect_hfp = true;
+                memcpy(address, s_reconnect_address, sizeof(address));
+            }
+        }
+        portEXIT_CRITICAL(&s_reconnect_lock);
+
+        if (connect_hid) {
+            esp_err_t err = esp_bt_hid_device_connect(address);
+            ESP_LOGI(TAG, "automatic HID reconnect requested: %s",
+                     esp_err_to_name(err));
+            if (err != ESP_OK) {
+                portENTER_CRITICAL(&s_reconnect_lock);
+                s_hid_connecting = false;
+                schedule_hid_retry(now_ms(), false);
+                portEXIT_CRITICAL(&s_reconnect_lock);
+            }
+        } else if (connect_hfp) {
+            esp_err_t err = esp_hf_client_connect(address);
+            ESP_LOGI(TAG, "automatic HFP reconnect requested: %s",
+                     esp_err_to_name(err));
+            if (err != ESP_OK) {
+                portENTER_CRITICAL(&s_reconnect_lock);
+                s_hfp_connecting = false;
+                schedule_hfp_retry(now_ms(), false);
+                portEXIT_CRITICAL(&s_reconnect_lock);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_TASK_PERIOD_MS));
     }
 }
 
@@ -311,7 +469,7 @@ esp_err_t vibe_bt_composite_init(vibe_bt_state_callback_t state_callback,
     ESP_RETURN_ON_ERROR(esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL), TAG,
                         "class of device");
 
-    s_reconnect_pending = load_first_bond(&s_reconnect_address);
+    s_reconnect_target_valid = load_first_bond(&s_reconnect_address);
     ESP_RETURN_ON_ERROR(esp_hf_client_register_callback(hfp_callback), TAG,
                         "HFP callback");
     ESP_RETURN_ON_ERROR(esp_hf_client_init(), TAG, "HFP init");
@@ -326,6 +484,10 @@ esp_err_t vibe_bt_composite_init(vibe_bt_state_callback_t state_callback,
     set_scan_mode(false);
     if (xTaskCreatePinnedToCore(audio_pump_task, "bt_audio_pump", 2048, NULL,
                                 6, &s_audio_pump_task, 0) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreatePinnedToCore(reconnect_task, "bt_reconnect", 3072, NULL,
+                                5, &s_reconnect_task, 0) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -377,7 +539,36 @@ esp_err_t vibe_bt_composite_clear_bonds(void)
     s_state.paired = false;
     s_state.hid_connected = false;
     s_state.hfp_connected = false;
+    s_state.audio_connected = false;
+    s_state.wideband = false;
+    portENTER_CRITICAL(&s_reconnect_lock);
+    s_reconnect_target_valid = false;
+    s_hid_connecting = false;
+    s_hfp_connecting = false;
+    portEXIT_CRITICAL(&s_reconnect_lock);
     set_scan_mode(false);
+    return ESP_OK;
+}
+
+esp_err_t vibe_bt_composite_request_reconnect(void)
+{
+    ESP_RETURN_ON_FALSE(s_state.paired, ESP_ERR_INVALID_STATE, TAG,
+                        "no bonded host");
+    int64_t current_ms = now_ms();
+    portENTER_CRITICAL(&s_reconnect_lock);
+    if (!s_reconnect_target_valid) {
+        portEXIT_CRITICAL(&s_reconnect_lock);
+        ESP_LOGE(TAG, "bonded host address unavailable");
+        return ESP_ERR_NOT_FOUND;
+    }
+    s_hid_connecting = false;
+    s_hfp_connecting = false;
+    s_hid_retry_at_ms = current_ms;
+    s_hfp_retry_at_ms = current_ms;
+    s_last_reconnect_request_ms =
+        current_ms - RECONNECT_REQUEST_GAP_MS;
+    portEXIT_CRITICAL(&s_reconnect_lock);
+    ESP_LOGI(TAG, "automatic reconnect requested by user activity");
     return ESP_OK;
 }
 

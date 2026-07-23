@@ -27,6 +27,7 @@ void vibe_bt_composite_set_pcm_reader(vibe_bt_pcm_read_fn reader,
 esp_err_t vibe_bt_composite_begin_pairing(void);
 esp_err_t vibe_bt_composite_end_pairing(void);
 esp_err_t vibe_bt_composite_clear_bonds(void);
+esp_err_t vibe_bt_composite_request_reconnect(void);
 vibe_bt_composite_state_t vibe_bt_composite_state(void);
 esp_err_t vibe_bt_composite_send_right_shift(bool pressed);
 esp_err_t vibe_bt_composite_send_enter(bool pressed);

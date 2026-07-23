@@ -390,11 +390,16 @@ static void poll_minijoy(void)
     vibe_bt_composite_state_t state = bt_state();
     bool button_changed = joy.button_pressed != s_minijoy_button_down;
     if (button_changed && joy.button_pressed && !state.hid_connected) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
-        s_pairing_deadline_ms = now_ms() + PAIRING_WINDOW_MS;
-        s_startup_pairing_due_ms = 0;
-        s_pairing_led_toggle_ms = 0;
-        vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, true);
+        if (state.paired) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                vibe_bt_composite_request_reconnect());
+        } else {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
+            s_pairing_deadline_ms = now_ms() + PAIRING_WINDOW_MS;
+            s_startup_pairing_due_ms = 0;
+            s_pairing_led_toggle_ms = 0;
+            vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, true);
+        }
         vibe_bt_status_ui_activity();
     } else if (state.hid_connected) {
         int8_t dx = joystick_axis(joy.x);
@@ -559,9 +564,13 @@ void app_main(void)
     ESP_ERROR_CHECK(vibe_input_init(&input_config, &input_callbacks));
     open_minijoy();
     vibe_bt_composite_state_t initial_state = bt_state();
-    if (!initial_state.hid_connected && !initial_state.hfp_connected) {
+    if (!initial_state.paired) {
         s_startup_pairing_due_ms = now_ms() + STARTUP_PAIRING_DELAY_MS;
         ESP_LOGI(TAG, "startup pairing window scheduled");
+    } else {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            vibe_bt_composite_request_reconnect());
+        ESP_LOGI(TAG, "bonded host found; automatic reconnect started");
     }
     update_status();
 
