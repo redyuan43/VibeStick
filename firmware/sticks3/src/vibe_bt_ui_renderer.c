@@ -62,6 +62,35 @@ void vibe_bt_ui_surface_fill_rect(vibe_bt_ui_surface_t *surface, int x, int y,
     }
 }
 
+void vibe_bt_ui_surface_fill_rounded_rect(vibe_bt_ui_surface_t *surface,
+                                          int x, int y, int width,
+                                          int height, int radius,
+                                          uint16_t color)
+{
+    if (!surface || !surface->pixels || width <= 0 || height <= 0) {
+        return;
+    }
+    if (radius < 0) {
+        radius = 0;
+    }
+    int max_radius = width / 2;
+    if (height / 2 < max_radius) {
+        max_radius = height / 2;
+    }
+    if (radius > max_radius) {
+        radius = max_radius;
+    }
+    for (int row = 0; row < height; ++row) {
+        int edge = row;
+        if (height - 1 - row < edge) {
+            edge = height - 1 - row;
+        }
+        int inset = edge < radius ? radius - edge - 1 : 0;
+        vibe_bt_ui_surface_fill_rect(surface, x + inset, y + row,
+                                     width - inset * 2, 1, color);
+    }
+}
+
 static uint8_t glyph_column(char character, int column)
 {
     static const struct {
@@ -197,36 +226,28 @@ bool vibe_bt_ui_surface_draw_pet(vibe_bt_ui_surface_t *surface, int x, int y,
     return output == pixel_count && input == frame->size;
 }
 
-uint8_t vibe_bt_ui_smooth_audio_level(uint8_t current, uint8_t target)
+void vibe_bt_ui_loading_heights(uint32_t elapsed_ms, int heights[5])
 {
-    if (target > current) {
-        unsigned delta = ((unsigned)target - current + 1) / 2;
-        return (uint8_t)(current + delta);
-    }
-    if (target < current) {
-        unsigned delta = ((unsigned)current - target + 3) / 4;
-        return (uint8_t)(current - delta);
-    }
-    return current;
-}
-
-void vibe_bt_ui_wave_heights(uint8_t level, int heights[5])
-{
-    static const int offsets[5] = {-8, 3, 10, -2, 6};
+    static const int min_heights[5] = {10, 14, 18, 14, 10};
+    static const int max_heights[5] = {24, 34, 48, 34, 24};
+    const uint32_t half_period_ms = 460;
+    const uint32_t period_ms = half_period_ms * 2;
+    const uint32_t delay_ms = 70;
     if (!heights) {
         return;
     }
-    if (level > 100) {
-        level = 100;
-    }
-    int base_height = 8 + level * 56 / 100;
     for (int i = 0; i < 5; ++i) {
-        int height = base_height + offsets[i];
-        if (height < 6) {
-            height = 6;
-        } else if (height > 68) {
-            height = 68;
+        uint32_t delay = (uint32_t)i * delay_ms;
+        if (elapsed_ms < delay) {
+            heights[i] = min_heights[i];
+            continue;
         }
-        heights[i] = height;
+        uint32_t phase = (elapsed_ms - delay) % period_ms;
+        uint32_t progress = phase <= half_period_ms
+                                ? phase
+                                : period_ms - phase;
+        heights[i] = min_heights[i] +
+                     (max_heights[i] - min_heights[i]) * (int)progress /
+                         (int)half_period_ms;
     }
 }

@@ -608,6 +608,20 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
         {.freq_hz = 0, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_GAP_MS},
         {.freq_hz = 520, .duration_ms = VIBE_STICK_ESCAPE_GLITCH_LONG_MS},
     };
+    static const sound_segment_t joystick_start[] = {
+        {.freq_hz = 2200, .duration_ms = 35},
+    };
+    static const sound_segment_t mouse_click[] = {
+        {.freq_hz = 3000, .duration_ms = 30},
+    };
+    static const sound_segment_t side_button[] = {
+        {.freq_hz = 1800, .duration_ms = 45},
+    };
+    static const sound_segment_t pairing[] = {
+        {.freq_hz = 1800, .duration_ms = 55},
+        {.freq_hz = 0, .duration_ms = 25},
+        {.freq_hz = 2600, .duration_ms = 55},
+    };
 
     switch (sound) {
     case VIBE_STICK_SOUND_DONE:
@@ -631,6 +645,18 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
     case VIBE_STICK_SOUND_FOLLOWUP_ESCAPE:
         *count = sizeof(followup_escape) / sizeof(followup_escape[0]);
         return followup_escape;
+    case VIBE_STICK_SOUND_JOYSTICK_START:
+        *count = sizeof(joystick_start) / sizeof(joystick_start[0]);
+        return joystick_start;
+    case VIBE_STICK_SOUND_MOUSE_CLICK:
+        *count = sizeof(mouse_click) / sizeof(mouse_click[0]);
+        return mouse_click;
+    case VIBE_STICK_SOUND_SIDE_BUTTON:
+        *count = sizeof(side_button) / sizeof(side_button[0]);
+        return side_button;
+    case VIBE_STICK_SOUND_PAIRING:
+        *count = sizeof(pairing) / sizeof(pairing[0]);
+        return pairing;
     default:
         *count = 0;
         return NULL;

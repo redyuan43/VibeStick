@@ -2,6 +2,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -23,6 +24,7 @@
 
 #define HID_REPORT_ID_KEYBOARD 1
 #define HID_REPORT_ID_MOUSE 2
+#define HID_KEY_CLICK_MS 20
 #define AUDIO_PUMP_PERIOD_MS 8
 #define RECONNECT_TASK_PERIOD_MS 250
 #define RECONNECT_REQUEST_GAP_MS 1000
@@ -596,6 +598,14 @@ esp_err_t vibe_bt_composite_send_right_shift(bool pressed)
 esp_err_t vibe_bt_composite_send_enter(bool pressed)
 {
     return send_keyboard_report(0x00, pressed ? 0x28 : 0x00);
+}
+
+esp_err_t vibe_bt_composite_send_enter_click(void)
+{
+    ESP_RETURN_ON_ERROR(vibe_bt_composite_send_enter(true), TAG,
+                        "Enter key down");
+    vTaskDelay(pdMS_TO_TICKS(HID_KEY_CLICK_MS));
+    return vibe_bt_composite_send_enter(false);
 }
 
 esp_err_t vibe_bt_composite_send_mouse(int8_t dx, int8_t dy,

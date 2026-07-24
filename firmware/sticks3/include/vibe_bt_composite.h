@@ -31,5 +31,6 @@ esp_err_t vibe_bt_composite_request_reconnect(void);
 vibe_bt_composite_state_t vibe_bt_composite_state(void);
 esp_err_t vibe_bt_composite_send_right_shift(bool pressed);
 esp_err_t vibe_bt_composite_send_enter(bool pressed);
+esp_err_t vibe_bt_composite_send_enter_click(void);
 esp_err_t vibe_bt_composite_send_mouse(int8_t dx, int8_t dy,
                                        bool left_pressed);

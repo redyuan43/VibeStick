@@ -3,8 +3,11 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -13,6 +16,7 @@
 #include "nvs_flash.h"
 #include "vibe_audio.h"
 #include "vibe_board.h"
+#include "vibe_board_profile.h"
 #include "vibe_bt_composite.h"
 #include "vibe_bt_status_ui.h"
 #include "vibe_input.h"
@@ -35,10 +39,14 @@
 #define MINIJOY_LED_JOYSTICK 0x004000
 #define STARTUP_PAIRING_DELAY_MS 1000
 #define CONFIRM_WINDOW_MS 5000
+#define PTT_RELEASE_AUDIO_TAIL_MS 350
 #define STARTUP_OTA_HOLD_MS 600
 #define STARTUP_OTA_POLL_MS 40
 #define OTA_RESULT_DISPLAY_MS 2500
 #define OTA_TASK_STACK_BYTES 8192
+#define DEEP_SLEEP_IDLE_MS 600000
+#define DEEP_SLEEP_RETRY_MS 5000
+#define WAKE_RELEASE_STABLE_MS 80
 
 typedef enum {
     APP_EVENT_PTT_DOWN,
@@ -51,6 +59,7 @@ static const char *TAG = "minijoy_bt";
 static QueueHandle_t s_event_queue;
 static atomic_bool s_ptt_active;
 static atomic_bool s_side_long_handled;
+static atomic_bool s_wake_input_guard;
 static portMUX_TYPE s_bt_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static vibe_bt_composite_state_t s_bt_state;
 static uint8_t s_pcm_staging[PCM_STAGING_BYTES];
@@ -59,6 +68,7 @@ static size_t s_pcm_staging_length;
 static uint8_t s_resample_staging[PCM_STAGING_BYTES];
 static bool s_minijoy_ready;
 static bool s_minijoy_button_down;
+static bool s_joystick_motion_active;
 static int64_t s_minijoy_retry_ms;
 static int64_t s_pairing_deadline_ms;
 static int64_t s_startup_pairing_due_ms;
@@ -66,12 +76,31 @@ static int64_t s_pairing_led_toggle_ms;
 static int64_t s_joystick_led_until_ms;
 static uint32_t s_minijoy_led_color = UINT32_MAX;
 static bool s_pairing_led_on;
-static bool s_confirm_key_down;
+static bool s_confirm_button_consumed;
+static bool s_front_confirm_consumed;
 static int64_t s_confirm_deadline_ms;
+static int64_t s_last_activity_ms;
+static int64_t s_next_deep_sleep_attempt_ms;
+static int64_t s_wake_release_since_ms;
 
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+static void register_activity(void)
+{
+    s_last_activity_ms = now_ms();
+    s_next_deep_sleep_attempt_ms = 0;
+    vibe_bt_status_ui_activity();
+}
+
+static void play_event_sound(agent_sound_t sound, const char *event)
+{
+    esp_err_t err = vibe_audio_play_sound(sound);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s sound failed: %s", event, esp_err_to_name(err));
+    }
 }
 
 static void queue_app_event(app_event_t event)
@@ -85,20 +114,27 @@ static void front_down_callback(void *button, void *context)
 {
     (void)button;
     (void)context;
-    queue_app_event(APP_EVENT_PTT_DOWN);
+    if (!atomic_load(&s_wake_input_guard)) {
+        queue_app_event(APP_EVENT_PTT_DOWN);
+    }
 }
 
 static void front_up_callback(void *button, void *context)
 {
     (void)button;
     (void)context;
-    queue_app_event(APP_EVENT_PTT_UP);
+    if (!atomic_load(&s_wake_input_guard)) {
+        queue_app_event(APP_EVENT_PTT_UP);
+    }
 }
 
 static void side_long_callback(void *button, void *context)
 {
     (void)button;
     (void)context;
+    if (atomic_load(&s_wake_input_guard)) {
+        return;
+    }
     atomic_store(&s_side_long_handled, true);
     queue_app_event(APP_EVENT_CLEAR_BONDS);
 }
@@ -107,6 +143,10 @@ static void side_up_callback(void *button, void *context)
 {
     (void)button;
     (void)context;
+    if (atomic_load(&s_wake_input_guard)) {
+        atomic_store(&s_side_long_handled, false);
+        return;
+    }
     if (atomic_exchange(&s_side_long_handled, false)) {
         return;
     }
@@ -133,12 +173,30 @@ static vibe_bt_composite_state_t bt_state(void)
 
 static void clear_confirm_window(void)
 {
-    if (s_confirm_key_down) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_send_enter(false));
-        s_confirm_key_down = false;
+    s_confirm_button_consumed = false;
+    s_front_confirm_consumed = false;
+    s_confirm_deadline_ms = 0;
+    vibe_bt_status_ui_set_confirm_window(false);
+}
+
+static bool consume_confirm_window(const char *source)
+{
+    if (s_confirm_deadline_ms <= now_ms()) {
+        return false;
     }
     s_confirm_deadline_ms = 0;
     vibe_bt_status_ui_set_confirm_window(false);
+    esp_err_t err = vibe_bt_composite_send_enter_click();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "%s sent HID Enter click", source);
+        play_event_sound(VIBE_STICK_SOUND_FOLLOWUP_ENTER,
+                         "follow-up Enter");
+    } else {
+        ESP_LOGW(TAG, "%s HID Enter click failed: %s", source,
+                 esp_err_to_name(err));
+        play_event_sound(VIBE_STICK_SOUND_ERROR, "follow-up Enter error");
+    }
+    return true;
 }
 
 static size_t read_raw_pcm(uint8_t *buffer, size_t length)
@@ -220,6 +278,7 @@ static void close_minijoy(void)
         vibe_minijoyc_close();
         s_minijoy_ready = false;
         s_minijoy_button_down = false;
+        s_joystick_motion_active = false;
         s_minijoy_led_color = UINT32_MAX;
         s_pairing_led_toggle_ms = 0;
     }
@@ -283,6 +342,7 @@ static void start_ptt(void)
         return;
     }
     clear_confirm_window();
+    play_event_sound(VIBE_STICK_SOUND_RECORDING_START, "recording start");
     set_minijoy_led(MINIJOY_LED_MICROPHONE);
     s_joystick_led_until_ms = 0;
     close_minijoy();
@@ -292,6 +352,7 @@ static void start_ptt(void)
         s_minijoy_retry_ms = now_ms() + 20;
         open_minijoy();
         vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
+        play_event_sound(VIBE_STICK_SOUND_ERROR, "MiniJoy suspend error");
         return;
     }
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -303,6 +364,7 @@ static void start_ptt(void)
         s_minijoy_retry_ms = now_ms() + 20;
         open_minijoy();
         vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
+        play_event_sound(VIBE_STICK_SOUND_ERROR, "microphone start error");
         return;
     }
     atomic_store(&s_ptt_active, true);
@@ -326,9 +388,11 @@ static void stop_ptt(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Right Shift up failed: %s", esp_err_to_name(err));
     }
+    /* CapsWriter finalizes 300 ms after key-up; keep SCO PCM alive through it. */
+    vTaskDelay(pdMS_TO_TICKS(PTT_RELEASE_AUDIO_TAIL_MS));
     atomic_store(&s_ptt_active, false);
-    vTaskDelay(pdMS_TO_TICKS(100));
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_audio_stop());
+    play_event_sound(VIBE_STICK_SOUND_RECORDING_STOP, "recording stop");
     s_pcm_staging_offset = 0;
     s_pcm_staging_length = 0;
     s_minijoy_retry_ms = now_ms() + 20;
@@ -346,12 +410,24 @@ static void handle_event(app_event_t event)
 {
     switch (event) {
     case APP_EVENT_PTT_DOWN:
-        start_ptt();
+        register_activity();
+        if (!atomic_load(&s_ptt_active) &&
+            consume_confirm_window("front follow-up")) {
+            s_front_confirm_consumed = true;
+        } else {
+            start_ptt();
+        }
         break;
     case APP_EVENT_PTT_UP:
-        stop_ptt();
+        register_activity();
+        if (s_front_confirm_consumed) {
+            s_front_confirm_consumed = false;
+        } else {
+            stop_ptt();
+        }
         break;
     case APP_EVENT_CLEAR_BONDS:
+        register_activity();
         stop_ptt();
         clear_confirm_window();
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_clear_bonds());
@@ -360,10 +436,14 @@ static void handle_event(app_event_t event)
         s_startup_pairing_due_ms = 0;
         s_pairing_led_toggle_ms = 0;
         vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
+        play_event_sound(VIBE_STICK_SOUND_PAIRING, "pairing");
         ESP_LOGI(TAG, "Bluetooth bonds cleared; pairing window started");
         break;
     case APP_EVENT_WAKE_DISPLAY:
-        vibe_bt_status_ui_activity();
+        register_activity();
+        if (!atomic_load(&s_ptt_active)) {
+            play_event_sound(VIBE_STICK_SOUND_SIDE_BUTTON, "side button");
+        }
         break;
     }
 }
@@ -400,35 +480,42 @@ static void poll_minijoy(void)
             s_pairing_led_toggle_ms = 0;
             vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, true);
         }
-        vibe_bt_status_ui_activity();
+        play_event_sound(VIBE_STICK_SOUND_PAIRING, "pairing request");
+        register_activity();
+        s_joystick_motion_active = false;
     } else if (state.hid_connected) {
         int8_t dx = joystick_axis(joy.x);
         int8_t dy = (int8_t)-joystick_axis(joy.y);
+        bool motion_active = dx != 0 || dy != 0;
+        bool motion_started = motion_active && !s_joystick_motion_active;
+        bool mouse_click = false;
         if (button_changed && joy.button_pressed &&
-            s_confirm_deadline_ms > now_ms()) {
-            esp_err_t enter_err = vibe_bt_composite_send_enter(true);
-            if (enter_err == ESP_OK) {
-                s_confirm_key_down = true;
-                s_confirm_deadline_ms = 0;
-                vibe_bt_status_ui_set_confirm_window(false);
-                ESP_LOGI(TAG, "confirm window sent Enter");
-            } else {
-                ESP_LOGW(TAG, "Enter down failed: %s",
-                         esp_err_to_name(enter_err));
-            }
+            consume_confirm_window("MiniJoy follow-up")) {
+            s_confirm_button_consumed = true;
+        } else if (button_changed && joy.button_pressed) {
+            mouse_click = true;
         } else if (button_changed && !joy.button_pressed &&
-                   s_confirm_key_down) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_send_enter(false));
-            s_confirm_key_down = false;
+                   s_confirm_button_consumed) {
+            s_confirm_button_consumed = false;
         }
         if (dx != 0 || dy != 0 || button_changed) {
             ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_send_mouse(
-                dx, dy, s_confirm_key_down ? false : joy.button_pressed));
-            vibe_bt_status_ui_activity();
+                dx, dy,
+                s_confirm_button_consumed ? false : joy.button_pressed));
+            register_activity();
         }
+        if (mouse_click) {
+            play_event_sound(VIBE_STICK_SOUND_MOUSE_CLICK, "mouse click");
+        } else if (motion_started && !button_changed) {
+            play_event_sound(VIBE_STICK_SOUND_JOYSTICK_START,
+                             "joystick start");
+        }
+        s_joystick_motion_active = motion_active;
         if (dx != 0 || dy != 0 || joy.button_pressed || button_changed) {
             s_joystick_led_until_ms = now_ms() + JOYSTICK_LED_HOLD_MS;
         }
+    } else {
+        s_joystick_motion_active = false;
     }
     s_minijoy_button_down = joy.button_pressed;
 }
@@ -447,10 +534,115 @@ static void update_status(void)
         vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
     } else if (state.hid_connected || state.hfp_connected) {
         vibe_bt_status_ui_set(VIBE_BT_UI_CONNECTED, s_minijoy_ready);
+    } else if (state.paired || state.hid_connected || state.hfp_connected) {
+        vibe_bt_status_ui_set(VIBE_BT_UI_CONNECTING, s_minijoy_ready);
     } else {
         vibe_bt_status_ui_set(VIBE_BT_UI_WAITING, s_minijoy_ready);
     }
 
+}
+
+static void update_wake_input_guard(int64_t current_ms)
+{
+    if (!atomic_load(&s_wake_input_guard)) {
+        return;
+    }
+    bool released = gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) != 0 &&
+                    gpio_get_level(VIBE_BOARD_PIN_BUTTON_SIDE) != 0;
+    if (!released) {
+        s_wake_release_since_ms = 0;
+        return;
+    }
+    if (s_wake_release_since_ms == 0) {
+        s_wake_release_since_ms = current_ms;
+        return;
+    }
+    if (current_ms - s_wake_release_since_ms >= WAKE_RELEASE_STABLE_MS) {
+        atomic_store(&s_wake_input_guard, false);
+        s_wake_release_since_ms = 0;
+        s_last_activity_ms = current_ms;
+        ESP_LOGI(TAG, "deep-sleep wake buttons released; input enabled");
+    }
+}
+
+static bool deep_sleep_has_active_work(int64_t current_ms)
+{
+    vibe_bt_composite_state_t state = bt_state();
+    return atomic_load(&s_ptt_active) ||
+           atomic_load(&s_wake_input_guard) || state.pairing ||
+           s_pairing_deadline_ms > current_ms ||
+           s_startup_pairing_due_ms > current_ms ||
+           s_confirm_deadline_ms > current_ms;
+}
+
+static esp_err_t configure_deep_sleep_wake_sources(void)
+{
+    ESP_RETURN_ON_ERROR(
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL), TAG,
+        "clear wake sources");
+    ESP_RETURN_ON_ERROR(
+        esp_sleep_enable_ext0_wakeup(VIBE_BOARD_PIN_BUTTON_FRONT, 0), TAG,
+        "front button wake");
+    return esp_sleep_enable_ext1_wakeup_io(
+        1ULL << VIBE_BOARD_PIN_BUTTON_SIDE, ESP_EXT1_WAKEUP_ALL_LOW);
+}
+
+static bool enter_deep_sleep(void)
+{
+    if (gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0 ||
+        gpio_get_level(VIBE_BOARD_PIN_BUTTON_SIDE) == 0) {
+        ESP_LOGW(TAG, "deep sleep deferred: wake button is active");
+        return false;
+    }
+    esp_err_t err = configure_deep_sleep_wake_sources();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep wake setup failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    err = vibe_audio_prepare_deep_sleep();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep audio preparation failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+
+    set_minijoy_led(MINIJOY_LED_OFF);
+    close_minijoy();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_status_ui_prepare_deep_sleep());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_set_external_5v(false));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_prepare_deep_sleep());
+    ESP_LOGI(TAG,
+             "entering deep sleep idle_ms=%d wake_front=%d wake_side=%d",
+             DEEP_SLEEP_IDLE_MS, (int)VIBE_BOARD_PIN_BUTTON_FRONT,
+             (int)VIBE_BOARD_PIN_BUTTON_SIDE);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    esp_deep_sleep_start();
+    return true;
+}
+
+static void maybe_enter_deep_sleep(int64_t current_ms)
+{
+    if (s_last_activity_ms == 0 ||
+        current_ms - s_last_activity_ms < DEEP_SLEEP_IDLE_MS ||
+        deep_sleep_has_active_work(current_ms) ||
+        (s_next_deep_sleep_attempt_ms > 0 &&
+         current_ms < s_next_deep_sleep_attempt_ms)) {
+        return;
+    }
+    s_next_deep_sleep_attempt_ms = current_ms + DEEP_SLEEP_RETRY_MS;
+
+    bool usb_powered = false;
+    esp_err_t power_err = vibe_board_usb_powered(&usb_powered);
+    if (power_err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep deferred: USB status unavailable: %s",
+                 esp_err_to_name(power_err));
+        return;
+    }
+    if (usb_powered) {
+        return;
+    }
+    (void)enter_deep_sleep();
 }
 
 static esp_err_t init_nvs(void)
@@ -527,6 +719,19 @@ static void ota_maintenance_task(void *context)
 
 void app_main(void)
 {
+    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    uint64_t ext1_status = esp_sleep_get_ext1_wakeup_status();
+    bool woke_from_button = wake_cause == ESP_SLEEP_WAKEUP_EXT0 ||
+                            wake_cause == ESP_SLEEP_WAKEUP_EXT1;
+    if (woke_from_button) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_FRONT));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_SIDE));
+        atomic_store(&s_wake_input_guard, true);
+        ESP_LOGI(TAG, "deep-sleep wake cause=%d ext1=0x%llx",
+                 (int)wake_cause, (unsigned long long)ext1_status);
+    }
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(vibe_board_init_power());
     ESP_ERROR_CHECK(vibe_board_set_external_5v(false));
@@ -562,6 +767,7 @@ void app_main(void)
         .side_mode_hold = side_long_callback,
     };
     ESP_ERROR_CHECK(vibe_input_init(&input_config, &input_callbacks));
+    s_last_activity_ms = now_ms();
     open_minijoy();
     vibe_bt_composite_state_t initial_state = bt_state();
     if (!initial_state.paired) {
@@ -577,12 +783,14 @@ void app_main(void)
     ESP_LOGI(TAG, "dedicated MiniJoy BT firmware ready version=%s",
              FIRMWARE_VERSION);
     for (;;) {
+        int64_t current_ms = now_ms();
+        update_wake_input_guard(current_ms);
         app_event_t event;
         while (xQueueReceive(s_event_queue, &event, 0) == pdTRUE) {
             handle_event(event);
         }
         poll_minijoy();
-        int64_t current_ms = now_ms();
+        current_ms = now_ms();
         if (s_confirm_deadline_ms > 0 &&
             current_ms >= s_confirm_deadline_ms) {
             s_confirm_deadline_ms = 0;
@@ -603,7 +811,8 @@ void app_main(void)
         }
         update_status();
         update_minijoy_led(current_ms);
-        vibe_bt_status_ui_tick(current_ms, vibe_audio_level_percent());
+        vibe_bt_status_ui_tick(current_ms);
+        maybe_enter_deep_sleep(current_ms);
         vTaskDelay(pdMS_TO_TICKS(APP_LOOP_MS));
     }
 }

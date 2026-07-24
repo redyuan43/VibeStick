@@ -32,10 +32,14 @@ static void test_surface_bounds(void)
     vibe_bt_ui_surface_fill_rect(&surface, -4, -3, 12, 10, 0xabcd);
     vibe_bt_ui_surface_fill_rect(&surface, TEST_WIDTH - 4, TEST_HEIGHT - 3,
                                  12, 10, 0xbeef);
+    vibe_bt_ui_surface_fill_rounded_rect(&surface, 10, 10, 6, 12, 3,
+                                         0x0f0f);
     assert(storage[0] == 0x55aa);
     assert(storage[TEST_PIXELS + 1] == 0xaa55);
     assert(storage[1] == 0xabcd);
     assert(storage[TEST_PIXELS] == 0xbeef);
+    assert(storage[1 + 10 * TEST_WIDTH + 10] != 0x0f0f);
+    assert(storage[1 + 11 * TEST_WIDTH + 12] == 0x0f0f);
     assert(!vibe_bt_ui_surface_init(&surface, &storage[1], TEST_PIXELS - 1,
                                     TEST_WIDTH, TEST_HEIGHT));
 }
@@ -49,6 +53,7 @@ static void test_text(void)
     vibe_bt_ui_surface_clear(&surface, 0);
     assert(vibe_bt_ui_text_width("PAIR", 1) == 23);
     assert(vibe_bt_ui_text_width("MIC LIVE", 2) == 94);
+    assert(vibe_bt_ui_text_width("PLEASE WAIT", 2) == 130);
     vibe_bt_ui_surface_draw_text(&surface, 0, 0, "PAIR", 0xffff, 1);
     bool has_foreground = false;
     for (size_t i = 0; i < TEST_PIXELS; ++i) {
@@ -77,21 +82,22 @@ static void test_pet_frames(void)
         &surface, 8, 0, VIBE_MINIJOY_PET_FRAME_IDLE));
 }
 
-static void test_wave_smoothing(void)
+static void test_loading_animation(void)
 {
-    assert(vibe_bt_ui_smooth_audio_level(0, 100) == 50);
-    assert(vibe_bt_ui_smooth_audio_level(50, 100) == 75);
-    assert(vibe_bt_ui_smooth_audio_level(75, 0) == 56);
-    assert(vibe_bt_ui_smooth_audio_level(10, 10) == 10);
-
-    int quiet[5];
-    int loud[5];
-    vibe_bt_ui_wave_heights(0, quiet);
-    vibe_bt_ui_wave_heights(100, loud);
+    int start[5];
+    vibe_bt_ui_loading_heights(0, start);
     for (int i = 0; i < 5; ++i) {
-        assert(quiet[i] >= 6 && quiet[i] <= 68);
-        assert(loud[i] >= 6 && loud[i] <= 68);
-        assert(loud[i] >= quiet[i]);
+        assert(start[i] >= 10 && start[i] <= 18);
+        int at_delay[5];
+        int at_peak[5];
+        int at_period[5];
+        uint32_t delay = (uint32_t)i * 70;
+        vibe_bt_ui_loading_heights(delay, at_delay);
+        vibe_bt_ui_loading_heights(delay + 460, at_peak);
+        vibe_bt_ui_loading_heights(delay + 920, at_period);
+        assert(at_delay[i] == start[i]);
+        assert(at_period[i] == start[i]);
+        assert(at_peak[i] > at_delay[i]);
     }
 }
 
@@ -100,6 +106,6 @@ int main(void)
     test_surface_bounds();
     test_text();
     test_pet_frames();
-    test_wave_smoothing();
+    test_loading_animation();
     return 0;
 }

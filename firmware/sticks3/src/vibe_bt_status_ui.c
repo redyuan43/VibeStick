@@ -26,7 +26,7 @@
     (VIBE_BOARD_LCD_H_RES * UI_BOTTOM_HEIGHT)
 #define UI_IDLE_OFF_MS 30000
 #define UI_POWER_POLL_MS 2000
-#define UI_WAVE_REFRESH_MS 100
+#define UI_LOADING_REFRESH_MS 40
 #define UI_PET_BLINK_HOLD_MS 250
 #define UI_PET_BLINK_MIN_MS 4000
 #define UI_PET_BLINK_RANGE_MS 4001
@@ -49,7 +49,8 @@ static bool s_confirm_window;
 static vibe_bt_ui_status_t s_status = VIBE_BT_UI_WAITING;
 static int64_t s_last_activity_ms;
 static int64_t s_last_power_poll_ms;
-static int64_t s_last_wave_refresh_ms;
+static int64_t s_last_loading_refresh_ms;
+static int64_t s_loading_started_ms;
 static int64_t s_pet_happy_until_ms;
 static int64_t s_pet_blink_until_ms;
 static int64_t s_pet_next_blink_ms;
@@ -57,9 +58,8 @@ static vibe_minijoy_pet_frame_id_t s_pet_blink_frame =
     VIBE_MINIJOY_PET_FRAME_BLINK_BOTH;
 static vibe_minijoy_pet_frame_id_t s_pet_current_frame =
     VIBE_MINIJOY_PET_FRAME_COUNT;
-static uint8_t s_wave_level;
-static int s_wave_heights[5];
-static bool s_wave_heights_valid;
+static int s_loading_heights[5];
+static bool s_loading_heights_valid;
 static int s_battery_samples[UI_BATTERY_SAMPLE_COUNT];
 static size_t s_battery_sample_count;
 static size_t s_battery_sample_index;
@@ -95,6 +95,11 @@ static uint16_t color_background(void)
 static uint16_t color_foreground(void)
 {
     return rgb565(225, 235, 242);
+}
+
+static uint16_t color_loading(void)
+{
+    return rgb565(244, 245, 247);
 }
 
 static uint16_t color_accent(void)
@@ -148,6 +153,8 @@ static void draw_text_centered(vibe_bt_ui_surface_t *surface, int y,
 static const char *status_text(void)
 {
     switch (s_status) {
+    case VIBE_BT_UI_CONNECTING:
+        return "SYNC";
     case VIBE_BT_UI_PAIRING:
         return "PAIR";
     case VIBE_BT_UI_CONNECTED:
@@ -174,6 +181,9 @@ static const char *status_text(void)
 
 static uint16_t status_color(void)
 {
+    if (s_status == VIBE_BT_UI_CONNECTING) {
+        return rgb565(255, 196, 64);
+    }
     return (s_status == VIBE_BT_UI_RECORDING ||
             s_status == VIBE_BT_UI_OTA_DOWNLOADING ||
             s_status == VIBE_BT_UI_OTA_FAILED ||
@@ -248,11 +258,14 @@ static void draw_bottom_bar(void)
     vibe_bt_ui_surface_clear(&surface, color_background());
     const bool ota_status = s_status >= VIBE_BT_UI_OTA_CONNECTING &&
                             s_status <= VIBE_BT_UI_OTA_FAILED;
-    const char *joy_text = ota_status
-                               ? "OTA MODE"
-                               : (s_status == VIBE_BT_UI_RECORDING
-                                      ? "JOY MIC"
-                                      : (s_minijoy_ready ? "JOY OK" : "JOY OFF"));
+    const char *joy_text =
+        ota_status
+            ? "OTA MODE"
+            : (s_status == VIBE_BT_UI_CONNECTING
+                   ? "HID MIC"
+                   : (s_status == VIBE_BT_UI_RECORDING
+                          ? "JOY MIC"
+                          : (s_minijoy_ready ? "JOY OK" : "JOY OFF")));
     draw_text_centered(&surface, 166 - UI_BOTTOM_Y, joy_text,
                        ota_status || s_minijoy_ready ||
                                s_status == VIBE_BT_UI_RECORDING
@@ -260,7 +273,9 @@ static void draw_bottom_bar(void)
                            : color_warning(),
                        1);
     const char *action_text = "A MIC";
-    if (s_status == VIBE_BT_UI_RECORDING) {
+    if (s_status == VIBE_BT_UI_CONNECTING) {
+        action_text = "PLEASE WAIT";
+    } else if (s_status == VIBE_BT_UI_RECORDING) {
         action_text = "MIC LIVE";
     } else if (s_status == VIBE_BT_UI_OTA_CONNECTING) {
         action_text = "CONNECT";
@@ -276,7 +291,9 @@ static void draw_bottom_bar(void)
         action_text = "ENTER";
     }
     draw_text_centered(&surface, 198 - UI_BOTTOM_Y, action_text,
-                       s_status == VIBE_BT_UI_RECORDING ||
+                       s_status == VIBE_BT_UI_CONNECTING
+                           ? rgb565(255, 196, 64)
+                           : s_status == VIBE_BT_UI_RECORDING ||
                                s_status == VIBE_BT_UI_OTA_DOWNLOADING
                            ? color_warning()
                            : color_accent(),
@@ -351,13 +368,16 @@ static void update_pet(int64_t now_ms)
     }
 }
 
-static void draw_waveform(uint8_t level)
+static void draw_loading(int64_t now_ms)
 {
-    s_wave_level = vibe_bt_ui_smooth_audio_level(s_wave_level, level);
     int heights[5];
-    vibe_bt_ui_wave_heights(s_wave_level, heights);
-    if (s_wave_heights_valid &&
-        memcmp(heights, s_wave_heights, sizeof(heights)) == 0) {
+    uint32_t elapsed_ms = s_loading_started_ms > 0 &&
+                                  now_ms >= s_loading_started_ms
+                              ? (uint32_t)(now_ms - s_loading_started_ms)
+                              : 0;
+    vibe_bt_ui_loading_heights(elapsed_ms, heights);
+    if (s_loading_heights_valid &&
+        memcmp(heights, s_loading_heights, sizeof(heights)) == 0) {
         return;
     }
 
@@ -366,19 +386,19 @@ static void draw_waveform(uint8_t level)
         return;
     }
     vibe_bt_ui_surface_clear(&surface, color_background());
-    const int bar_width = 9;
-    const int gap = 7;
+    const int bar_width = 6;
+    const int gap = 6;
     const int total_width = 5 * bar_width + 4 * gap;
     const int start_x = (UI_WAVE_WIDTH - total_width) / 2;
     for (int i = 0; i < 5; ++i) {
         int y = (UI_WAVE_HEIGHT - heights[i]) / 2;
-        vibe_bt_ui_surface_fill_rect(
+        vibe_bt_ui_surface_fill_rounded_rect(
             &surface, start_x + i * (bar_width + gap), y, bar_width,
-            heights[i], i == 2 ? color_warning() : color_accent());
+            heights[i], 3, color_loading());
     }
     if (flush_surface(UI_WAVE_X, UI_WAVE_Y, &surface)) {
-        memcpy(s_wave_heights, heights, sizeof(heights));
-        s_wave_heights_valid = true;
+        memcpy(s_loading_heights, heights, sizeof(heights));
+        s_loading_heights_valid = true;
     }
 }
 
@@ -485,7 +505,7 @@ static void clear_panel_background(void)
     }
 }
 
-static void redraw_full(int64_t now_ms, uint8_t audio_level)
+static void redraw_full(int64_t now_ms)
 {
     if (!s_panel || !s_display_on) {
         return;
@@ -494,9 +514,9 @@ static void redraw_full(int64_t now_ms, uint8_t audio_level)
     draw_bottom_bar();
     s_pet_current_frame = VIBE_MINIJOY_PET_FRAME_COUNT;
     if (s_status == VIBE_BT_UI_RECORDING) {
-        s_wave_heights_valid = false;
-        draw_waveform(audio_level);
-        s_last_wave_refresh_ms = now_ms;
+        s_loading_heights_valid = false;
+        draw_loading(now_ms);
+        s_last_loading_refresh_ms = now_ms;
     } else {
         update_pet(now_ms);
     }
@@ -508,7 +528,7 @@ static bool wake_display(void)
         vibe_board_set_lcd_brightness(VIBE_BOARD_LCD_BACKLIGHT_DEFAULT);
         s_display_on = true;
         clear_panel_background();
-        redraw_full(esp_timer_get_time() / 1000, 0);
+        redraw_full(esp_timer_get_time() / 1000);
         esp_lcd_panel_disp_on_off(s_panel, true);
         return true;
     }
@@ -577,7 +597,7 @@ esp_err_t vibe_bt_status_ui_init(void)
     refresh_power_status(s_last_activity_ms, false);
     s_display_on = true;
     clear_panel_background();
-    redraw_full(s_last_activity_ms, 0);
+    redraw_full(s_last_activity_ms);
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG,
                         "display on");
     ESP_RETURN_ON_ERROR(vibe_board_set_lcd_brightness(
@@ -604,12 +624,12 @@ void vibe_bt_status_ui_set(vibe_bt_ui_status_t status, bool minijoy_ready)
         s_pet_next_blink_ms = 0;
     }
     if (status == VIBE_BT_UI_RECORDING) {
-        s_last_wave_refresh_ms = 0;
-        s_wave_level = 0;
-        s_wave_heights_valid = false;
+        s_last_loading_refresh_ms = 0;
+        s_loading_started_ms = current_ms;
+        s_loading_heights_valid = false;
     }
     if (!wake_display()) {
-        redraw_full(current_ms, 0);
+        redraw_full(current_ms);
     }
 }
 
@@ -634,7 +654,7 @@ void vibe_bt_status_ui_set_confirm_window(bool active)
     }
 }
 
-void vibe_bt_status_ui_tick(int64_t now_ms, uint8_t audio_level)
+void vibe_bt_status_ui_tick(int64_t now_ms)
 {
     if (s_last_power_poll_ms == 0 ||
         now_ms - s_last_power_poll_ms >= UI_POWER_POLL_MS) {
@@ -644,10 +664,11 @@ void vibe_bt_status_ui_tick(int64_t now_ms, uint8_t audio_level)
         return;
     }
     if (s_status == VIBE_BT_UI_RECORDING) {
-        if (s_last_wave_refresh_ms == 0 ||
-            now_ms - s_last_wave_refresh_ms >= UI_WAVE_REFRESH_MS) {
-            draw_waveform(audio_level);
-            s_last_wave_refresh_ms = now_ms;
+        if (s_last_loading_refresh_ms == 0 ||
+            now_ms - s_last_loading_refresh_ms >=
+                UI_LOADING_REFRESH_MS) {
+            draw_loading(now_ms);
+            s_last_loading_refresh_ms = now_ms;
         }
         return;
     }
@@ -658,4 +679,18 @@ void vibe_bt_status_ui_tick(int64_t now_ms, uint8_t audio_level)
         s_display_on = false;
         s_pet_current_frame = VIBE_MINIJOY_PET_FRAME_COUNT;
     }
+}
+
+esp_err_t vibe_bt_status_ui_prepare_deep_sleep(void)
+{
+    ESP_RETURN_ON_FALSE(s_panel != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "panel unavailable");
+    esp_err_t err = esp_lcd_panel_disp_on_off(s_panel, false);
+    esp_err_t backlight_err = vibe_board_set_lcd_brightness(0);
+    s_display_on = false;
+    s_pet_current_frame = VIBE_MINIJOY_PET_FRAME_COUNT;
+    if (err != ESP_OK) {
+        return err;
+    }
+    return backlight_err;
 }
