@@ -1,5 +1,6 @@
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -14,6 +15,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "vibe_air_mouse.h"
 #include "vibe_audio.h"
 #include "vibe_board.h"
 #include "vibe_board_profile.h"
@@ -22,6 +24,7 @@
 #include "vibe_input.h"
 #include "vibe_minijoyc.h"
 #include "vibe_minijoy_ota.h"
+#include "vibe_motion.h"
 #include "vibe_stick_config.h"
 
 #define APP_LOOP_MS 20
@@ -47,12 +50,14 @@
 #define DEEP_SLEEP_IDLE_MS 600000
 #define DEEP_SLEEP_RETRY_MS 5000
 #define WAKE_RELEASE_STABLE_MS 80
+#define IMU_READ_ERROR_LIMIT 5
+#define AIR_MOUSE_CALIBRATION_LOG_MS 1000
 
 typedef enum {
-    APP_EVENT_PTT_DOWN,
-    APP_EVENT_PTT_UP,
+    APP_EVENT_FRONT_DOWN,
+    APP_EVENT_FRONT_UP,
+    APP_EVENT_TOGGLE_AIR_MOUSE,
     APP_EVENT_CLEAR_BONDS,
-    APP_EVENT_WAKE_DISPLAY,
 } app_event_t;
 
 static const char *TAG = "minijoy_bt";
@@ -78,6 +83,16 @@ static uint32_t s_minijoy_led_color = UINT32_MAX;
 static bool s_pairing_led_on;
 static bool s_confirm_button_consumed;
 static bool s_front_confirm_consumed;
+static vibe_air_mouse_t s_air_mouse;
+static bool s_air_mouse_enabled;
+static bool s_air_mouse_calibrated;
+static bool s_air_mouse_left_down;
+static bool s_air_mouse_ignore_front_until_up;
+static bool s_imu_available;
+static bool s_imu_error;
+static unsigned int s_imu_read_errors;
+static int64_t s_last_imu_sample_ms;
+static int64_t s_last_calibration_log_ms;
 static int64_t s_confirm_deadline_ms;
 static int64_t s_last_activity_ms;
 static int64_t s_next_deep_sleep_attempt_ms;
@@ -115,7 +130,7 @@ static void front_down_callback(void *button, void *context)
     (void)button;
     (void)context;
     if (!atomic_load(&s_wake_input_guard)) {
-        queue_app_event(APP_EVENT_PTT_DOWN);
+        queue_app_event(APP_EVENT_FRONT_DOWN);
     }
 }
 
@@ -124,7 +139,7 @@ static void front_up_callback(void *button, void *context)
     (void)button;
     (void)context;
     if (!atomic_load(&s_wake_input_guard)) {
-        queue_app_event(APP_EVENT_PTT_UP);
+        queue_app_event(APP_EVENT_FRONT_UP);
     }
 }
 
@@ -150,7 +165,7 @@ static void side_up_callback(void *button, void *context)
     if (atomic_exchange(&s_side_long_handled, false)) {
         return;
     }
-    queue_app_event(APP_EVENT_WAKE_DISPLAY);
+    queue_app_event(APP_EVENT_TOGGLE_AIR_MOUSE);
 }
 
 static void bt_state_callback(const vibe_bt_composite_state_t *state,
@@ -177,6 +192,27 @@ static void clear_confirm_window(void)
     s_front_confirm_consumed = false;
     s_confirm_deadline_ms = 0;
     vibe_bt_status_ui_set_confirm_window(false);
+}
+
+static bool request_hid_connection(void)
+{
+    vibe_bt_composite_state_t state = bt_state();
+    if (state.hid_connected) {
+        return true;
+    }
+    if (state.paired) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            vibe_bt_composite_request_reconnect());
+    } else {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
+        s_pairing_deadline_ms = now_ms() + PAIRING_WINDOW_MS;
+        s_startup_pairing_due_ms = 0;
+        s_pairing_led_toggle_ms = 0;
+        vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
+    }
+    play_event_sound(VIBE_STICK_SOUND_PAIRING, "pairing request");
+    register_activity();
+    return false;
 }
 
 static bool consume_confirm_window(const char *source)
@@ -406,29 +442,165 @@ static void stop_ptt(void)
              (unsigned)esp_get_minimum_free_heap_size());
 }
 
-static void handle_event(app_event_t event)
+static void release_air_mouse_button(void)
 {
-    switch (event) {
-    case APP_EVENT_PTT_DOWN:
+    if (!s_air_mouse_left_down) {
+        return;
+    }
+    esp_err_t err = vibe_bt_composite_send_mouse(0, 0, false);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "air mouse left button up failed: %s",
+                 esp_err_to_name(err));
+    }
+    s_air_mouse_left_down = false;
+}
+
+static bool ensure_imu_ready(void)
+{
+    if (!s_imu_available) {
+        esp_err_t err = vibe_motion_init();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "MPU6886 init failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        s_imu_available = true;
+    }
+    if (vibe_motion_suspended()) {
+        esp_err_t err = vibe_motion_resume();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "MPU6886 resume failed: %s", esp_err_to_name(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+static void enter_air_mouse_mode(void)
+{
+    stop_ptt();
+    clear_confirm_window();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        vibe_bt_composite_send_mouse(0, 0, false));
+    s_confirm_button_consumed = false;
+    s_front_confirm_consumed = false;
+    s_air_mouse_ignore_front_until_up = vibe_input_front_pressed();
+
+    if (!ensure_imu_ready()) {
+        s_imu_error = true;
+        play_event_sound(VIBE_STICK_SOUND_ERROR, "air mouse IMU error");
         register_activity();
+        return;
+    }
+
+    vibe_air_mouse_reset_motion(&s_air_mouse);
+    s_air_mouse_enabled = true;
+    s_air_mouse_calibrated = vibe_air_mouse_calibrated(&s_air_mouse);
+    s_air_mouse_left_down = false;
+    s_imu_error = false;
+    s_imu_read_errors = 0;
+    s_last_imu_sample_ms = 0;
+    s_last_calibration_log_ms = 0;
+    vibe_bt_status_ui_set_air_mouse(true, s_air_mouse_calibrated);
+    play_event_sound(VIBE_STICK_SOUND_SIDE_BUTTON, "air mouse enabled");
+    register_activity();
+    (void)request_hid_connection();
+    if (s_air_mouse_calibrated) {
+        ESP_LOGI(TAG, "mode=AIR_MOUSE_ACTIVE calibration reused");
+    } else {
+        ESP_LOGI(TAG, "mode=AIR_MOUSE_CALIBRATING keep device still");
+    }
+    ESP_LOGI(TAG,
+             "air mouse mapping cursor_x=gyro_z cursor_y=gyro_x "
+             "forward=WheelUp backward=WheelDown");
+}
+
+static void exit_air_mouse_mode(void)
+{
+    release_air_mouse_button();
+    s_air_mouse_enabled = false;
+    s_air_mouse_calibrated = false;
+    s_air_mouse_ignore_front_until_up = vibe_input_front_pressed();
+    s_imu_error = false;
+    s_imu_read_errors = 0;
+    s_last_imu_sample_ms = 0;
+    vibe_bt_status_ui_set_air_mouse(false, false);
+    if (s_imu_available && !vibe_motion_suspended()) {
+        esp_err_t err = vibe_motion_suspend();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "MPU6886 suspend failed: %s",
+                     esp_err_to_name(err));
+        }
+    }
+    play_event_sound(VIBE_STICK_SOUND_SIDE_BUTTON, "air mouse disabled");
+    register_activity();
+    ESP_LOGI(TAG, "mode=JOYSTICK_PTT");
+}
+
+static void handle_front_down(void)
+{
+    register_activity();
+    if (s_air_mouse_ignore_front_until_up) {
+        return;
+    }
+    if (!s_air_mouse_enabled) {
         if (!atomic_load(&s_ptt_active) &&
             consume_confirm_window("front follow-up")) {
             s_front_confirm_consumed = true;
         } else {
             start_ptt();
         }
+        return;
+    }
+    if (!request_hid_connection()) {
+        return;
+    }
+    esp_err_t err = vibe_bt_composite_send_mouse(0, 0, true);
+    if (err == ESP_OK) {
+        s_air_mouse_left_down = true;
+        play_event_sound(VIBE_STICK_SOUND_MOUSE_CLICK,
+                         "air mouse click");
+    } else {
+        ESP_LOGW(TAG, "air mouse left button down failed: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+static void handle_front_up(void)
+{
+    register_activity();
+    if (s_air_mouse_ignore_front_until_up) {
+        s_air_mouse_ignore_front_until_up = false;
+        return;
+    }
+    if (s_air_mouse_enabled) {
+        release_air_mouse_button();
+    } else if (s_front_confirm_consumed) {
+        s_front_confirm_consumed = false;
+    } else {
+        stop_ptt();
+    }
+}
+
+static void handle_event(app_event_t event)
+{
+    switch (event) {
+    case APP_EVENT_FRONT_DOWN:
+        handle_front_down();
         break;
-    case APP_EVENT_PTT_UP:
-        register_activity();
-        if (s_front_confirm_consumed) {
-            s_front_confirm_consumed = false;
+    case APP_EVENT_FRONT_UP:
+        handle_front_up();
+        break;
+    case APP_EVENT_TOGGLE_AIR_MOUSE:
+        if (s_air_mouse_enabled) {
+            exit_air_mouse_mode();
         } else {
-            stop_ptt();
+            enter_air_mouse_mode();
         }
         break;
     case APP_EVENT_CLEAR_BONDS:
         register_activity();
         stop_ptt();
+        release_air_mouse_button();
         clear_confirm_window();
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_clear_bonds());
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
@@ -438,12 +610,6 @@ static void handle_event(app_event_t event)
         vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
         play_event_sound(VIBE_STICK_SOUND_PAIRING, "pairing");
         ESP_LOGI(TAG, "Bluetooth bonds cleared; pairing window started");
-        break;
-    case APP_EVENT_WAKE_DISPLAY:
-        register_activity();
-        if (!atomic_load(&s_ptt_active)) {
-            play_event_sound(VIBE_STICK_SOUND_SIDE_BUTTON, "side button");
-        }
         break;
     }
 }
@@ -469,19 +635,13 @@ static void poll_minijoy(void)
 
     vibe_bt_composite_state_t state = bt_state();
     bool button_changed = joy.button_pressed != s_minijoy_button_down;
+    if (s_air_mouse_enabled) {
+        s_minijoy_button_down = joy.button_pressed;
+        s_joystick_motion_active = false;
+        return;
+    }
     if (button_changed && joy.button_pressed && !state.hid_connected) {
-        if (state.paired) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(
-                vibe_bt_composite_request_reconnect());
-        } else {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
-            s_pairing_deadline_ms = now_ms() + PAIRING_WINDOW_MS;
-            s_startup_pairing_due_ms = 0;
-            s_pairing_led_toggle_ms = 0;
-            vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, true);
-        }
-        play_event_sound(VIBE_STICK_SOUND_PAIRING, "pairing request");
-        register_activity();
+        (void)request_hid_connection();
         s_joystick_motion_active = false;
     } else if (state.hid_connected) {
         int8_t dx = joystick_axis(joy.x);
@@ -520,6 +680,103 @@ static void poll_minijoy(void)
     s_minijoy_button_down = joy.button_pressed;
 }
 
+static void poll_air_mouse(int64_t current_ms)
+{
+    if (!s_air_mouse_enabled) {
+        return;
+    }
+
+    vibe_motion_sample_t motion_sample = {0};
+    esp_err_t err = vibe_motion_read_raw_sample(&motion_sample);
+    if (err != ESP_OK) {
+        ++s_imu_read_errors;
+        if (s_imu_read_errors <= IMU_READ_ERROR_LIMIT) {
+            ESP_LOGW(TAG, "MPU6886 read failed count=%u: %s",
+                     s_imu_read_errors, esp_err_to_name(err));
+        }
+        if (s_imu_read_errors == IMU_READ_ERROR_LIMIT) {
+            s_imu_error = true;
+            release_air_mouse_button();
+            play_event_sound(VIBE_STICK_SOUND_ERROR,
+                             "air mouse read error");
+        }
+        return;
+    }
+    if (s_imu_error) {
+        ESP_LOGI(TAG, "MPU6886 input recovered");
+    }
+    s_imu_error = false;
+    s_imu_read_errors = 0;
+
+    vibe_air_mouse_sample_t sample = {0};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        sample.accel_g[axis] = motion_sample.accel_g[axis];
+        sample.gyro_dps[axis] = motion_sample.gyro_dps[axis];
+    }
+    float delta_seconds = s_last_imu_sample_ms > 0
+                              ? (float)(current_ms - s_last_imu_sample_ms) /
+                                    1000.0f
+                              : (float)APP_LOOP_MS / 1000.0f;
+    s_last_imu_sample_ms = current_ms;
+
+    vibe_air_mouse_output_t output = {0};
+    bool ready = vibe_air_mouse_update(&s_air_mouse, &sample,
+                                       delta_seconds, &output);
+    if (!s_air_mouse_calibrated &&
+        current_ms - s_last_calibration_log_ms >=
+            AIR_MOUSE_CALIBRATION_LOG_MS) {
+        s_last_calibration_log_ms = current_ms;
+        ESP_LOGI(TAG, "air mouse calibration progress=%u/50",
+                 vibe_air_mouse_calibration_progress(&s_air_mouse));
+    }
+    if (!s_air_mouse_calibrated && ready &&
+        vibe_air_mouse_calibrated(&s_air_mouse)) {
+        s_air_mouse_calibrated = true;
+        vibe_bt_status_ui_set_air_mouse(true, true);
+        register_activity();
+        ESP_LOGI(TAG,
+                 "mode=AIR_MOUSE_ACTIVE gyro_bias=(%.2f,%.2f,%.2f)",
+                 s_air_mouse.gyro_bias[0], s_air_mouse.gyro_bias[1],
+                 s_air_mouse.gyro_bias[2]);
+    }
+    if (!ready || !s_air_mouse_calibrated) {
+        return;
+    }
+
+    vibe_bt_composite_state_t state = bt_state();
+    if (output.dx != 0 || output.dy != 0) {
+        if (state.hid_connected) {
+            err = vibe_bt_composite_send_mouse(
+                output.dx, output.dy, s_air_mouse_left_down);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "air mouse report failed: %s",
+                         esp_err_to_name(err));
+            }
+        }
+        register_activity();
+    }
+    if (output.wheel != 0) {
+        if (state.hid_connected) {
+            err = vibe_bt_composite_send_scroll(
+                output.wheel, s_air_mouse_left_down);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "wheel %s failed: %s",
+                         output.wheel > 0 ? "up" : "down",
+                         esp_err_to_name(err));
+            } else {
+                ESP_LOGI(TAG, "air mouse wheel=%s",
+                         output.wheel > 0 ? "UP" : "DOWN");
+            }
+        }
+        register_activity();
+    }
+    if (output.motion_started) {
+        register_activity();
+        play_event_sound(VIBE_STICK_SOUND_JOYSTICK_START,
+                         "air mouse intentional motion");
+    }
+}
+
 static void update_status(void)
 {
     vibe_bt_composite_state_t state = bt_state();
@@ -528,7 +785,12 @@ static void update_status(void)
         s_pairing_deadline_ms = 0;
         state = bt_state();
     }
-    if (atomic_load(&s_ptt_active)) {
+    if (!state.hid_connected) {
+        s_air_mouse_left_down = false;
+    }
+    if (s_imu_error) {
+        vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
+    } else if (atomic_load(&s_ptt_active)) {
         vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
     } else if (state.pairing) {
         vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
@@ -600,10 +862,21 @@ static bool enter_deep_sleep(void)
                  esp_err_to_name(err));
         return false;
     }
+    bool resume_motion_on_error =
+        s_imu_available && !vibe_motion_suspended();
+    err = vibe_motion_prepare_deep_sleep();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep IMU preparation failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
     err = vibe_audio_prepare_deep_sleep();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "deep sleep audio preparation failed: %s",
                  esp_err_to_name(err));
+        if (resume_motion_on_error) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_motion_resume());
+        }
         return false;
     }
 
@@ -749,6 +1022,16 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(vibe_audio_init());
 
+    const vibe_air_mouse_config_t air_mouse_config = {
+        .horizontal_axis = 2,
+        .horizontal_sign = -1,
+        .horizontal_gain = 1.8f,
+        .vertical_axis = 0,
+        .vertical_sign = -1,
+        .vertical_gain = 1.0f,
+    };
+    vibe_air_mouse_init(&s_air_mouse, &air_mouse_config);
+
     s_event_queue = xQueueCreate(12, sizeof(app_event_t));
     ESP_ERROR_CHECK(s_event_queue ? ESP_OK : ESP_ERR_NO_MEM);
     vibe_bt_composite_set_pcm_reader(read_hfp_pcm, NULL);
@@ -780,7 +1063,8 @@ void app_main(void)
     }
     update_status();
 
-    ESP_LOGI(TAG, "dedicated MiniJoy BT firmware ready version=%s",
+    ESP_LOGI(TAG,
+             "dedicated MiniJoy BT firmware ready version=%s mode=JOYSTICK_PTT",
              FIRMWARE_VERSION);
     for (;;) {
         int64_t current_ms = now_ms();
@@ -791,6 +1075,7 @@ void app_main(void)
         }
         poll_minijoy();
         current_ms = now_ms();
+        poll_air_mouse(current_ms);
         if (s_confirm_deadline_ms > 0 &&
             current_ms >= s_confirm_deadline_ms) {
             s_confirm_deadline_ms = 0;

@@ -24,6 +24,7 @@
 
 #define HID_REPORT_ID_KEYBOARD 1
 #define HID_REPORT_ID_MOUSE 2
+#define HID_KEY_ENTER 0x28
 #define HID_KEY_CLICK_MS 20
 #define AUDIO_PUMP_PERIOD_MS 8
 #define RECONNECT_TASK_PERIOD_MS 250
@@ -597,23 +598,46 @@ esp_err_t vibe_bt_composite_send_right_shift(bool pressed)
 
 esp_err_t vibe_bt_composite_send_enter(bool pressed)
 {
-    return send_keyboard_report(0x00, pressed ? 0x28 : 0x00);
+    return send_keyboard_report(0x00, pressed ? HID_KEY_ENTER : 0x00);
+}
+
+static esp_err_t send_key_click(uint8_t keycode, const char *key_name)
+{
+    ESP_RETURN_ON_ERROR(send_keyboard_report(0x00, keycode), TAG,
+                        "%s key down", key_name);
+    vTaskDelay(pdMS_TO_TICKS(HID_KEY_CLICK_MS));
+    ESP_RETURN_ON_ERROR(send_keyboard_report(0x00, 0x00), TAG,
+                        "%s key up", key_name);
+    return ESP_OK;
 }
 
 esp_err_t vibe_bt_composite_send_enter_click(void)
 {
-    ESP_RETURN_ON_ERROR(vibe_bt_composite_send_enter(true), TAG,
-                        "Enter key down");
-    vTaskDelay(pdMS_TO_TICKS(HID_KEY_CLICK_MS));
-    return vibe_bt_composite_send_enter(false);
+    return send_key_click(HID_KEY_ENTER, "Enter");
+}
+
+static esp_err_t send_mouse_report(int8_t dx, int8_t dy, int8_t wheel,
+                                   bool left_pressed)
+{
+    ESP_RETURN_ON_FALSE(s_hid && esp_hidd_dev_connected(s_hid),
+                        ESP_ERR_INVALID_STATE, TAG, "HID disconnected");
+    uint8_t report[4] = {
+        left_pressed ? 1 : 0,
+        (uint8_t)dx,
+        (uint8_t)dy,
+        (uint8_t)wheel,
+    };
+    return esp_hidd_dev_input_set(s_hid, 0, HID_REPORT_ID_MOUSE,
+                                  report, sizeof(report));
+}
+
+esp_err_t vibe_bt_composite_send_scroll(int8_t wheel, bool left_pressed)
+{
+    return send_mouse_report(0, 0, wheel, left_pressed);
 }
 
 esp_err_t vibe_bt_composite_send_mouse(int8_t dx, int8_t dy,
                                        bool left_pressed)
 {
-    ESP_RETURN_ON_FALSE(s_hid && esp_hidd_dev_connected(s_hid),
-                        ESP_ERR_INVALID_STATE, TAG, "HID disconnected");
-    uint8_t report[4] = {left_pressed ? 1 : 0, (uint8_t)dx, (uint8_t)dy, 0};
-    return esp_hidd_dev_input_set(s_hid, 0, HID_REPORT_ID_MOUSE,
-                                  report, sizeof(report));
+    return send_mouse_report(dx, dy, 0, left_pressed);
 }

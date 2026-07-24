@@ -21,6 +21,7 @@ typedef enum {
 
 esp_err_t vibe_bt_status_ui_init(void);
 void vibe_bt_status_ui_set(vibe_bt_ui_status_t status, bool minijoy_ready);
+void vibe_bt_status_ui_set_air_mouse(bool enabled, bool calibrated);
 void vibe_bt_status_ui_set_confirm_window(bool active);
 void vibe_bt_status_ui_activity(void);
 void vibe_bt_status_ui_tick(int64_t now_ms);

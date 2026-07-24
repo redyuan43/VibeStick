@@ -45,6 +45,8 @@ static SemaphoreHandle_t s_transfer_done;
 static uint16_t *s_render_buffer;
 static bool s_display_on;
 static bool s_minijoy_ready;
+static bool s_air_mouse_enabled;
+static bool s_air_mouse_calibrated;
 static bool s_confirm_window;
 static vibe_bt_ui_status_t s_status = VIBE_BT_UI_WAITING;
 static int64_t s_last_activity_ms;
@@ -265,9 +267,13 @@ static void draw_bottom_bar(void)
                    ? "HID MIC"
                    : (s_status == VIBE_BT_UI_RECORDING
                           ? "JOY MIC"
-                          : (s_minijoy_ready ? "JOY OK" : "JOY OFF")));
+                          : (s_air_mouse_enabled
+                                 ? (s_air_mouse_calibrated ? "IMU READY"
+                                                           : "KEEP STILL")
+                                 : (s_minijoy_ready ? "JOY OK"
+                                                    : "JOY OFF"))));
     draw_text_centered(&surface, 166 - UI_BOTTOM_Y, joy_text,
-                       ota_status || s_minijoy_ready ||
+                       ota_status || s_air_mouse_enabled || s_minijoy_ready ||
                                s_status == VIBE_BT_UI_RECORDING
                            ? color_foreground()
                            : color_warning(),
@@ -289,6 +295,8 @@ static void draw_bottom_bar(void)
         action_text = "FAILED";
     } else if (s_confirm_window) {
         action_text = "ENTER";
+    } else if (s_air_mouse_enabled) {
+        action_text = s_air_mouse_calibrated ? "AIR MOUSE" : "CALIBRATE";
     }
     draw_text_centered(&surface, 198 - UI_BOTTOM_Y, action_text,
                        s_status == VIBE_BT_UI_CONNECTING
@@ -637,6 +645,21 @@ void vibe_bt_status_ui_activity(void)
 {
     s_last_activity_ms = esp_timer_get_time() / 1000;
     (void)wake_display();
+}
+
+void vibe_bt_status_ui_set_air_mouse(bool enabled, bool calibrated)
+{
+    if (enabled == s_air_mouse_enabled &&
+        calibrated == s_air_mouse_calibrated) {
+        return;
+    }
+    s_air_mouse_enabled = enabled;
+    s_air_mouse_calibrated = enabled && calibrated;
+    s_last_activity_ms = esp_timer_get_time() / 1000;
+    if (!wake_display() && s_display_on &&
+        s_status != VIBE_BT_UI_RECORDING) {
+        draw_bottom_bar();
+    }
 }
 
 void vibe_bt_status_ui_set_confirm_window(bool active)

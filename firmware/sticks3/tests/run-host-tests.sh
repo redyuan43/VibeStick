@@ -30,3 +30,11 @@ cc -std=c11 -Wall -Wextra -Werror \
   src/vibe_audio_pdm_filter.c \
   -o build-host-tests/test_vibe_audio_pdm_filter
 ./build-host-tests/test_vibe_audio_pdm_filter
+
+cc -std=c11 -Wall -Wextra -Werror \
+  -I include \
+  tests/test_vibe_air_mouse.c \
+  src/vibe_air_mouse.c \
+  -lm \
+  -o build-host-tests/test_vibe_air_mouse
+./build-host-tests/test_vibe_air_mouse

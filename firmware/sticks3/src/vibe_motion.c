@@ -430,6 +430,29 @@ bool vibe_motion_available(void)
     return s_available;
 }
 
+esp_err_t vibe_motion_read_raw_sample(vibe_motion_sample_t *sample)
+{
+    ESP_RETURN_ON_FALSE(sample != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "motion sample missing");
+#if VIBE_BOARD_HAS_LIFT_TO_TALK
+    ESP_RETURN_ON_FALSE(s_available && !s_suspended,
+                        ESP_ERR_INVALID_STATE, TAG, "motion unavailable");
+    vec3f_t accel_g = {0};
+    vec3f_t gyro_dps = {0};
+    ESP_RETURN_ON_ERROR(read_motion(&accel_g, &gyro_dps), TAG,
+                        "read raw motion");
+    sample->accel_g[0] = accel_g.x;
+    sample->accel_g[1] = accel_g.y;
+    sample->accel_g[2] = accel_g.z;
+    sample->gyro_dps[0] = gyro_dps.x;
+    sample->gyro_dps[1] = gyro_dps.y;
+    sample->gyro_dps[2] = gyro_dps.z;
+    return ESP_OK;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
 esp_err_t vibe_motion_suspend(void)
 {
 #if VIBE_BOARD_HAS_LIFT_TO_TALK
