@@ -1,6 +1,6 @@
 #include "vibe_minijoyc.h"
 
-#if defined(VIBE_BOARD_STICKC_PLUS)
+#if defined(VIBE_BOARD_STICKC_PLUS) || defined(VIBE_BOARD_STICKC_PLUS_SE)
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_check.h"

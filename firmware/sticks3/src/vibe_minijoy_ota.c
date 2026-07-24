@@ -23,7 +23,11 @@
 #include "vibe_ota_policy.h"
 #include "vibe_stick_config.h"
 
+#if defined(VIBE_BOARD_STICKC_PLUS_SE)
+#define MINIJOY_OTA_BOARD "stickc_plus_se_minijoy_bt"
+#else
 #define MINIJOY_OTA_BOARD "stickc_plus_minijoy_bt"
+#endif
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAILED_BIT BIT1
 #define WIFI_CONNECT_TIMEOUT_MS 15000

@@ -532,6 +532,7 @@ static void release_air_mouse_button(void)
     s_air_mouse_left_down = false;
 }
 
+#if VIBE_BOARD_HAS_MPU6886 || VIBE_BOARD_HAS_BMI270
 static bool ensure_imu_ready(void)
 {
     if (!s_imu_available) {
@@ -612,6 +613,7 @@ static void exit_air_mouse_mode(void)
     register_activity();
     ESP_LOGI(TAG, "mode=JOYSTICK_PTT");
 }
+#endif
 
 static void handle_front_down(void)
 {
@@ -674,11 +676,18 @@ static void handle_event(app_event_t event)
         stop_host_capture();
         break;
     case APP_EVENT_TOGGLE_AIR_MOUSE:
+#if VIBE_BOARD_HAS_MPU6886 || VIBE_BOARD_HAS_BMI270
         if (s_air_mouse_enabled) {
             exit_air_mouse_mode();
         } else {
             enter_air_mouse_mode();
         }
+#else
+        register_activity();
+        play_event_sound(VIBE_STICK_SOUND_ERROR,
+                         "air mouse unavailable");
+        ESP_LOGW(TAG, "air mouse unavailable: board has no IMU");
+#endif
         break;
     case APP_EVENT_CLEAR_BONDS:
         register_activity();

@@ -1,4 +1,5 @@
-if(VIBE_BOARD STREQUAL "stickc_plus_minijoy_bt")
+if(VIBE_BOARD STREQUAL "stickc_plus_minijoy_bt" OR
+   VIBE_BOARD STREQUAL "stickc_plus_se_minijoy_bt")
     idf_component_register(
         SRCS "main_minijoy_bt.c" "vibe_air_mouse.c" "vibe_board.c" "vibe_audio.c"
              "vibe_audio_pdm_filter.c" "vibe_input.c"
@@ -27,6 +28,10 @@ endif()
 if(VIBE_BOARD STREQUAL "stickc_plus_minijoy_bt")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         VIBE_BOARD_STICKC_PLUS=1
+        VIBE_BOARD_MINIJOYC_BT=1)
+elseif(VIBE_BOARD STREQUAL "stickc_plus_se_minijoy_bt")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        VIBE_BOARD_STICKC_PLUS_SE=1
         VIBE_BOARD_MINIJOYC_BT=1)
 elseif(VIBE_BOARD STREQUAL "stickc_plus")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE VIBE_BOARD_STICKC_PLUS=1)
