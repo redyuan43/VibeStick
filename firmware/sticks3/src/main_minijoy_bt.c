@@ -56,13 +56,21 @@
 typedef enum {
     APP_EVENT_FRONT_DOWN,
     APP_EVENT_FRONT_UP,
+    APP_EVENT_HFP_AUDIO_CONNECTED,
+    APP_EVENT_HFP_AUDIO_DISCONNECTED,
     APP_EVENT_TOGGLE_AIR_MOUSE,
     APP_EVENT_CLEAR_BONDS,
 } app_event_t;
 
+typedef enum {
+    CAPTURE_OWNER_NONE,
+    CAPTURE_OWNER_DEVICE_PTT,
+    CAPTURE_OWNER_HOST_HFP,
+} capture_owner_t;
+
 static const char *TAG = "minijoy_bt";
 static QueueHandle_t s_event_queue;
-static atomic_bool s_ptt_active;
+static atomic_bool s_capture_active;
 static atomic_bool s_side_long_handled;
 static atomic_bool s_wake_input_guard;
 static portMUX_TYPE s_bt_state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -97,6 +105,7 @@ static int64_t s_confirm_deadline_ms;
 static int64_t s_last_activity_ms;
 static int64_t s_next_deep_sleep_attempt_ms;
 static int64_t s_wake_release_since_ms;
+static capture_owner_t s_capture_owner;
 
 static int64_t now_ms(void)
 {
@@ -172,9 +181,16 @@ static void bt_state_callback(const vibe_bt_composite_state_t *state,
                               void *context)
 {
     (void)context;
+    bool audio_was_connected;
     portENTER_CRITICAL(&s_bt_state_lock);
+    audio_was_connected = s_bt_state.audio_connected;
     s_bt_state = *state;
     portEXIT_CRITICAL(&s_bt_state_lock);
+    if (state->audio_connected != audio_was_connected) {
+        queue_app_event(state->audio_connected
+                            ? APP_EVENT_HFP_AUDIO_CONNECTED
+                            : APP_EVENT_HFP_AUDIO_DISCONNECTED);
+    }
 }
 
 static vibe_bt_composite_state_t bt_state(void)
@@ -261,7 +277,7 @@ static size_t read_raw_pcm(uint8_t *buffer, size_t length)
 static size_t read_hfp_pcm(uint8_t *buffer, size_t length, void *context)
 {
     (void)context;
-    if (!atomic_load(&s_ptt_active)) {
+    if (!atomic_load(&s_capture_active)) {
         return 0;
     }
     vibe_bt_composite_state_t state = bt_state();
@@ -356,7 +372,7 @@ static void update_minijoy_led(int64_t current_ms)
 
 static void open_minijoy(void)
 {
-    if (atomic_load(&s_ptt_active) || s_minijoy_ready ||
+    if (atomic_load(&s_capture_active) || s_minijoy_ready ||
         now_ms() < s_minijoy_retry_ms) {
         return;
     }
@@ -374,7 +390,7 @@ static void open_minijoy(void)
 
 static void start_ptt(void)
 {
-    if (atomic_load(&s_ptt_active)) {
+    if (atomic_load(&s_capture_active)) {
         return;
     }
     clear_confirm_window();
@@ -403,7 +419,8 @@ static void start_ptt(void)
         play_event_sound(VIBE_STICK_SOUND_ERROR, "microphone start error");
         return;
     }
-    atomic_store(&s_ptt_active, true);
+    s_capture_owner = CAPTURE_OWNER_DEVICE_PTT;
+    atomic_store(&s_capture_active, true);
     err = vibe_bt_composite_send_right_shift(true);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Right Shift down failed: %s", esp_err_to_name(err));
@@ -417,7 +434,7 @@ static void start_ptt(void)
 
 static void stop_ptt(void)
 {
-    if (!atomic_load(&s_ptt_active)) {
+    if (s_capture_owner != CAPTURE_OWNER_DEVICE_PTT) {
         return;
     }
     esp_err_t err = vibe_bt_composite_send_right_shift(false);
@@ -426,8 +443,9 @@ static void stop_ptt(void)
     }
     /* CapsWriter finalizes 300 ms after key-up; keep SCO PCM alive through it. */
     vTaskDelay(pdMS_TO_TICKS(PTT_RELEASE_AUDIO_TAIL_MS));
-    atomic_store(&s_ptt_active, false);
+    atomic_store(&s_capture_active, false);
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_audio_stop());
+    s_capture_owner = CAPTURE_OWNER_NONE;
     play_event_sound(VIBE_STICK_SOUND_RECORDING_STOP, "recording stop");
     s_pcm_staging_offset = 0;
     s_pcm_staging_length = 0;
@@ -440,6 +458,65 @@ static void stop_ptt(void)
              s_minijoy_ready, CONFIRM_WINDOW_MS,
              (unsigned)esp_get_free_heap_size(),
              (unsigned)esp_get_minimum_free_heap_size());
+}
+
+static void start_host_capture(void)
+{
+    if (atomic_load(&s_capture_active)) {
+        return;
+    }
+    clear_confirm_window();
+    play_event_sound(VIBE_STICK_SOUND_RECORDING_START,
+                     "host recording start");
+    set_minijoy_led(MINIJOY_LED_MICROPHONE);
+    s_joystick_led_until_ms = 0;
+    close_minijoy();
+    esp_err_t err = vibe_minijoyc_suspend_for_microphone();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MiniJoy suspend for host capture failed: %s",
+                 esp_err_to_name(err));
+        s_minijoy_retry_ms = now_ms() + 20;
+        open_minijoy();
+        vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+    s_pcm_staging_offset = 0;
+    s_pcm_staging_length = 0;
+    err = vibe_audio_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "host microphone capture start failed: %s",
+                 esp_err_to_name(err));
+        s_minijoy_retry_ms = now_ms() + 20;
+        open_minijoy();
+        vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
+        return;
+    }
+    s_capture_owner = CAPTURE_OWNER_HOST_HFP;
+    atomic_store(&s_capture_active, true);
+    vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
+    register_activity();
+    ESP_LOGI(TAG, "host-initiated HFP capture started");
+}
+
+static void stop_host_capture(void)
+{
+    if (s_capture_owner != CAPTURE_OWNER_HOST_HFP) {
+        return;
+    }
+    atomic_store(&s_capture_active, false);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_audio_stop());
+    s_capture_owner = CAPTURE_OWNER_NONE;
+    play_event_sound(VIBE_STICK_SOUND_RECORDING_STOP,
+                     "host recording stop");
+    s_pcm_staging_offset = 0;
+    s_pcm_staging_length = 0;
+    s_minijoy_retry_ms = now_ms() + 20;
+    open_minijoy();
+    register_activity();
+    ESP_LOGI(TAG,
+             "host-initiated HFP capture stopped; MiniJoy resumed=%d",
+             s_minijoy_ready);
 }
 
 static void release_air_mouse_button(void)
@@ -543,7 +620,7 @@ static void handle_front_down(void)
         return;
     }
     if (!s_air_mouse_enabled) {
-        if (!atomic_load(&s_ptt_active) &&
+        if (!atomic_load(&s_capture_active) &&
             consume_confirm_window("front follow-up")) {
             s_front_confirm_consumed = true;
         } else {
@@ -590,6 +667,12 @@ static void handle_event(app_event_t event)
     case APP_EVENT_FRONT_UP:
         handle_front_up();
         break;
+    case APP_EVENT_HFP_AUDIO_CONNECTED:
+        start_host_capture();
+        break;
+    case APP_EVENT_HFP_AUDIO_DISCONNECTED:
+        stop_host_capture();
+        break;
     case APP_EVENT_TOGGLE_AIR_MOUSE:
         if (s_air_mouse_enabled) {
             exit_air_mouse_mode();
@@ -616,7 +699,7 @@ static void handle_event(app_event_t event)
 
 static void poll_minijoy(void)
 {
-    if (atomic_load(&s_ptt_active)) {
+    if (atomic_load(&s_capture_active)) {
         return;
     }
     open_minijoy();
@@ -790,7 +873,7 @@ static void update_status(void)
     }
     if (s_imu_error) {
         vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
-    } else if (atomic_load(&s_ptt_active)) {
+    } else if (atomic_load(&s_capture_active)) {
         vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
     } else if (state.pairing) {
         vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
@@ -830,7 +913,7 @@ static void update_wake_input_guard(int64_t current_ms)
 static bool deep_sleep_has_active_work(int64_t current_ms)
 {
     vibe_bt_composite_state_t state = bt_state();
-    return atomic_load(&s_ptt_active) ||
+    return atomic_load(&s_capture_active) ||
            atomic_load(&s_wake_input_guard) || state.pairing ||
            s_pairing_deadline_ms > current_ms ||
            s_startup_pairing_due_ms > current_ms ||
