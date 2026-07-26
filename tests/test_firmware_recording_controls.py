@@ -1323,6 +1323,12 @@ def test_board_firmware_versions_remain_independent() -> None:
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
 
 
+def test_ota_publisher_strips_null_padding_from_image_metadata() -> None:
+    publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
+
+    assert 'value.strip().rstrip("\\x00")' in publisher
+
+
 def test_wifi_reconnect_uses_delayed_backoff_instead_of_immediate_retry() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     handler = source.split("static void wifi_event_handler", 1)[1]
