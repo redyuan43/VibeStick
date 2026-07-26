@@ -143,6 +143,8 @@
 #define VIBE_STICK_OTA_ENABLED 1
 #endif
 #define RECORDING_RSSI_UNKNOWN -127
+#define DEVICE_COMMAND_POLL_TIMEOUT_MS 25000
+#define DEVICE_COMMAND_RETRY_DELAY_MS 1000
 #define WIFI_PROFILE_NAMESPACE "vibe_wifi"
 #define WIFI_PROFILE_BLOB_KEY "profiles"
 #define WIFI_PROFILE_MAGIC 0x56425746u
@@ -428,6 +430,10 @@ static char s_last_alert_event_id[56];
 static char s_last_alert_type[24];
 static bool s_alert_sound_baseline_ready;
 static char s_recording_session_id[40];
+static uint32_t s_recording_chunk_id;
+static bool s_recording_local_capture;
+static bool s_recording_bridge_stop_required;
+static uint32_t s_device_command_cursor;
 static atomic_bool s_recording_session_active;
 static TaskHandle_t s_recording_finalize_task;
 static atomic_bool s_recording_finalize_active;
@@ -3583,6 +3589,11 @@ static esp_err_t http_request_target(const char *method, const char *host, int p
     }
     esp_err_t err = esp_http_client_perform(client);
     int status_code = esp_http_client_get_status_code(client);
+    if (err == ESP_OK && (status_code < 200 || status_code >= 300)) {
+        ESP_LOGW(TAG, "http %s %s returned status=%d",
+                 method, path, status_code);
+        err = ESP_FAIL;
+    }
     if (err == ESP_OK && response && response_len > 0 && capture.used == 0) {
         ESP_LOGW(TAG, "http %s %s status=%d empty response", method, path, status_code);
     }
@@ -4164,6 +4175,10 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     esp_http_client_set_post_field(client, (const char *)body, body_len);
     esp_err_t err = esp_http_client_perform(client);
     int status_code = esp_http_client_get_status_code(client);
+    if (err == ESP_OK && (status_code < 200 || status_code >= 300)) {
+        ESP_LOGW(TAG, "http POST %s returned status=%d", path, status_code);
+        err = ESP_FAIL;
+    }
     if (err == ESP_OK && response && response_len > 0 && capture.used == 0) {
         ESP_LOGW(TAG, "http POST %s status=%d empty response", path, status_code);
     }
@@ -5093,6 +5108,29 @@ static bool parse_recording_session_id(const char *json, char *session_id, size_
     return ok;
 }
 
+static bool parse_recording_capture_mode(const char *json, char *capture_mode,
+                                         size_t capture_mode_len)
+{
+    if (capture_mode_len > 0) {
+        capture_mode[0] = '\0';
+    }
+    cJSON *root = cJSON_Parse(json);
+    if (!root) {
+        return false;
+    }
+    cJSON *recording = cJSON_GetObjectItemCaseSensitive(root, "recording");
+    cJSON *mode = cJSON_IsObject(recording)
+                      ? cJSON_GetObjectItemCaseSensitive(recording, "capture_mode")
+                      : NULL;
+    bool ok = cJSON_IsString(mode) && mode->valuestring &&
+              mode->valuestring[0] != '\0';
+    if (ok) {
+        strlcpy(capture_mode, mode->valuestring, capture_mode_len);
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
 static bool is_recording_failure_status(const char *status)
 {
     return strcmp(status, "transcription_failed") == 0 ||
@@ -5163,8 +5201,9 @@ static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len,
         return ESP_ERR_INVALID_ARG;
     }
     char path[128];
-    snprintf(path, sizeof(path), "%s?session_id=%s&append=1",
-             VIBE_STICK_RECORDING_AUDIO_PATH, s_recording_session_id);
+    snprintf(path, sizeof(path), "%s?session_id=%s&chunk_id=%lu",
+             VIBE_STICK_RECORDING_AUDIO_PATH, s_recording_session_id,
+             (unsigned long)s_recording_chunk_id);
     char response[512] = {0};
     esp_err_t err = http_post_binary(path, audio, audio_len, response, sizeof(response));
     if (err != ESP_OK) {
@@ -5172,6 +5211,7 @@ static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len,
                  (unsigned)audio_len, esp_err_to_name(err));
         return err;
     }
+    s_recording_chunk_id++;
     (void)response;
     return ESP_OK;
 }
@@ -5192,7 +5232,9 @@ static bool start_recording_upload_task(void)
         &config, current_wifi_rssi(), RECORDING_RSSI_UNKNOWN);
 }
 
-static bool handle_recording_start(const char *event_name, const char *hint)
+static bool handle_recording_start_internal(const char *event_name, const char *hint,
+                                            const char *provided_session_id,
+                                            bool notify_bridge)
 {
     register_activity();
     clear_ptt_followup_enter_window();
@@ -5201,11 +5243,20 @@ static bool handle_recording_start(const char *event_name, const char *hint)
         ESP_LOGI(TAG, "recording start ignored while already recording");
         return false;
     }
-    generate_recording_session_id(s_recording_session_id, sizeof(s_recording_session_id));
+    if (provided_session_id && provided_session_id[0] != '\0') {
+        strlcpy(s_recording_session_id, provided_session_id,
+                sizeof(s_recording_session_id));
+    } else {
+        generate_recording_session_id(s_recording_session_id,
+                                      sizeof(s_recording_session_id));
+    }
     if (s_recording_session_id[0] == '\0') {
         ESP_LOGW(TAG, "recording start failed: no session id");
         return false;
     }
+    s_recording_chunk_id = 0;
+    s_recording_local_capture = true;
+    s_recording_bridge_stop_required = notify_bridge;
     set_recording_session_active(true);
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_NONE));
@@ -5216,46 +5267,65 @@ static bool handle_recording_start(const char *event_name, const char *hint)
              recording_mode_label(),
              recording_mode_intent(),
              s_recording_session_id);
-    char body[240];
-    snprintf(body, sizeof(body),
-             "{\"event\":\"%s\",\"source\":\"%s\","
-             "\"audio_source\":\"%s\",\"session_id\":\"%s\","
-             "\"intent\":\"%s\",\"mode\":\"%s\"}",
-             event_name,
-             VIBE_BOARD_EVENT_SOURCE,
-             VIBE_BOARD_AUDIO_SOURCE,
-             s_recording_session_id,
-             recording_mode_intent(),
-             recording_mode_label());
-    char response[1024] = {0};
-    esp_err_t err = http_request_timeout("POST", VIBE_STICK_RECORDING_START_PATH, body, response,
-                                         sizeof(response), RECORDING_START_TIMEOUT_MS);
-    if (err == ESP_OK && response[0] != '\0') {
-        char response_session_id[40] = {0};
-        parse_recording_session_id(response, response_session_id, sizeof(response_session_id));
-        if (response_session_id[0] != '\0' &&
-            strcmp(response_session_id, s_recording_session_id) != 0) {
-            ESP_LOGW(TAG, "bridge returned a different recording session id");
-            strlcpy(s_recording_session_id, response_session_id, sizeof(s_recording_session_id));
+    if (notify_bridge) {
+        char body[240];
+        snprintf(body, sizeof(body),
+                 "{\"event\":\"%s\",\"source\":\"%s\","
+                 "\"audio_source\":\"%s\",\"session_id\":\"%s\","
+                 "\"intent\":\"%s\",\"mode\":\"%s\"}",
+                 event_name,
+                 VIBE_BOARD_EVENT_SOURCE,
+                 VIBE_BOARD_AUDIO_SOURCE,
+                 s_recording_session_id,
+                 recording_mode_intent(),
+                 recording_mode_label());
+        char response[1024] = {0};
+        esp_err_t err = http_request_timeout(
+            "POST", VIBE_STICK_RECORDING_START_PATH, body, response,
+            sizeof(response), RECORDING_START_TIMEOUT_MS);
+        if (err == ESP_OK && response[0] != '\0') {
+            char response_session_id[40] = {0};
+            char capture_mode[24] = "device_upload";
+            parse_recording_session_id(response, response_session_id,
+                                       sizeof(response_session_id));
+            parse_recording_capture_mode(response, capture_mode,
+                                         sizeof(capture_mode));
+            if (response_session_id[0] != '\0' &&
+                strcmp(response_session_id, s_recording_session_id) != 0) {
+                ESP_LOGW(TAG, "bridge returned a different recording session id");
+                strlcpy(s_recording_session_id, response_session_id,
+                        sizeof(s_recording_session_id));
+            }
+            s_recording_local_capture =
+                strcmp(capture_mode, "device_upload") == 0;
+            ESP_LOGI(TAG, "recording capture mode=%s local=%d",
+                     capture_mode, s_recording_local_capture ? 1 : 0);
+            if (parse_state_json(response)) {
+                complete_pet_fast_resume();
+                render_state();
+            }
+        } else {
+            ESP_LOGW(TAG, "recording start bridge request failed: %s",
+                     esp_err_to_name(err));
+            show_recording_overlay("CONNECT FAILED", "", true);
+            vTaskDelay(pdMS_TO_TICKS(700));
+            show_recording_overlay(NULL, NULL, false);
+            s_recording_session_id[0] = '\0';
+            set_recording_session_active(false);
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
+            return false;
         }
-        if (parse_state_json(response)) {
-            complete_pet_fast_resume();
-            render_state();
-        }
-    } else {
-        ESP_LOGW(TAG, "recording start bridge request failed: %s", esp_err_to_name(err));
-        show_recording_overlay("CONNECT FAILED", "", true);
-        vTaskDelay(pdMS_TO_TICKS(700));
-        show_recording_overlay(NULL, NULL, false);
-        s_recording_session_id[0] = '\0';
-        set_recording_session_active(false);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
-        return false;
     }
 
     esp_err_t sound_err = vibe_audio_play_sound(VIBE_STICK_SOUND_RECORDING_START);
     if (sound_err != ESP_OK) {
         ESP_LOGW(TAG, "recording start sound skipped: %s", esp_err_to_name(sound_err));
+    }
+
+    if (!s_recording_local_capture) {
+        show_recording_overlay("REMOTE MIC", hint, true);
+        return true;
     }
 
     esp_err_t audio_err = vibe_audio_start();
@@ -5284,19 +5354,42 @@ static bool handle_recording_start(const char *event_name, const char *hint)
     return true;
 }
 
+static bool handle_recording_start(const char *event_name, const char *hint)
+{
+    return handle_recording_start_internal(event_name, hint, NULL, true);
+}
+
 static void finish_recording_stop(const char *event_name)
 {
-    esp_err_t audio_err = vibe_audio_stop();
-    if (audio_err != ESP_OK) {
-        ESP_LOGW(TAG, "hardware recording stop failed: %s", esp_err_to_name(audio_err));
+    if (s_recording_local_capture) {
+        esp_err_t audio_err = vibe_audio_stop();
+        if (audio_err != ESP_OK) {
+            ESP_LOGW(TAG, "hardware recording stop failed: %s",
+                     esp_err_to_name(audio_err));
+        }
+        vibe_recording_upload_wait();
+        vibe_recording_upload_log_diagnostics(VIBE_BOARD_NAME,
+                                              current_wifi_rssi());
+        vibe_audio_clear();
     }
     esp_err_t sound_err = vibe_audio_play_sound(VIBE_STICK_SOUND_RECORDING_STOP);
     if (sound_err != ESP_OK) {
         ESP_LOGW(TAG, "recording stop sound skipped: %s", esp_err_to_name(sound_err));
     }
-    vibe_recording_upload_wait();
-    vibe_recording_upload_log_diagnostics(VIBE_BOARD_NAME, current_wifi_rssi());
-    vibe_audio_clear();
+
+    if (!s_recording_bridge_stop_required) {
+        ESP_LOGI(TAG, "remote recording complete session=%s",
+                 s_recording_session_id);
+        s_recording_session_id[0] = '\0';
+        s_recording_local_capture = false;
+        set_recording_session_active(false);
+        s_tap_recording_active = false;
+        s_motion_recording_active = false;
+        show_recording_overlay(NULL, NULL, false);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
+        return;
+    }
 
     show_recording_overlay("TRANSCRIBING", "", true);
     bool paste_result = !recording_intent_is_cyber();
@@ -5349,6 +5442,8 @@ static void finish_recording_stop(const char *event_name)
         start_cyber_tts_wait();
     }
     s_recording_session_id[0] = '\0';
+    s_recording_local_capture = false;
+    s_recording_bridge_stop_required = false;
     set_recording_session_active(false);
     s_tap_recording_active = false;
     s_motion_recording_active = false;
@@ -5408,6 +5503,128 @@ static void handle_recording_stop(const char *event_name)
         finish_recording_stop(event_name);
         set_recording_finalize_active(false);
         s_recording_finalize_task = NULL;
+    }
+}
+
+static void post_device_command_ack(const char *command_id, const char *status,
+                                    const char *session_id, const char *error)
+{
+    char body[320];
+    snprintf(body, sizeof(body),
+             "{\"command_id\":\"%s\",\"status\":\"%s\","
+             "\"session_id\":\"%s\",\"error\":\"%s\"}",
+             command_id ? command_id : "",
+             status ? status : "failed",
+             session_id ? session_id : "",
+             error ? error : "");
+    char response[256] = {0};
+    esp_err_t err = http_request(
+        "POST", VIBE_STICK_DEVICE_COMMAND_ACK_PATH, body,
+        response, sizeof(response));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "device command ack failed id=%s: %s",
+                 command_id ? command_id : "-", esp_err_to_name(err));
+    }
+}
+
+static void process_device_command(const char *response)
+{
+    cJSON *root = cJSON_Parse(response);
+    if (!root) {
+        return;
+    }
+    cJSON *cursor = cJSON_GetObjectItemCaseSensitive(root, "cursor");
+    cJSON *command = cJSON_GetObjectItemCaseSensitive(root, "command");
+    if (cJSON_IsNumber(cursor) && cursor->valuedouble >= 0) {
+        s_device_command_cursor = (uint32_t)cursor->valuedouble;
+    }
+    if (!cJSON_IsObject(command)) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    cJSON *command_cursor =
+        cJSON_GetObjectItemCaseSensitive(command, "cursor");
+    cJSON *command_id =
+        cJSON_GetObjectItemCaseSensitive(command, "command_id");
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(command, "type");
+    cJSON *payload = cJSON_GetObjectItemCaseSensitive(command, "payload");
+    cJSON *session_id = cJSON_IsObject(payload)
+                            ? cJSON_GetObjectItemCaseSensitive(
+                                  payload, "session_id")
+                            : NULL;
+    if (cJSON_IsNumber(command_cursor) && command_cursor->valuedouble >= 0) {
+        s_device_command_cursor = (uint32_t)command_cursor->valuedouble;
+    }
+    if (!cJSON_IsString(command_id) || !command_id->valuestring ||
+        !cJSON_IsString(type) || !type->valuestring ||
+        !cJSON_IsString(session_id) || !session_id->valuestring) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    char command_id_text[48];
+    char type_text[32];
+    char session_id_text[40];
+    strlcpy(command_id_text, command_id->valuestring,
+            sizeof(command_id_text));
+    strlcpy(type_text, type->valuestring, sizeof(type_text));
+    strlcpy(session_id_text, session_id->valuestring,
+            sizeof(session_id_text));
+    cJSON_Delete(root);
+
+    if (strcmp(type_text, "recording_start") == 0) {
+        bool started = handle_recording_start_internal(
+            "remote_command_start", "REMOTE", session_id_text, false);
+        post_device_command_ack(command_id_text,
+                                started ? "started" : "failed",
+                                session_id_text,
+                                started ? "" : "recording start failed");
+        return;
+    }
+    if (strcmp(type_text, "recording_stop") == 0) {
+        if (strcmp(s_recording_session_id, session_id_text) != 0 ||
+            s_recording_session_id[0] == '\0') {
+            post_device_command_ack(command_id_text, "failed",
+                                    session_id_text,
+                                    "recording session not active");
+            return;
+        }
+        show_recording_overlay("SENDING", "", true);
+        s_tap_recording_active = false;
+        finish_recording_stop("remote_command_stop");
+        post_device_command_ack(command_id_text, "completed",
+                                session_id_text, "");
+        return;
+    }
+    post_device_command_ack(command_id_text, "ignored",
+                            session_id_text, "unknown command");
+}
+
+static void device_command_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        if (!wifi_connected() || ota_in_progress()) {
+            vTaskDelay(pdMS_TO_TICKS(DEVICE_COMMAND_RETRY_DELAY_MS));
+            continue;
+        }
+        char path[128];
+        snprintf(path, sizeof(path), "%s?cursor=%lu&timeout_ms=%d",
+                 VIBE_STICK_DEVICE_COMMAND_POLL_PATH,
+                 (unsigned long)s_device_command_cursor,
+                 DEVICE_COMMAND_POLL_TIMEOUT_MS);
+        char response[1024] = {0};
+        esp_err_t err = http_request_timeout(
+            "GET", path, NULL, response, sizeof(response),
+            DEVICE_COMMAND_POLL_TIMEOUT_MS + 5000);
+        if (err == ESP_OK && response[0] != '\0') {
+            process_device_command(response);
+        } else if (err != ESP_OK) {
+            ESP_LOGW(TAG, "device command poll failed: %s",
+                     esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(DEVICE_COMMAND_RETRY_DELAY_MS));
+        }
     }
 }
 
@@ -6466,6 +6683,10 @@ void app_main(void)
     capture_deep_sleep_front_button_intent();
     capture_deep_sleep_motion_intent();
     ESP_ERROR_CHECK(vibe_audio_init());
+    BaseType_t command_task_ok =
+        xTaskCreatePinnedToCore(device_command_task, "device_commands", 8192,
+                                NULL, 3, NULL, VIBE_STICK_NETWORK_CORE);
+    ESP_ERROR_CHECK(command_task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     xTaskCreatePinnedToCore(app_task, "agent_app", 6144, NULL, 4, NULL,
                             VIBE_STICK_APP_CORE);
 }

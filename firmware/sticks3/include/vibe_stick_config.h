@@ -2,7 +2,7 @@
 
 #define VIBE_STICK_DEVICE_NAME "VibeStick"
 #define FIRMWARE_NAME "vibestick"
-#define VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.50"
+#define VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.61"
 #define VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.38"
 #if defined(VIBE_BOARD_STICKS3)
 #define FIRMWARE_VERSION VIBE_STICK_FIRMWARE_VERSION_STICKS3
@@ -16,6 +16,8 @@
 #define VIBE_STICK_RECORDING_START_PATH "/recording/start"
 #define VIBE_STICK_RECORDING_AUDIO_PATH "/recording/audio"
 #define VIBE_STICK_RECORDING_STOP_PATH "/recording/stop"
+#define VIBE_STICK_DEVICE_COMMAND_POLL_PATH "/device/commands/poll"
+#define VIBE_STICK_DEVICE_COMMAND_ACK_PATH "/device/commands/ack"
 #define VIBE_STICK_RECORDING_TTS_PATH "/recording/tts"
 #define VIBE_STICK_OTA_MANIFEST_PATH "/ota/manifest"
 #define VIBE_STICK_OTA_BIN_PATH "/ota/bin"

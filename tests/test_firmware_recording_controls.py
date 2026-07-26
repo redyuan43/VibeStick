@@ -558,11 +558,33 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
 
-    assert "append=1" in source
+    assert "chunk_id=%lu" in source
+    assert "s_recording_chunk_id++" in source
+    assert "RECORDING_UPLOAD_RETRY_COUNT 3" in upload_source
     assert "recording diagnostics board=%s" in upload_source
     assert "esp_wifi_sta_get_ap_info" in source
     assert "post_ms_min" in upload_source
     assert "vibe_recording_upload_log_diagnostics" in source
+
+
+def test_remote_audio_commands_reuse_sessions_and_ack_after_upload() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    config = (
+        ROOT / "firmware" / "sticks3" / "include" / "vibe_stick_config.h"
+    ).read_text(encoding="utf-8")
+
+    assert 'VIBE_STICK_DEVICE_COMMAND_POLL_PATH "/device/commands/poll"' in config
+    assert 'VIBE_STICK_DEVICE_COMMAND_ACK_PATH "/device/commands/ack"' in config
+    assert "handle_recording_start_internal(" in source
+    assert '"remote_command_start", "REMOTE", session_id_text, false' in source
+    assert 'finish_recording_stop("remote_command_stop")' in source
+    stop_command = source.split('if (strcmp(type_text, "recording_stop") == 0)', 1)[1]
+    stop_command = stop_command.split('post_device_command_ack(command_id_text, "ignored"', 1)[0]
+    assert stop_command.index('finish_recording_stop("remote_command_stop")') < (
+        stop_command.index('"completed"')
+    )
+    assert '"capture_mode"' in source
+    assert 'strcmp(capture_mode, "device_upload") == 0' in source
 
 
 def test_idle_backlight_has_dim_and_off_states() -> None:
@@ -1294,7 +1316,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.50"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.61"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.38"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
