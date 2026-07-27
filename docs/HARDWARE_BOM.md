@@ -57,7 +57,7 @@ Primary external references:
 | Battery | Li-ion/LiPo battery | 120 mAh at 3.7 V | 1 | Battery status shown locally | Include protection/lead/connector if your costing model separates battery pack from cell. |
 | USB bridge / connector | USB Type-C plus USB serial path | Input 5 V at 500 mA; Linux often appears as FT232 `/dev/ttyUSB*` | 1 set | Flashing, serial monitor, power | Public docs mention FTDI driver for USB serial; exact bridge chip should be verified from schematic/supplier. |
 | Buttons | Custom buttons | Button A GPIO37, Button B GPIO39 | 2 | Push-to-talk and provider/mode switching | Include key caps if costing finished device. |
-| LED | Red LED | GPIO10 per public pin map | 1 | Present in hardware; not used by current firmware | Optional for a VibeStick-only derivative if LED is not needed. |
+| LED | Red LED | GPIO10 per public pin map | 1 | Status LED in the dedicated MiniJoy Bluetooth firmware; mirrors MiniJoy pairing and activity timing | Optional for a VibeStick-only derivative if LED is not needed. |
 | IR transmitter | IR TX | GPIO9 per public pin map | 1 | Not used by current firmware | Optional for a VibeStick-only derivative if IR is not needed. |
 | Expansion connector | HY2.0-4P Grove-style connector | GND, 5 V, GPIO32, GPIO33 | 1 | Not used by current firmware | Public docs also mention external pins G0, G25/G26, G36, G32, G33. |
 | Antenna | 2.4 GHz 3D antenna / RF path | Integrated antenna | 1 | Wi-Fi | Public spec lists 2.4 GHz 3D antenna. |

@@ -507,10 +507,13 @@ def test_s3_uses_a_softer_recording_tone_profile_while_plus_keeps_its_buzzer_pro
     recording_stop = source.split("static const sound_segment_t recording_stop[] = {", 1)[1]
     recording_stop = recording_stop.split("};", 1)[0]
 
-    profile_block = source.split("#define VIBE_STICK_AUDIO_CORE 1\n\n", 1)[1]
+    profile_block = source.split(
+        "/* The StickS3's amplified speaker needs a softer profile than the Plus buzzer. */",
+        1,
+    )[1]
     profile_block = profile_block.split("\ntypedef struct", 1)[0]
-    s3_profile = profile_block.split("#if VIBE_BOARD_HAS_ES8311", 1)[1].split("#else", 1)[0]
-    plus_profile = profile_block.split("#else", 1)[1].split("#endif", 1)[0]
+    s3_profile, plus_profile = profile_block.split("#else", 1)
+    plus_profile = plus_profile.split("#endif", 1)[0]
 
     assert "#define VIBE_STICK_SOUND_VOLUME 0.28f" in s3_profile
     assert "#define VIBE_STICK_SOUND_OUTPUT_VOLUME 70" in s3_profile
@@ -765,7 +768,9 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     motion_header = (ROOT / "firmware/sticks3/include/vibe_motion.h").read_text(encoding="utf-8")
     board_source = BOARD_C.read_text(encoding="utf-8")
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
-    plus_profile = board_profile.split("#else", 1)[0]
+    plus_profile = board_profile.split(
+        "// M5StickC Plus 1.1 hardware profile.", 1
+    )[1].split("#endif", 1)[0]
 
     assert "#define VIBE_STICK_IDLE_DIM_MS 30000" in source
     assert "#define VIBE_STICK_IDLE_OFF_MS 60000" in source
@@ -871,7 +876,7 @@ def test_recording_trigger_is_independent_from_disabled_cyber_intents() -> None:
     )[1]
 
     assert "VIBE_STICK_ANIM_PREVIEW 0" in source
-    assert board_profile.count("#define VIBE_BOARD_HAS_CYBER_INTENTS 0") == 2
+    assert board_profile.count("#define VIBE_BOARD_HAS_CYBER_INTENTS 0") == 3
     assert "recording_intent_supported" in source
     assert "sanitize_recording_intent();" in source
     assert "cyber intents unavailable" in intent_toggle

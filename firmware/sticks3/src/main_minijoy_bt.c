@@ -36,6 +36,8 @@
 #define PCM_STAGING_BYTES 2048
 #define PAIRING_LED_INTERVAL_MS 150
 #define JOYSTICK_LED_HOLD_MS 200
+#define BOARD_STATUS_LED_GPIO GPIO_NUM_10
+#define BOARD_STATUS_LED_ON_LEVEL 0
 #define MINIJOY_LED_OFF 0x000000
 #define MINIJOY_LED_PAIRING 0x0000ff
 #define MINIJOY_LED_MICROPHONE 0x400000
@@ -89,6 +91,8 @@ static int64_t s_pairing_led_toggle_ms;
 static int64_t s_joystick_led_until_ms;
 static uint32_t s_minijoy_led_color = UINT32_MAX;
 static bool s_pairing_led_on;
+static bool s_board_status_led_on;
+static bool s_board_status_led_ready;
 static bool s_confirm_button_consumed;
 static bool s_front_confirm_consumed;
 static vibe_air_mouse_t s_air_mouse;
@@ -346,11 +350,39 @@ static void set_minijoy_led(uint32_t color)
     }
 }
 
-static void update_minijoy_led(int64_t current_ms)
+static esp_err_t init_board_status_led(void)
 {
-    if (!s_minijoy_ready) {
+    ESP_RETURN_ON_ERROR(gpio_reset_pin(BOARD_STATUS_LED_GPIO), TAG,
+                        "reset board status LED");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_level(BOARD_STATUS_LED_GPIO, !BOARD_STATUS_LED_ON_LEVEL),
+        TAG, "preset board status LED off");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_direction(BOARD_STATUS_LED_GPIO, GPIO_MODE_OUTPUT), TAG,
+        "configure board status LED");
+    s_board_status_led_on = false;
+    s_board_status_led_ready = true;
+    return ESP_OK;
+}
+
+static void set_board_status_led(bool enabled)
+{
+    if (!s_board_status_led_ready || enabled == s_board_status_led_on) {
         return;
     }
+    esp_err_t err = gpio_set_level(
+        BOARD_STATUS_LED_GPIO,
+        enabled ? BOARD_STATUS_LED_ON_LEVEL : !BOARD_STATUS_LED_ON_LEVEL);
+    if (err == ESP_OK) {
+        s_board_status_led_on = enabled;
+    } else {
+        ESP_LOGW(TAG, "board status LED update failed: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+static void update_status_leds(int64_t current_ms)
+{
     vibe_bt_composite_state_t state = bt_state();
     if (state.pairing) {
         if (s_pairing_led_toggle_ms == 0 ||
@@ -360,11 +392,14 @@ static void update_minijoy_led(int64_t current_ms)
                 current_ms + PAIRING_LED_INTERVAL_MS;
             set_minijoy_led(s_pairing_led_on ? MINIJOY_LED_PAIRING
                                              : MINIJOY_LED_OFF);
+            set_board_status_led(s_pairing_led_on);
         }
         return;
     }
     s_pairing_led_toggle_ms = 0;
     s_pairing_led_on = false;
+    set_board_status_led(atomic_load(&s_capture_active) ||
+                         current_ms < s_joystick_led_until_ms);
     set_minijoy_led(current_ms < s_joystick_led_until_ms
                         ? MINIJOY_LED_JOYSTICK
                         : MINIJOY_LED_OFF);
@@ -973,6 +1008,7 @@ static bool enter_deep_sleep(void)
     }
 
     set_minijoy_led(MINIJOY_LED_OFF);
+    set_board_status_led(false);
     close_minijoy();
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_status_ui_prepare_deep_sleep());
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_set_external_5v(false));
@@ -1103,6 +1139,7 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(80));
     ESP_ERROR_CHECK(vibe_board_set_external_5v(true));
     vTaskDelay(pdMS_TO_TICKS(150));
+    ESP_ERROR_CHECK(init_board_status_led());
     ESP_ERROR_CHECK(vibe_bt_status_ui_init());
     if (startup_ota_requested()) {
         ESP_LOGI(TAG, "startup gesture selected OTA maintenance mode");
@@ -1187,7 +1224,7 @@ void app_main(void)
             s_pairing_deadline_ms = 0;
         }
         update_status();
-        update_minijoy_led(current_ms);
+        update_status_leds(current_ms);
         vibe_bt_status_ui_tick(current_ms);
         maybe_enter_deep_sleep(current_ms);
         vTaskDelay(pdMS_TO_TICKS(APP_LOOP_MS));
