@@ -63,7 +63,7 @@ def image_info(image: Path) -> dict[str, str]:
             continue
         key, value = line.split(":", 1)
         key = key.strip().lower().replace(" ", "_")
-        info[key] = value.strip()
+        info[key] = value.strip().rstrip("\x00")
     return info
 
 

@@ -13,6 +13,8 @@
 #include "freertos/task.h"
 
 static const char *TAG = "vibe_stick";
+#define RECORDING_UPLOAD_RETRY_COUNT 3
+#define RECORDING_UPLOAD_RETRY_DELAY_MS 120
 
 static vibe_recording_upload_config_t s_config;
 static vibe_recording_upload_stats_t s_stats;
@@ -63,7 +65,17 @@ static void upload_task(void *arg)
         }
 
         int64_t post_start_ms = esp_timer_get_time() / 1000;
-        err = s_config.post_chunk(buffer, audio_len, s_config.context);
+        for (int attempt = 1; attempt <= RECORDING_UPLOAD_RETRY_COUNT; ++attempt) {
+            err = s_config.post_chunk(buffer, audio_len, s_config.context);
+            if (err == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(TAG, "audio upload attempt %d/%d failed: %s",
+                     attempt, RECORDING_UPLOAD_RETRY_COUNT, esp_err_to_name(err));
+            if (attempt < RECORDING_UPLOAD_RETRY_COUNT) {
+                vTaskDelay(pdMS_TO_TICKS(RECORDING_UPLOAD_RETRY_DELAY_MS * attempt));
+            }
+        }
         int64_t post_duration_ms =
             esp_timer_get_time() / 1000 - post_start_ms;
         vibe_recording_upload_stats_note_post(

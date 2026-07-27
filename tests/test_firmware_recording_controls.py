@@ -558,11 +558,68 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
 
-    assert "append=1" in source
+    assert "chunk_id=%lu" in source
+    assert "s_recording_chunk_id++" in source
+    assert "RECORDING_UPLOAD_RETRY_COUNT 3" in upload_source
     assert "recording diagnostics board=%s" in upload_source
     assert "esp_wifi_sta_get_ap_info" in source
     assert "post_ms_min" in upload_source
     assert "vibe_recording_upload_log_diagnostics" in source
+
+
+def test_remote_audio_commands_reuse_sessions_and_ack_after_upload() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    config = (
+        ROOT / "firmware" / "sticks3" / "include" / "vibe_stick_config.h"
+    ).read_text(encoding="utf-8")
+
+    assert 'VIBE_STICK_DEVICE_COMMAND_POLL_PATH "/device/commands/poll"' in config
+    assert 'VIBE_STICK_DEVICE_COMMAND_ACK_PATH "/device/commands/ack"' in config
+    assert "handle_recording_start_internal(" in source
+    assert '"remote_command_start", "REMOTE", session_id_text, false' in source
+    assert 'finish_recording_stop("remote_command_stop")' in source
+    stop_command = source.split('if (strcmp(type_text, "recording_stop") == 0)', 1)[1]
+    stop_command = stop_command.split('post_device_command_ack(command_id_text, "ignored"', 1)[0]
+    assert stop_command.index('finish_recording_stop("remote_command_stop")') < (
+        stop_command.index('"completed"')
+    )
+    assert '"capture_mode"' in source
+    assert 'strcmp(capture_mode, "device_upload") == 0' in source
+
+
+def test_lift_requires_a_real_flat_posture_before_arming() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    motion_source = MOTION_C.read_text(encoding="utf-8")
+    motion_header = MOTION_H.read_text(encoding="utf-8")
+    lift_mode = source.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[1]
+    lift_mode = lift_mode.split("static void start_manual_motion_calibration", 1)[0]
+    app_task = source.split("static void app_task(void *arg)", 1)[1]
+    app_task = app_task.split("#if VIBE_STICK_SERIAL_DEBUG_ENABLED", 1)[0]
+
+    assert "bool vibe_motion_is_flat_stable(void);" in motion_header
+    assert "static bool s_flat_stable;" in motion_source
+    assert "s_flat_stable = false;" in motion_source
+    assert "s_flat_stable = true;" in motion_source
+    assert "s_motion_lift_armed = false;" in lift_mode
+    assert 'set_motion_arm_prompt(true);' in lift_mode
+    assert '"PLACE FLAT"' in source
+    assert "vibe_motion_is_flat_stable()" in app_task
+    assert "lift recording armed after stable flat posture" in app_task
+
+
+def test_front_tap_stops_lift_recording_and_requires_rearming() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    handle_toggle = source.split("static void handle_recording_toggle", 1)[1]
+    handle_toggle = handle_toggle.split("static bool wifi_profile_merge", 1)[0]
+    motion_start = source.split("case VIBE_STICK_EVENT_MOTION_START:", 1)[1]
+    motion_start = motion_start.split("case VIBE_STICK_EVENT_MOTION_STOP:", 1)[0]
+
+    assert "s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK" in handle_toggle
+    assert "front tap stopping active LIFT recording" in handle_toggle
+    assert 'handle_recording_stop("motion_button_stop")' in handle_toggle
+    assert "front tap cancelling pending LIFT recording" in handle_toggle
+    assert "s_motion_lift_armed = false;" in handle_toggle
+    assert "s_motion_lift_armed = false;" in motion_start
 
 
 def test_idle_backlight_has_dim_and_off_states() -> None:
@@ -757,41 +814,6 @@ def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
     assert "queue_event(VIBE_STICK_EVENT_MOTION_START)" in source
 
 
-def test_lift_requires_a_real_flat_posture_before_arming() -> None:
-    source = MAIN_C.read_text(encoding="utf-8")
-    motion_source = MOTION_C.read_text(encoding="utf-8")
-    motion_header = MOTION_H.read_text(encoding="utf-8")
-    lift_mode = source.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[1]
-    lift_mode = lift_mode.split("static void start_manual_motion_calibration", 1)[0]
-    app_task = source.split("static void app_task(void *arg)", 1)[1]
-    app_task = app_task.split("#if VIBE_STICK_SERIAL_DEBUG_ENABLED", 1)[0]
-
-    assert "bool vibe_motion_is_flat_stable(void);" in motion_header
-    assert "static bool s_flat_stable;" in motion_source
-    assert "s_flat_stable = false;" in motion_source
-    assert "s_flat_stable = true;" in motion_source
-    assert "s_motion_lift_armed = false;" in lift_mode
-    assert 'set_motion_arm_prompt(true);' in lift_mode
-    assert '"PLACE FLAT"' in source
-    assert "vibe_motion_is_flat_stable()" in app_task
-    assert "lift recording armed after stable flat posture" in app_task
-
-
-def test_front_tap_stops_lift_recording_and_requires_rearming() -> None:
-    source = MAIN_C.read_text(encoding="utf-8")
-    handle_toggle = source.split("static void handle_recording_toggle", 1)[1]
-    handle_toggle = handle_toggle.split("static bool wifi_profile_merge", 1)[0]
-    motion_start = source.split("case VIBE_STICK_EVENT_MOTION_START:", 1)[1]
-    motion_start = motion_start.split("case VIBE_STICK_EVENT_MOTION_STOP:", 1)[0]
-
-    assert "s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK" in handle_toggle
-    assert "front tap stopping active LIFT recording" in handle_toggle
-    assert 'handle_recording_stop("motion_button_stop")' in handle_toggle
-    assert "front tap cancelling pending LIFT recording" in handle_toggle
-    assert "s_motion_lift_armed = false;" in handle_toggle
-    assert "s_motion_lift_armed = false;" in motion_start
-
-
 def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     enter_sleep = source.split("static bool enter_deep_sleep(void)", 1)[1]
@@ -800,7 +822,7 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     motion_header = (ROOT / "firmware/sticks3/include/vibe_motion.h").read_text(encoding="utf-8")
     board_source = BOARD_C.read_text(encoding="utf-8")
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
-    plus_profile = board_profile.split("#else", 1)[0]
+    plus_profile = board_profile.split("// M5StickC Plus 1.1 hardware profile.", 1)[1]
 
     assert "#define VIBE_STICK_IDLE_DIM_MS 30000" in source
     assert "#define VIBE_STICK_IDLE_OFF_MS 60000" in source
@@ -906,7 +928,7 @@ def test_recording_trigger_is_independent_from_disabled_cyber_intents() -> None:
     )[1]
 
     assert "VIBE_STICK_ANIM_PREVIEW 0" in source
-    assert board_profile.count("#define VIBE_BOARD_HAS_CYBER_INTENTS 0") == 2
+    assert board_profile.count("#define VIBE_BOARD_HAS_CYBER_INTENTS 0") == 3
     assert "recording_intent_supported" in source
     assert "sanitize_recording_intent();" in source
     assert "cyber intents unavailable" in intent_toggle
@@ -1329,11 +1351,17 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.51"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.61"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.38"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
+
+
+def test_ota_publisher_strips_null_padding_from_image_metadata() -> None:
+    publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
+
+    assert 'value.strip().rstrip("\\x00")' in publisher
 
 
 def test_wifi_reconnect_uses_delayed_backoff_instead_of_immediate_retry() -> None:
