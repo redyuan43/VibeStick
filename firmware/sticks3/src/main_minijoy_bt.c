@@ -30,6 +30,7 @@
 #include "vibe_input.h"
 #include "vibe_minijoyc.h"
 #include "vibe_minijoy_ota.h"
+#include "vibe_minijoy_bt_policy.h"
 #include "vibe_motion.h"
 #include "vibe_stick_config.h"
 
@@ -64,7 +65,7 @@
 #define PROFILE_ERROR_LED_CYCLE_MS 2400
 #define PROFILE_ERROR_LED_SLOT_MS 280
 #define PROFILE_ERROR_LED_ON_MS 120
-#define AUDIO_ERROR_DISPLAY_MS 5000
+#define PTT_AUDIO_CONNECT_GRACE_MS 3000
 #define FRONT_BUTTON_DEBOUNCE_MS 30
 #define M5CTL_UART_PORT UART_NUM_0
 #define M5CTL_LINE_BYTES 128
@@ -141,11 +142,11 @@ static int64_t s_last_activity_ms;
 static int64_t s_next_deep_sleep_attempt_ms;
 static int64_t s_wake_release_since_ms;
 static int64_t s_profile_connect_started_ms;
-static int64_t s_audio_error_until_ms;
 static bool s_front_button_pressed;
 static bool s_front_button_candidate;
 static int64_t s_front_button_candidate_since_ms;
 static capture_owner_t s_capture_owner;
+static vibe_minijoy_ptt_audio_guard_t s_ptt_audio_guard;
 
 static int64_t now_ms(void)
 {
@@ -637,22 +638,28 @@ static void start_ptt(void)
     }
     s_capture_owner = CAPTURE_OWNER_DEVICE_PTT;
     atomic_store(&s_capture_active, true);
+    vibe_bt_composite_state_t state = bt_state();
+    vibe_minijoy_ptt_audio_begin(&s_ptt_audio_guard,
+                                 state.audio_connected, now_ms(),
+                                 PTT_AUDIO_CONNECT_GRACE_MS);
     err = vibe_bt_composite_send_right_shift(true);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Right Shift down failed: %s", esp_err_to_name(err));
     }
     vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
     ESP_LOGI(TAG,
-             "PTT started; MiniJoy paused free_heap=%u min_free_heap=%u",
+             "PTT started; MiniJoy paused audio=%d audio_grace_ms=%d free_heap=%u min_free_heap=%u",
+             state.audio_connected, PTT_AUDIO_CONNECT_GRACE_MS,
              (unsigned)esp_get_free_heap_size(),
              (unsigned)esp_get_minimum_free_heap_size());
 }
 
-static void stop_ptt(void)
+static void stop_ptt(bool arm_followup)
 {
     if (s_capture_owner != CAPTURE_OWNER_DEVICE_PTT) {
         return;
     }
+    vibe_minijoy_ptt_audio_clear(&s_ptt_audio_guard);
     esp_err_t err = vibe_bt_composite_send_right_shift(false);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Right Shift up failed: %s", esp_err_to_name(err));
@@ -667,11 +674,15 @@ static void stop_ptt(void)
     s_pcm_staging_length = 0;
     s_minijoy_retry_ms = now_ms() + 20;
     open_minijoy();
-    s_confirm_deadline_ms = now_ms() + CONFIRM_WINDOW_MS;
-    vibe_bt_status_ui_set_confirm_window(true);
+    if (arm_followup) {
+        s_confirm_deadline_ms = now_ms() + CONFIRM_WINDOW_MS;
+        vibe_bt_status_ui_set_confirm_window(true);
+    } else {
+        clear_confirm_window();
+    }
     ESP_LOGI(TAG,
              "PTT stopped; MiniJoy resumed=%d confirm_window_ms=%d free_heap=%u min_free_heap=%u",
-             s_minijoy_ready, CONFIRM_WINDOW_MS,
+             s_minijoy_ready, arm_followup ? CONFIRM_WINDOW_MS : 0,
              (unsigned)esp_get_free_heap_size(),
              (unsigned)esp_get_minimum_free_heap_size());
 }
@@ -771,7 +782,7 @@ static bool ensure_imu_ready(void)
 
 static void enter_air_mouse_mode(void)
 {
-    stop_ptt();
+    stop_ptt(false);
     clear_confirm_window();
     ESP_ERROR_CHECK_WITHOUT_ABORT(
         vibe_bt_composite_send_mouse(0, 0, false));
@@ -838,10 +849,16 @@ static void handle_front_down(void)
         return;
     }
     if (!s_air_mouse_enabled) {
-        if (!atomic_load(&s_capture_active) &&
-            consume_confirm_window("front follow-up")) {
-            s_front_confirm_consumed = true;
-        } else {
+        vibe_minijoy_ptt_press_action_t action = vibe_minijoy_ptt_press_action(
+            false, atomic_load(&s_capture_active),
+            s_confirm_deadline_ms > now_ms());
+        if (action == VIBE_MINIJOY_PTT_PRESS_FOLLOWUP) {
+            if (consume_confirm_window("front follow-up")) {
+                s_front_confirm_consumed = true;
+            } else {
+                start_ptt();
+            }
+        } else if (action == VIBE_MINIJOY_PTT_PRESS_START) {
             start_ptt();
         }
         return;
@@ -872,7 +889,7 @@ static void handle_front_up(void)
     } else if (s_front_confirm_consumed) {
         s_front_confirm_consumed = false;
     } else {
-        stop_ptt();
+        stop_ptt(true);
     }
 }
 
@@ -880,7 +897,7 @@ static void start_pairing_window(uint32_t seconds, bool clear_bonds,
                                  const char *reason)
 {
     register_activity();
-    stop_ptt();
+    stop_ptt(false);
     release_air_mouse_button();
     clear_confirm_window();
     if (clear_bonds) {
@@ -945,10 +962,17 @@ static void handle_event(const app_event_message_t *message)
         ESP_LOGI(TAG, "serial Bluetooth service reconnect requested");
         break;
     case APP_EVENT_SERIAL_PTT_DOWN:
-        handle_front_down();
+        register_activity();
+        if (vibe_minijoy_ptt_press_action(
+                true, atomic_load(&s_capture_active),
+                s_confirm_deadline_ms > now_ms()) ==
+            VIBE_MINIJOY_PTT_PRESS_START) {
+            start_ptt();
+        }
         break;
     case APP_EVENT_SERIAL_PTT_UP:
-        handle_front_up();
+        register_activity();
+        stop_ptt(false);
         break;
     case APP_EVENT_SERIAL_REBOOT:
         ESP_LOGI(TAG, "serial reboot requested");
@@ -1140,9 +1164,28 @@ static void update_status(void)
     }
     bool profile_grace_elapsed = s_profile_connect_started_ms > 0 &&
         current_ms - s_profile_connect_started_ms >= PROFILE_CONNECT_GRACE_MS;
+    vibe_minijoy_ptt_audio_state_t previous_ptt_audio_state =
+        s_ptt_audio_guard.state;
+    vibe_minijoy_ptt_audio_state_t ptt_audio_state =
+        vibe_minijoy_ptt_audio_update(
+            &s_ptt_audio_guard,
+            s_capture_owner == CAPTURE_OWNER_DEVICE_PTT &&
+                atomic_load(&s_capture_active),
+            state.audio_connected, current_ms, PTT_AUDIO_CONNECT_GRACE_MS);
+    if (ptt_audio_state != previous_ptt_audio_state) {
+        if (ptt_audio_state == VIBE_MINIJOY_PTT_AUDIO_FAILED) {
+            ESP_LOGW(TAG, "PTT audio unavailable after %dms grace",
+                     PTT_AUDIO_CONNECT_GRACE_MS);
+        } else if (ptt_audio_state == VIBE_MINIJOY_PTT_AUDIO_CONNECTED) {
+            ESP_LOGI(TAG, "PTT audio connected; recording status restored");
+        } else if (ptt_audio_state == VIBE_MINIJOY_PTT_AUDIO_WAITING) {
+            ESP_LOGW(TAG, "PTT audio disconnected; waiting %dms for recovery",
+                     PTT_AUDIO_CONNECT_GRACE_MS);
+        }
+    }
     if (s_imu_error) {
         vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
-    } else if (current_ms < s_audio_error_until_ms) {
+    } else if (ptt_audio_state == VIBE_MINIJOY_PTT_AUDIO_FAILED) {
         vibe_bt_status_ui_set(VIBE_BT_UI_AUDIO_FAILED, s_minijoy_ready);
     } else if (atomic_load(&s_capture_active)) {
         vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);

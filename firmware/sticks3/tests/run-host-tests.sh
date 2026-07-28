@@ -8,6 +8,7 @@ cc -std=c11 -Wall -Wextra -Werror \
   tests/test_vibe_policies.c \
   src/vibe_ota_policy.c \
   src/vibe_recording_policy.c \
+  src/vibe_minijoy_bt_policy.c \
   src/vibe_power_policy.c \
   src/vibe_bridge_profile_policy.c \
   src/vibe_wifi_policy.c \

@@ -1,7 +1,8 @@
 if(VIBE_BOARD STREQUAL "stickc_plus_minijoy_bt" OR
    VIBE_BOARD STREQUAL "stickc_plus_se_minijoy_bt")
     idf_component_register(
-        SRCS "main_minijoy_bt.c" "vibe_air_mouse.c" "vibe_board.c" "vibe_audio.c"
+        SRCS "main_minijoy_bt.c" "vibe_minijoy_bt_policy.c"
+             "vibe_air_mouse.c" "vibe_board.c" "vibe_audio.c"
              "vibe_audio_pdm_filter.c" "vibe_input.c"
              "vibe_minijoyc.c" "vibe_minijoy_ota.c" "vibe_ota_policy.c"
              "vibe_bt_composite.c" "vibe_bt_status_ui.c" "vibe_motion.c"

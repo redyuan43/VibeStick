@@ -2,6 +2,7 @@
 #include "vibe_ota_policy.h"
 #include "vibe_power_policy.h"
 #include "vibe_recording_policy.h"
+#include "vibe_minijoy_bt_policy.h"
 #include "vibe_wifi_policy.h"
 #include "vibe_wav.h"
 
@@ -54,6 +55,42 @@ static void test_followup_window(void)
     assert(vibe_recording_followup_arm(&window, "session-2", 100, 3000));
     assert(!vibe_recording_followup_consume(&window, false, 200));
     assert(!vibe_recording_followup_present(&window));
+}
+
+static void test_minijoy_ptt_press_policy(void)
+{
+    assert(vibe_minijoy_ptt_press_action(false, false, true) ==
+           VIBE_MINIJOY_PTT_PRESS_FOLLOWUP);
+    assert(vibe_minijoy_ptt_press_action(false, false, false) ==
+           VIBE_MINIJOY_PTT_PRESS_START);
+    assert(vibe_minijoy_ptt_press_action(true, false, true) ==
+           VIBE_MINIJOY_PTT_PRESS_START);
+    assert(vibe_minijoy_ptt_press_action(true, true, true) ==
+           VIBE_MINIJOY_PTT_PRESS_NOOP);
+}
+
+static void test_minijoy_ptt_audio_guard(void)
+{
+    vibe_minijoy_ptt_audio_guard_t guard = {0};
+    vibe_minijoy_ptt_audio_begin(&guard, false, 100, 3000);
+    assert(guard.state == VIBE_MINIJOY_PTT_AUDIO_WAITING);
+    assert(vibe_minijoy_ptt_audio_update(&guard, true, false, 3099, 3000) ==
+           VIBE_MINIJOY_PTT_AUDIO_WAITING);
+    assert(vibe_minijoy_ptt_audio_update(&guard, true, false, 3100, 3000) ==
+           VIBE_MINIJOY_PTT_AUDIO_FAILED);
+    assert(vibe_minijoy_ptt_audio_update(&guard, true, true, 3200, 3000) ==
+           VIBE_MINIJOY_PTT_AUDIO_CONNECTED);
+
+    assert(vibe_minijoy_ptt_audio_update(&guard, true, false, 3300, 3000) ==
+           VIBE_MINIJOY_PTT_AUDIO_WAITING);
+    assert(guard.deadline_ms == 6300);
+    assert(vibe_minijoy_ptt_audio_update(&guard, false, false, 3400, 3000) ==
+           VIBE_MINIJOY_PTT_AUDIO_IDLE);
+    assert(guard.deadline_ms == 0);
+
+    vibe_minijoy_ptt_audio_begin(&guard, true, 4000, 3000);
+    assert(guard.state == VIBE_MINIJOY_PTT_AUDIO_CONNECTED);
+    assert(guard.deadline_ms == 0);
 }
 
 static void test_recording_upload_stats(void)
@@ -248,6 +285,8 @@ int main(void)
 {
     test_ota_versions();
     test_followup_window();
+    test_minijoy_ptt_press_policy();
+    test_minijoy_ptt_audio_guard();
     test_recording_upload_stats();
     test_power_policy();
     test_bridge_identity_policy();
