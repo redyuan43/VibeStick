@@ -163,6 +163,16 @@ static const char *status_text(void)
         return "LINK";
     case VIBE_BT_UI_RECORDING:
         return "REC";
+    case VIBE_BT_UI_NO_BOND:
+        return "NO BOND";
+    case VIBE_BT_UI_HID_FAILED:
+        return "NO HID";
+    case VIBE_BT_UI_HFP_FAILED:
+        return "NO HFP";
+    case VIBE_BT_UI_PROFILES_FAILED:
+        return "NO LINK";
+    case VIBE_BT_UI_AUDIO_FAILED:
+        return "NO AUDIO";
     case VIBE_BT_UI_OTA_CONNECTING:
         return "WIFI";
     case VIBE_BT_UI_OTA_CHECKING:
@@ -187,6 +197,8 @@ static uint16_t status_color(void)
         return rgb565(255, 196, 64);
     }
     return (s_status == VIBE_BT_UI_RECORDING ||
+            (s_status >= VIBE_BT_UI_NO_BOND &&
+             s_status <= VIBE_BT_UI_AUDIO_FAILED) ||
             s_status == VIBE_BT_UI_OTA_DOWNLOADING ||
             s_status == VIBE_BT_UI_OTA_FAILED ||
             s_status == VIBE_BT_UI_ERROR)
@@ -258,11 +270,23 @@ static void draw_bottom_bar(void)
         return;
     }
     vibe_bt_ui_surface_clear(&surface, color_background());
+    const bool profile_error = s_status >= VIBE_BT_UI_NO_BOND &&
+                               s_status <= VIBE_BT_UI_AUDIO_FAILED;
     const bool ota_status = s_status >= VIBE_BT_UI_OTA_CONNECTING &&
                             s_status <= VIBE_BT_UI_OTA_FAILED;
     const char *joy_text =
         ota_status
             ? "OTA MODE"
+            : profile_error
+                  ? (s_status == VIBE_BT_UI_NO_BOND
+                         ? "PAIR DEVICE"
+                         : (s_status == VIBE_BT_UI_HID_FAILED
+                                ? "KEYS OFF"
+                                : (s_status == VIBE_BT_UI_HFP_FAILED
+                                       ? "MIC OFF"
+                                       : (s_status == VIBE_BT_UI_AUDIO_FAILED
+                                              ? "AUDIO OFF"
+                                              : "HID+MIC OFF"))))
             : (s_status == VIBE_BT_UI_CONNECTING
                    ? "HID MIC"
                    : (s_status == VIBE_BT_UI_RECORDING
@@ -272,17 +296,21 @@ static void draw_bottom_bar(void)
                                                            : "KEEP STILL")
                                  : (s_minijoy_ready ? "JOY OK"
                                                     : "JOY OFF"))));
-    draw_text_centered(&surface, 166 - UI_BOTTOM_Y, joy_text,
-                       ota_status || s_air_mouse_enabled || s_minijoy_ready ||
-                               s_status == VIBE_BT_UI_RECORDING
-                           ? color_foreground()
-                           : color_warning(),
-                       1);
+    uint16_t joy_color = profile_error
+                             ? color_warning()
+                             : (ota_status || s_air_mouse_enabled ||
+                                        s_minijoy_ready ||
+                                        s_status == VIBE_BT_UI_RECORDING
+                                    ? color_foreground()
+                                    : color_warning());
+    draw_text_centered(&surface, 166 - UI_BOTTOM_Y, joy_text, joy_color, 1);
     const char *action_text = "A MIC";
     if (s_status == VIBE_BT_UI_CONNECTING) {
         action_text = "PLEASE WAIT";
     } else if (s_status == VIBE_BT_UI_RECORDING) {
         action_text = "MIC LIVE";
+    } else if (profile_error) {
+        action_text = "CHECK BT";
     } else if (s_status == VIBE_BT_UI_OTA_CONNECTING) {
         action_text = "CONNECT";
     } else if (s_status == VIBE_BT_UI_OTA_CHECKING) {
@@ -299,7 +327,9 @@ static void draw_bottom_bar(void)
         action_text = s_air_mouse_calibrated ? "AIR MOUSE" : "CALIBRATE";
     }
     draw_text_centered(&surface, 198 - UI_BOTTOM_Y, action_text,
-                       s_status == VIBE_BT_UI_CONNECTING
+                       profile_error
+                           ? color_warning()
+                           : s_status == VIBE_BT_UI_CONNECTING
                            ? rgb565(255, 196, 64)
                            : s_status == VIBE_BT_UI_RECORDING ||
                                s_status == VIBE_BT_UI_OTA_DOWNLOADING
@@ -333,7 +363,9 @@ static void schedule_next_blink(int64_t now_ms)
 
 static vibe_minijoy_pet_frame_id_t pet_frame_for_status(int64_t now_ms)
 {
-    if (s_status == VIBE_BT_UI_ERROR ||
+    if ((s_status >= VIBE_BT_UI_NO_BOND &&
+         s_status <= VIBE_BT_UI_AUDIO_FAILED) ||
+        s_status == VIBE_BT_UI_ERROR ||
         s_status == VIBE_BT_UI_OTA_FAILED) {
         return VIBE_MINIJOY_PET_FRAME_ERROR;
     }

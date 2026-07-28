@@ -200,6 +200,7 @@ static void gap_callback(esp_bt_gap_cb_event_t event,
 {
     switch (event) {
     case ESP_BT_GAP_AUTH_CMPL_EVT:
+        s_state.last_auth_status = param->auth_cmpl.stat;
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
             s_state.paired = true;
             set_reconnect_target(param->auth_cmpl.bda);
@@ -282,6 +283,16 @@ static void hfp_callback(esp_hf_client_cb_event_t event,
         }
         break;
     case ESP_HF_CLIENT_CONNECTION_STATE_EVT:
+        portENTER_CRITICAL(&s_reconnect_lock);
+        if (param->conn_stat.state ==
+                ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED ||
+            param->conn_stat.state ==
+                ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
+            memcpy(s_reconnect_address, param->conn_stat.remote_bda,
+                   sizeof(s_reconnect_address));
+            s_reconnect_target_valid = true;
+        }
+        portEXIT_CRITICAL(&s_reconnect_lock);
         s_state.hfp_connected =
             param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED ||
             param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED;
@@ -558,6 +569,7 @@ esp_err_t vibe_bt_composite_request_reconnect(void)
     ESP_RETURN_ON_FALSE(s_state.paired, ESP_ERR_INVALID_STATE, TAG,
                         "no bonded host");
     int64_t current_ms = now_ms();
+    esp_bd_addr_t address = {0};
     portENTER_CRITICAL(&s_reconnect_lock);
     if (!s_reconnect_target_valid) {
         portEXIT_CRITICAL(&s_reconnect_lock);
@@ -570,8 +582,11 @@ esp_err_t vibe_bt_composite_request_reconnect(void)
     s_hfp_retry_at_ms = current_ms;
     s_last_reconnect_request_ms =
         current_ms - RECONNECT_REQUEST_GAP_MS;
+    memcpy(address, s_reconnect_address, sizeof(address));
     portEXIT_CRITICAL(&s_reconnect_lock);
-    ESP_LOGI(TAG, "automatic reconnect requested by user activity");
+    ESP_LOGI(TAG, "automatic reconnect requested host=%02X:%02X:%02X:%02X:%02X:%02X",
+             address[0], address[1], address[2], address[3],
+             address[4], address[5]);
     return ESP_OK;
 }
 

@@ -2,12 +2,18 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
+#include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -54,6 +60,19 @@
 #define WAKE_RELEASE_STABLE_MS 80
 #define IMU_READ_ERROR_LIMIT 5
 #define AIR_MOUSE_CALIBRATION_LOG_MS 1000
+#define PROFILE_CONNECT_GRACE_MS 12000
+#define PROFILE_ERROR_LED_CYCLE_MS 2400
+#define PROFILE_ERROR_LED_SLOT_MS 280
+#define PROFILE_ERROR_LED_ON_MS 120
+#define AUDIO_ERROR_DISPLAY_MS 5000
+#define FRONT_BUTTON_DEBOUNCE_MS 30
+#define M5CTL_UART_PORT UART_NUM_0
+#define M5CTL_LINE_BYTES 128
+#define M5CTL_RESPONSE_BYTES 384
+#define M5CTL_UART_RX_BUFFER_BYTES 256
+#define M5CTL_DEFAULT_PAIRING_SECONDS 180
+#define M5CTL_MIN_PAIRING_SECONDS 30
+#define M5CTL_MAX_PAIRING_SECONDS 300
 
 typedef enum {
     APP_EVENT_FRONT_DOWN,
@@ -62,7 +81,19 @@ typedef enum {
     APP_EVENT_HFP_AUDIO_DISCONNECTED,
     APP_EVENT_TOGGLE_AIR_MOUSE,
     APP_EVENT_CLEAR_BONDS,
+    APP_EVENT_SERIAL_PAIR,
+    APP_EVENT_SERIAL_RESET_PAIRING,
+    APP_EVENT_SERIAL_STOP_PAIR,
+    APP_EVENT_SERIAL_RECONNECT,
+    APP_EVENT_SERIAL_PTT_DOWN,
+    APP_EVENT_SERIAL_PTT_UP,
+    APP_EVENT_SERIAL_REBOOT,
 } app_event_t;
+
+typedef struct {
+    app_event_t type;
+    uint32_t value;
+} app_event_message_t;
 
 typedef enum {
     CAPTURE_OWNER_NONE,
@@ -109,6 +140,11 @@ static int64_t s_confirm_deadline_ms;
 static int64_t s_last_activity_ms;
 static int64_t s_next_deep_sleep_attempt_ms;
 static int64_t s_wake_release_since_ms;
+static int64_t s_profile_connect_started_ms;
+static int64_t s_audio_error_until_ms;
+static bool s_front_button_pressed;
+static bool s_front_button_candidate;
+static int64_t s_front_button_candidate_since_ms;
 static capture_owner_t s_capture_owner;
 
 static int64_t now_ms(void)
@@ -134,25 +170,16 @@ static void play_event_sound(agent_sound_t sound, const char *event)
 static void queue_app_event(app_event_t event)
 {
     if (s_event_queue) {
-        xQueueSend(s_event_queue, &event, 0);
+        const app_event_message_t message = {.type = event, .value = 0};
+        xQueueSend(s_event_queue, &message, 0);
     }
 }
 
-static void front_down_callback(void *button, void *context)
+static void queue_serial_event(app_event_t event, uint32_t value)
 {
-    (void)button;
-    (void)context;
-    if (!atomic_load(&s_wake_input_guard)) {
-        queue_app_event(APP_EVENT_FRONT_DOWN);
-    }
-}
-
-static void front_up_callback(void *button, void *context)
-{
-    (void)button;
-    (void)context;
-    if (!atomic_load(&s_wake_input_guard)) {
-        queue_app_event(APP_EVENT_FRONT_UP);
+    if (s_event_queue) {
+        const app_event_message_t message = {.type = event, .value = value};
+        xQueueSend(s_event_queue, &message, 0);
     }
 }
 
@@ -204,6 +231,131 @@ static vibe_bt_composite_state_t bt_state(void)
     state = s_bt_state;
     portEXIT_CRITICAL(&s_bt_state_lock);
     return state;
+}
+
+static void serial_reply(const char *payload)
+{
+    char line[M5CTL_RESPONSE_BYTES + 16];
+    int length = snprintf(line, sizeof(line), "M5CTL %s\n", payload);
+    if (length > 0) {
+        uart_write_bytes(M5CTL_UART_PORT, line, (size_t)length);
+    }
+}
+
+static void serial_status_reply(void)
+{
+    vibe_bt_composite_state_t state = bt_state();
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_BT);
+    char payload[M5CTL_RESPONSE_BYTES];
+    snprintf(payload, sizeof(payload),
+             "{\"ok\":true,\"version\":\"%s\",\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"paired\":%s,\"pairing\":%s,\"hid\":%s,\"hfp\":%s,\"audio\":%s,\"wideband\":%s,\"front\":%d,\"side\":%d,\"input_guard\":%s,\"air_mouse\":%s,\"minijoy\":%s,\"last_auth_status\":%ld}",
+             FIRMWARE_VERSION, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+             state.paired ? "true" : "false", state.pairing ? "true" : "false",
+             state.hid_connected ? "true" : "false",
+             state.hfp_connected ? "true" : "false",
+             state.audio_connected ? "true" : "false",
+             state.wideband ? "true" : "false",
+             gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0,
+             gpio_get_level(VIBE_BOARD_PIN_BUTTON_SIDE) == 0,
+             atomic_load(&s_wake_input_guard) ? "true" : "false",
+             s_air_mouse_enabled ? "true" : "false",
+             s_minijoy_ready ? "true" : "false",
+             (long)state.last_auth_status);
+    serial_reply(payload);
+}
+
+static uint32_t serial_pairing_seconds(const char *value)
+{
+    if (!value || !*value) {
+        return M5CTL_DEFAULT_PAIRING_SECONDS;
+    }
+    char *end = NULL;
+    unsigned long seconds = strtoul(value, &end, 10);
+    if (!end || *end != '\0' || seconds < M5CTL_MIN_PAIRING_SECONDS ||
+        seconds > M5CTL_MAX_PAIRING_SECONDS) {
+        return 0;
+    }
+    return (uint32_t)seconds;
+}
+
+static void serial_handle_line(char *line)
+{
+    char *save = NULL;
+    char *prefix = strtok_r(line, " \t", &save);
+    char *command = strtok_r(NULL, " \t", &save);
+    char *argument = strtok_r(NULL, " \t", &save);
+    if (!prefix || !command || strcasecmp(prefix, "M5CTL") != 0) {
+        return;
+    }
+    if (strcasecmp(command, "STATUS") == 0) {
+        serial_status_reply();
+    } else if (strcasecmp(command, "PAIR") == 0) {
+        uint32_t seconds = serial_pairing_seconds(argument);
+        if (!seconds) {
+            serial_reply("{\"ok\":false,\"error\":\"pair_seconds_must_be_30_to_300\"}");
+            return;
+        }
+        queue_serial_event(APP_EVENT_SERIAL_PAIR, seconds);
+        serial_reply("{\"ok\":true,\"queued\":\"pair\"}");
+    } else if (strcasecmp(command, "RESET_PAIRING") == 0) {
+        queue_serial_event(APP_EVENT_SERIAL_RESET_PAIRING,
+                           M5CTL_DEFAULT_PAIRING_SECONDS);
+        serial_reply("{\"ok\":true,\"queued\":\"reset_pairing\"}");
+    } else if (strcasecmp(command, "STOP_PAIR") == 0) {
+        queue_serial_event(APP_EVENT_SERIAL_STOP_PAIR, 0);
+        serial_reply("{\"ok\":true,\"queued\":\"stop_pair\"}");
+    } else if (strcasecmp(command, "RECONNECT") == 0) {
+        queue_serial_event(APP_EVENT_SERIAL_RECONNECT, 0);
+        serial_reply("{\"ok\":true,\"queued\":\"reconnect\"}");
+    } else if (strcasecmp(command, "PTT_DOWN") == 0) {
+        queue_serial_event(APP_EVENT_SERIAL_PTT_DOWN, 0);
+        serial_reply("{\"ok\":true,\"queued\":\"ptt_down\"}");
+    } else if (strcasecmp(command, "PTT_UP") == 0) {
+        queue_serial_event(APP_EVENT_SERIAL_PTT_UP, 0);
+        serial_reply("{\"ok\":true,\"queued\":\"ptt_up\"}");
+    } else if (strcasecmp(command, "REBOOT") == 0) {
+        queue_serial_event(APP_EVENT_SERIAL_REBOOT, 0);
+        serial_reply("{\"ok\":true,\"queued\":\"reboot\"}");
+    } else {
+        serial_reply("{\"ok\":false,\"error\":\"unknown_command\"}");
+    }
+}
+
+static void serial_maintenance_task(void *context)
+{
+    (void)context;
+    esp_err_t err = uart_driver_install(M5CTL_UART_PORT, M5CTL_UART_RX_BUFFER_BYTES,
+                                        0, 0, NULL, 0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "serial maintenance unavailable: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+    char line[M5CTL_LINE_BYTES] = {0};
+    size_t length = 0;
+    for (;;) {
+        uint8_t byte = 0;
+        int received = uart_read_bytes(M5CTL_UART_PORT, &byte, 1,
+                                       pdMS_TO_TICKS(200));
+        if (received != 1) {
+            continue;
+        }
+        if (byte == '\r' || byte == '\n') {
+            if (length > 0) {
+                line[length] = '\0';
+                serial_handle_line(line);
+                length = 0;
+            }
+            continue;
+        }
+        if (length + 1 < sizeof(line)) {
+            line[length++] = (char)byte;
+        } else {
+            length = 0;
+            serial_reply("{\"ok\":false,\"error\":\"line_too_long\"}");
+        }
+    }
 }
 
 static void clear_confirm_window(void)
@@ -398,6 +550,35 @@ static void update_status_leds(int64_t current_ms)
     }
     s_pairing_led_toggle_ms = 0;
     s_pairing_led_on = false;
+    int blink_count = 0;
+    uint32_t error_color = MINIJOY_LED_OFF;
+    bool profile_grace_elapsed = s_profile_connect_started_ms > 0 &&
+        current_ms - s_profile_connect_started_ms >= PROFILE_CONNECT_GRACE_MS;
+    if (!state.paired) {
+        blink_count = 1;
+        error_color = MINIJOY_LED_PAIRING;
+    } else if (profile_grace_elapsed &&
+               (!state.hid_connected || !state.hfp_connected)) {
+        if (!state.hid_connected && !state.hfp_connected) {
+            blink_count = 4;
+            error_color = 0x600000;
+        } else if (!state.hid_connected) {
+            blink_count = 2;
+            error_color = 0x604000;
+        } else {
+            blink_count = 3;
+            error_color = 0x600060;
+        }
+    }
+    if (blink_count > 0) {
+        int64_t phase = current_ms % PROFILE_ERROR_LED_CYCLE_MS;
+        bool pulse_on = phase < blink_count * PROFILE_ERROR_LED_SLOT_MS &&
+                        phase % PROFILE_ERROR_LED_SLOT_MS <
+                            PROFILE_ERROR_LED_ON_MS;
+        set_board_status_led(pulse_on);
+        set_minijoy_led(pulse_on ? error_color : MINIJOY_LED_OFF);
+        return;
+    }
     set_board_status_led(atomic_load(&s_capture_active) ||
                          current_ms < s_joystick_led_until_ms);
     set_minijoy_led(current_ms < s_joystick_led_until_ms
@@ -695,9 +876,29 @@ static void handle_front_up(void)
     }
 }
 
-static void handle_event(app_event_t event)
+static void start_pairing_window(uint32_t seconds, bool clear_bonds,
+                                 const char *reason)
 {
-    switch (event) {
+    register_activity();
+    stop_ptt();
+    release_air_mouse_button();
+    clear_confirm_window();
+    if (clear_bonds) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_clear_bonds());
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
+    s_pairing_deadline_ms = now_ms() + (int64_t)seconds * 1000;
+    s_startup_pairing_due_ms = 0;
+    s_pairing_led_toggle_ms = 0;
+    vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
+    play_event_sound(VIBE_STICK_SOUND_PAIRING, reason);
+    ESP_LOGI(TAG, "%s pairing window started seconds=%" PRIu32,
+             reason, seconds);
+}
+
+static void handle_event(const app_event_message_t *message)
+{
+    switch (message->type) {
     case APP_EVENT_FRONT_DOWN:
         handle_front_down();
         break;
@@ -725,18 +926,34 @@ static void handle_event(app_event_t event)
 #endif
         break;
     case APP_EVENT_CLEAR_BONDS:
-        register_activity();
-        stop_ptt();
-        release_air_mouse_button();
-        clear_confirm_window();
-        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_clear_bonds());
-        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
-        s_pairing_deadline_ms = now_ms() + PAIRING_WINDOW_MS;
+        start_pairing_window(PAIRING_WINDOW_MS / 1000, true, "button_clear_bonds");
+        break;
+    case APP_EVENT_SERIAL_PAIR:
+        start_pairing_window(message->value, false, "serial_pair");
+        break;
+    case APP_EVENT_SERIAL_RESET_PAIRING:
+        start_pairing_window(message->value, true, "serial_reset_pairing");
+        break;
+    case APP_EVENT_SERIAL_STOP_PAIR:
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_end_pairing());
+        s_pairing_deadline_ms = 0;
         s_startup_pairing_due_ms = 0;
-        s_pairing_led_toggle_ms = 0;
-        vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
-        play_event_sound(VIBE_STICK_SOUND_PAIRING, "pairing");
-        ESP_LOGI(TAG, "Bluetooth bonds cleared; pairing window started");
+        ESP_LOGI(TAG, "serial pairing window stopped");
+        break;
+    case APP_EVENT_SERIAL_RECONNECT:
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_request_reconnect());
+        ESP_LOGI(TAG, "serial Bluetooth service reconnect requested");
+        break;
+    case APP_EVENT_SERIAL_PTT_DOWN:
+        handle_front_down();
+        break;
+    case APP_EVENT_SERIAL_PTT_UP:
+        handle_front_up();
+        break;
+    case APP_EVENT_SERIAL_REBOOT:
+        ESP_LOGI(TAG, "serial reboot requested");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
         break;
     }
 }
@@ -907,6 +1124,7 @@ static void poll_air_mouse(int64_t current_ms)
 static void update_status(void)
 {
     vibe_bt_composite_state_t state = bt_state();
+    int64_t current_ms = now_ms();
     if (state.pairing && (state.hid_connected || state.hfp_connected)) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_end_pairing());
         s_pairing_deadline_ms = 0;
@@ -915,18 +1133,33 @@ static void update_status(void)
     if (!state.hid_connected) {
         s_air_mouse_left_down = false;
     }
+    if (!state.paired || (state.hid_connected && state.hfp_connected)) {
+        s_profile_connect_started_ms = 0;
+    } else if (s_profile_connect_started_ms == 0) {
+        s_profile_connect_started_ms = current_ms;
+    }
+    bool profile_grace_elapsed = s_profile_connect_started_ms > 0 &&
+        current_ms - s_profile_connect_started_ms >= PROFILE_CONNECT_GRACE_MS;
     if (s_imu_error) {
         vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
+    } else if (current_ms < s_audio_error_until_ms) {
+        vibe_bt_status_ui_set(VIBE_BT_UI_AUDIO_FAILED, s_minijoy_ready);
     } else if (atomic_load(&s_capture_active)) {
         vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
     } else if (state.pairing) {
         vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
-    } else if (state.hid_connected || state.hfp_connected) {
+    } else if (state.hid_connected && state.hfp_connected) {
         vibe_bt_status_ui_set(VIBE_BT_UI_CONNECTED, s_minijoy_ready);
-    } else if (state.paired || state.hid_connected || state.hfp_connected) {
+    } else if (state.paired && !profile_grace_elapsed) {
         vibe_bt_status_ui_set(VIBE_BT_UI_CONNECTING, s_minijoy_ready);
+    } else if (state.paired && !state.hid_connected && !state.hfp_connected) {
+        vibe_bt_status_ui_set(VIBE_BT_UI_PROFILES_FAILED, s_minijoy_ready);
+    } else if (state.paired && !state.hid_connected) {
+        vibe_bt_status_ui_set(VIBE_BT_UI_HID_FAILED, s_minijoy_ready);
+    } else if (state.paired && !state.hfp_connected) {
+        vibe_bt_status_ui_set(VIBE_BT_UI_HFP_FAILED, s_minijoy_ready);
     } else {
-        vibe_bt_status_ui_set(VIBE_BT_UI_WAITING, s_minijoy_ready);
+        vibe_bt_status_ui_set(VIBE_BT_UI_NO_BOND, s_minijoy_ready);
     }
 
 }
@@ -951,6 +1184,29 @@ static void update_wake_input_guard(int64_t current_ms)
         s_wake_release_since_ms = 0;
         s_last_activity_ms = current_ms;
         ESP_LOGI(TAG, "deep-sleep wake buttons released; input enabled");
+    }
+}
+
+static void poll_front_button(int64_t current_ms)
+{
+    bool pressed = vibe_input_front_pressed();
+    if (pressed != s_front_button_candidate) {
+        s_front_button_candidate = pressed;
+        s_front_button_candidate_since_ms = current_ms;
+        return;
+    }
+    if (pressed == s_front_button_pressed ||
+        current_ms - s_front_button_candidate_since_ms <
+            FRONT_BUTTON_DEBOUNCE_MS) {
+        return;
+    }
+    s_front_button_pressed = pressed;
+    ESP_LOGI(TAG, "front button %s gpio=%d guard=%d",
+             pressed ? "down" : "up",
+             gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT),
+             atomic_load(&s_wake_input_guard));
+    if (!atomic_load(&s_wake_input_guard)) {
+        queue_app_event(pressed ? APP_EVENT_FRONT_DOWN : APP_EVENT_FRONT_UP);
     }
 }
 
@@ -1161,7 +1417,7 @@ void app_main(void)
     };
     vibe_air_mouse_init(&s_air_mouse, &air_mouse_config);
 
-    s_event_queue = xQueueCreate(12, sizeof(app_event_t));
+    s_event_queue = xQueueCreate(12, sizeof(app_event_message_t));
     ESP_ERROR_CHECK(s_event_queue ? ESP_OK : ESP_ERR_NO_MEM);
     vibe_bt_composite_set_pcm_reader(read_hfp_pcm, NULL);
     ESP_ERROR_CHECK(vibe_bt_composite_init(bt_state_callback, NULL));
@@ -1173,12 +1429,16 @@ void app_main(void)
         .side_calibration_ms = 60000,
     };
     const vibe_input_callbacks_t input_callbacks = {
-        .front_down = front_down_callback,
-        .front_up = front_up_callback,
         .side_up = side_up_callback,
         .side_mode_hold = side_long_callback,
     };
     ESP_ERROR_CHECK(vibe_input_init(&input_config, &input_callbacks));
+    s_front_button_pressed = vibe_input_front_pressed();
+    s_front_button_candidate = s_front_button_pressed;
+    s_front_button_candidate_since_ms = now_ms();
+    BaseType_t serial_task_created = xTaskCreatePinnedToCore(
+        serial_maintenance_task, "m5ctl_uart", 3072, NULL, 4, NULL, 0);
+    ESP_ERROR_CHECK(serial_task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     s_last_activity_ms = now_ms();
     open_minijoy();
     vibe_bt_composite_state_t initial_state = bt_state();
@@ -1198,9 +1458,10 @@ void app_main(void)
     for (;;) {
         int64_t current_ms = now_ms();
         update_wake_input_guard(current_ms);
-        app_event_t event;
+        poll_front_button(current_ms);
+        app_event_message_t event;
         while (xQueueReceive(s_event_queue, &event, 0) == pdTRUE) {
-            handle_event(event);
+            handle_event(&event);
         }
         poll_minijoy();
         current_ms = now_ms();

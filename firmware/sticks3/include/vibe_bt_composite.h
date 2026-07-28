@@ -13,6 +13,7 @@ typedef struct {
     bool hfp_connected;
     bool audio_connected;
     bool wideband;
+    int32_t last_auth_status;
 } vibe_bt_composite_state_t;
 
 typedef size_t (*vibe_bt_pcm_read_fn)(uint8_t *buffer, size_t length,
