@@ -29,6 +29,7 @@ esp_err_t vibe_bt_composite_begin_pairing(void);
 esp_err_t vibe_bt_composite_end_pairing(void);
 esp_err_t vibe_bt_composite_clear_bonds(void);
 esp_err_t vibe_bt_composite_request_reconnect(void);
+esp_err_t vibe_bt_composite_prepare_deep_sleep(uint32_t timeout_ms);
 vibe_bt_composite_state_t vibe_bt_composite_state(void);
 esp_err_t vibe_bt_composite_send_right_shift(bool pressed);
 esp_err_t vibe_bt_composite_send_enter(bool pressed);

@@ -16,6 +16,75 @@ def test_pc_audio_gateway_owns_sco_lifecycle() -> None:
     assert "esp_hf_client_disconnect_audio" not in COMPOSITE_SOURCE
 
 
+def test_deep_sleep_gracefully_disconnects_profiles_before_power_off() -> None:
+    enter_sleep = _function(
+        MAIN_SOURCE,
+        "static bool enter_deep_sleep(void)",
+        "static void maybe_enter_deep_sleep",
+    )
+
+    assert "vibe_bt_composite_prepare_deep_sleep(uint32_t timeout_ms)" in COMPOSITE_HEADER
+    assert "s_reconnect_suspended = true;" in COMPOSITE_SOURCE
+    assert "esp_hf_client_disconnect(address)" in COMPOSITE_SOURCE
+    assert "esp_bt_hid_device_disconnect()" in COMPOSITE_SOURCE
+    assert "Bluetooth profiles disconnected for deep sleep" in COMPOSITE_SOURCE
+    assert enter_sleep.index("vibe_audio_prepare_deep_sleep()") < enter_sleep.index(
+        "vibe_bt_composite_prepare_deep_sleep(1200)"
+    )
+    assert enter_sleep.index("vibe_bt_composite_prepare_deep_sleep(1200)") < enter_sleep.index(
+        "vibe_board_prepare_deep_sleep()"
+    )
+    assert enter_sleep.index("vibe_bt_composite_prepare_deep_sleep(1200)") < enter_sleep.index(
+        "esp_deep_sleep_start()"
+    )
+    bluetooth_prepare = enter_sleep.split(
+        "err = vibe_bt_composite_prepare_deep_sleep(1200);", 1
+    )[1].split("set_minijoy_led", 1)[0]
+    assert "if (err != ESP_OK)" in bluetooth_prepare
+    assert "vibe_bt_composite_request_reconnect()" in bluetooth_prepare
+    assert "vibe_motion_resume()" in bluetooth_prepare
+    assert "return false;" in bluetooth_prepare
+
+
+def test_usb_power_does_not_block_deep_sleep() -> None:
+    maybe_sleep = _function(
+        MAIN_SOURCE,
+        "static void maybe_enter_deep_sleep(int64_t current_ms)",
+        "static esp_err_t init_nvs",
+    )
+
+    assert "vibe_board_usb_powered" not in maybe_sleep
+    assert "enter_deep_sleep();" in maybe_sleep
+
+
+def test_serial_sleep_uses_the_production_deep_sleep_path() -> None:
+    serial = _function(
+        MAIN_SOURCE,
+        "static void serial_handle_line(char *line)",
+        "static void serial_maintenance_task",
+    )
+    handler = _function(MAIN_SOURCE, "static void handle_event", "static void poll_minijoy")
+    sleep_event = handler.split("case APP_EVENT_SERIAL_SLEEP:", 1)[1].split(
+        "case APP_EVENT_SERIAL_REBOOT:", 1
+    )[0]
+
+    assert 'strcasecmp(command, "SLEEP") == 0' in serial
+    assert "queue_serial_event(APP_EVENT_SERIAL_SLEEP, 0);" in serial
+    assert "deep_sleep_has_active_work(now_ms())" in sleep_event
+    assert "enter_deep_sleep()" in sleep_event
+
+
+def test_startup_reconnect_waits_for_the_host_to_finish_disconnect_cleanup() -> None:
+    app_main = MAIN_SOURCE.split("void app_main(void)", 1)[1]
+    bonded_startup = app_main.split("if (!initial_state.paired)", 1)[1].split(
+        "update_status();", 1
+    )[0]
+
+    assert "#define RECONNECT_INITIAL_DELAY_MS 5000" in COMPOSITE_SOURCE
+    assert "delayed automatic reconnect scheduled" in bonded_startup
+    assert "vibe_bt_composite_request_reconnect()" not in bonded_startup
+
+
 def test_device_ptt_starts_pcm_then_notifies_pc_with_right_shift() -> None:
     start = _function(MAIN_SOURCE, "static void start_ptt(void)", "static void stop_ptt(bool arm_followup)")
     assert start.index("vibe_audio_start()") < start.index("vibe_bt_composite_send_right_shift(true)")

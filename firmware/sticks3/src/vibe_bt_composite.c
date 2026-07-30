@@ -29,7 +29,7 @@
 #define AUDIO_PUMP_PERIOD_MS 8
 #define RECONNECT_TASK_PERIOD_MS 250
 #define RECONNECT_REQUEST_GAP_MS 1000
-#define RECONNECT_INITIAL_DELAY_MS 750
+#define RECONNECT_INITIAL_DELAY_MS 5000
 #define RECONNECT_ATTEMPT_TIMEOUT_MS 8000
 #define RECONNECT_BACKOFF_MAX_MS 30000
 
@@ -52,11 +52,21 @@ static bool s_hid_ready;
 static bool s_hid_connecting;
 static bool s_hfp_ready;
 static bool s_hfp_connecting;
+static bool s_reconnect_suspended;
 static int64_t s_hid_retry_at_ms;
 static int64_t s_hfp_retry_at_ms;
 static int64_t s_last_reconnect_request_ms;
 static uint32_t s_hid_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
 static uint32_t s_hfp_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+
+static vibe_bt_composite_state_t state_snapshot(void)
+{
+    vibe_bt_composite_state_t state;
+    portENTER_CRITICAL(&s_reconnect_lock);
+    state = s_state;
+    portEXIT_CRITICAL(&s_reconnect_lock);
+    return state;
+}
 
 static int64_t now_ms(void)
 {
@@ -162,13 +172,16 @@ static esp_hid_device_config_t s_hid_config = {
 static void notify_state(void)
 {
     if (s_state_callback) {
-        s_state_callback(&s_state, s_state_context);
+        vibe_bt_composite_state_t state = state_snapshot();
+        s_state_callback(&state, s_state_context);
     }
 }
 
 static void set_scan_mode(bool pairing)
 {
+    portENTER_CRITICAL(&s_reconnect_lock);
     s_state.pairing = pairing;
+    portEXIT_CRITICAL(&s_reconnect_lock);
     esp_err_t err = esp_bt_gap_set_scan_mode(
         ESP_BT_CONNECTABLE,
         pairing ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
@@ -200,9 +213,13 @@ static void gap_callback(esp_bt_gap_cb_event_t event,
 {
     switch (event) {
     case ESP_BT_GAP_AUTH_CMPL_EVT:
+        portENTER_CRITICAL(&s_reconnect_lock);
         s_state.last_auth_status = param->auth_cmpl.stat;
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
             s_state.paired = true;
+        }
+        portEXIT_CRITICAL(&s_reconnect_lock);
+        if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
             set_reconnect_target(param->auth_cmpl.bda);
             set_scan_mode(false);
             ESP_LOGI(TAG, "bonded with %s", param->auth_cmpl.device_name);
@@ -243,24 +260,28 @@ static void hid_callback(void *arg, esp_event_base_t base, int32_t id,
             portEXIT_CRITICAL(&s_reconnect_lock);
         }
         break;
-    case ESP_HIDD_CONNECT_EVENT:
-        s_state.hid_connected = !data || data->connect.status == ESP_OK;
+    case ESP_HIDD_CONNECT_EVENT: {
+        bool hid_connected = !data || data->connect.status == ESP_OK;
         portENTER_CRITICAL(&s_reconnect_lock);
+        s_state.hid_connected = hid_connected;
         s_hid_connecting = false;
-        if (s_state.hid_connected) {
+        if (hid_connected) {
             s_hid_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
         } else {
             schedule_hid_retry(now_ms(), false);
         }
         portEXIT_CRITICAL(&s_reconnect_lock);
-        ESP_LOGI(TAG, "HID connected=%d", s_state.hid_connected);
+        ESP_LOGI(TAG, "HID connected=%d", hid_connected);
         notify_state();
         break;
+    }
     case ESP_HIDD_DISCONNECT_EVENT:
-        s_state.hid_connected = false;
         portENTER_CRITICAL(&s_reconnect_lock);
+        s_state.hid_connected = false;
         s_hid_connecting = false;
-        schedule_hid_retry(now_ms(), true);
+        if (!s_reconnect_suspended) {
+            schedule_hid_retry(now_ms(), true);
+        }
         portEXIT_CRITICAL(&s_reconnect_lock);
         ESP_LOGI(TAG, "HID disconnected; automatic reconnect scheduled");
         notify_state();
@@ -282,48 +303,52 @@ static void hfp_callback(esp_hf_client_cb_event_t event,
             portEXIT_CRITICAL(&s_reconnect_lock);
         }
         break;
-    case ESP_HF_CLIENT_CONNECTION_STATE_EVT:
+    case ESP_HF_CLIENT_CONNECTION_STATE_EVT: {
+        bool hfp_connected =
+            param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED ||
+            param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED;
         portENTER_CRITICAL(&s_reconnect_lock);
-        if (param->conn_stat.state ==
-                ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED ||
-            param->conn_stat.state ==
-                ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
+        if (hfp_connected) {
             memcpy(s_reconnect_address, param->conn_stat.remote_bda,
                    sizeof(s_reconnect_address));
             s_reconnect_target_valid = true;
         }
-        portEXIT_CRITICAL(&s_reconnect_lock);
-        s_state.hfp_connected =
-            param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED ||
-            param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED;
-        portENTER_CRITICAL(&s_reconnect_lock);
+        s_state.hfp_connected = hfp_connected;
         s_hfp_connecting =
             param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTING;
-        if (s_state.hfp_connected) {
+        if (hfp_connected) {
             s_hfp_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
         } else if (param->conn_stat.state ==
                    ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {
             s_hfp_connecting = false;
-            schedule_hfp_retry(now_ms(), true);
+            if (!s_reconnect_suspended) {
+                schedule_hfp_retry(now_ms(), true);
+            }
             s_state.audio_connected = false;
             s_state.wideband = false;
         }
         portEXIT_CRITICAL(&s_reconnect_lock);
         ESP_LOGI(TAG, "HFP state=%d connected=%d",
-                 param->conn_stat.state, s_state.hfp_connected);
+                 param->conn_stat.state, hfp_connected);
         notify_state();
         break;
-    case ESP_HF_CLIENT_AUDIO_STATE_EVT:
-        s_state.audio_connected =
+    }
+    case ESP_HF_CLIENT_AUDIO_STATE_EVT: {
+        bool audio_connected =
             param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED ||
             param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC;
-        s_state.wideband =
+        bool wideband =
             param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC;
+        portENTER_CRITICAL(&s_reconnect_lock);
+        s_state.audio_connected = audio_connected;
+        s_state.wideband = wideband;
+        portEXIT_CRITICAL(&s_reconnect_lock);
         ESP_LOGI(TAG, "HFP audio connected=%d codec=%s frame=%u",
-                 s_state.audio_connected, s_state.wideband ? "mSBC" : "CVSD",
+                 audio_connected, wideband ? "mSBC" : "CVSD",
                  param->audio_stat.preferred_frame_size);
         notify_state();
         break;
+    }
     default:
         break;
     }
@@ -354,7 +379,7 @@ static void audio_pump_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        if (s_state.audio_connected) {
+        if (state_snapshot().audio_connected) {
             esp_hf_client_outgoing_data_ready();
         }
         vTaskDelay(pdMS_TO_TICKS(AUDIO_PUMP_PERIOD_MS));
@@ -371,7 +396,8 @@ static void reconnect_task(void *arg)
         int64_t current_ms = now_ms();
 
         portENTER_CRITICAL(&s_reconnect_lock);
-        if (s_reconnect_target_valid && !s_state.pairing &&
+        if (!s_reconnect_suspended && s_reconnect_target_valid &&
+            !s_state.pairing &&
             current_ms - s_last_reconnect_request_ms >=
                 RECONNECT_REQUEST_GAP_MS) {
             if (s_hid_connecting && current_ms >= s_hid_retry_at_ms) {
@@ -483,7 +509,16 @@ esp_err_t vibe_bt_composite_init(vibe_bt_state_callback_t state_callback,
     ESP_RETURN_ON_ERROR(esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL), TAG,
                         "class of device");
 
-    s_reconnect_target_valid = load_first_bond(&s_reconnect_address);
+    esp_bd_addr_t bonded_address = {0};
+    bool bonded = load_first_bond(&bonded_address);
+    portENTER_CRITICAL(&s_reconnect_lock);
+    s_reconnect_target_valid = bonded;
+    if (bonded) {
+        memcpy(s_reconnect_address, bonded_address,
+               sizeof(s_reconnect_address));
+    }
+    s_state.paired = bonded;
+    portEXIT_CRITICAL(&s_reconnect_lock);
     ESP_RETURN_ON_ERROR(esp_hf_client_register_callback(hfp_callback), TAG,
                         "HFP callback");
     ESP_RETURN_ON_ERROR(esp_hf_client_init(), TAG, "HFP init");
@@ -494,7 +529,6 @@ esp_err_t vibe_bt_composite_init(vibe_bt_state_callback_t state_callback,
                                           hid_callback, &s_hid),
                         TAG, "HID init");
 
-    s_state.paired = esp_bt_gap_get_bond_device_num() > 0;
     set_scan_mode(false);
     if (xTaskCreatePinnedToCore(audio_pump_task, "bt_audio_pump", 2048, NULL,
                                 6, &s_audio_pump_task, 0) != pdPASS) {
@@ -505,8 +539,10 @@ esp_err_t vibe_bt_composite_init(vibe_bt_state_callback_t state_callback,
         return ESP_ERR_NO_MEM;
     }
 
+    vibe_bt_composite_state_t initial_state = state_snapshot();
     ESP_LOGI(TAG, "ready name=%s serial=%s paired=%d free_heap=%" PRIu32,
-             DEVICE_NAME, s_serial, s_state.paired, esp_get_free_heap_size());
+             DEVICE_NAME, s_serial, initial_state.paired,
+             esp_get_free_heap_size());
     notify_state();
     return ESP_OK;
 }
@@ -520,6 +556,9 @@ void vibe_bt_composite_set_pcm_reader(vibe_bt_pcm_read_fn reader,
 
 esp_err_t vibe_bt_composite_begin_pairing(void)
 {
+    portENTER_CRITICAL(&s_reconnect_lock);
+    s_reconnect_suspended = false;
+    portEXIT_CRITICAL(&s_reconnect_lock);
     set_scan_mode(true);
     return ESP_OK;
 }
@@ -550,12 +589,12 @@ esp_err_t vibe_bt_composite_clear_bonds(void)
         free(addresses);
         ESP_RETURN_ON_ERROR(err, TAG, "remove bonds");
     }
+    portENTER_CRITICAL(&s_reconnect_lock);
     s_state.paired = false;
     s_state.hid_connected = false;
     s_state.hfp_connected = false;
     s_state.audio_connected = false;
     s_state.wideband = false;
-    portENTER_CRITICAL(&s_reconnect_lock);
     s_reconnect_target_valid = false;
     s_hid_connecting = false;
     s_hfp_connecting = false;
@@ -566,11 +605,12 @@ esp_err_t vibe_bt_composite_clear_bonds(void)
 
 esp_err_t vibe_bt_composite_request_reconnect(void)
 {
-    ESP_RETURN_ON_FALSE(s_state.paired, ESP_ERR_INVALID_STATE, TAG,
+    ESP_RETURN_ON_FALSE(state_snapshot().paired, ESP_ERR_INVALID_STATE, TAG,
                         "no bonded host");
     int64_t current_ms = now_ms();
     esp_bd_addr_t address = {0};
     portENTER_CRITICAL(&s_reconnect_lock);
+    s_reconnect_suspended = false;
     if (!s_reconnect_target_valid) {
         portEXIT_CRITICAL(&s_reconnect_lock);
         ESP_LOGE(TAG, "bonded host address unavailable");
@@ -590,9 +630,68 @@ esp_err_t vibe_bt_composite_request_reconnect(void)
     return ESP_OK;
 }
 
+esp_err_t vibe_bt_composite_prepare_deep_sleep(uint32_t timeout_ms)
+{
+    esp_bd_addr_t address = {0};
+    bool target_valid = false;
+    bool disconnect_hfp = false;
+    bool disconnect_hid = false;
+
+    disconnect_hid = s_hid && esp_hidd_dev_connected(s_hid);
+    portENTER_CRITICAL(&s_reconnect_lock);
+    s_reconnect_suspended = true;
+    s_hid_connecting = false;
+    s_hfp_connecting = false;
+    target_valid = s_reconnect_target_valid;
+    if (target_valid) {
+        memcpy(address, s_reconnect_address, sizeof(address));
+    }
+    disconnect_hfp = target_valid &&
+                     (s_state.hfp_connected || s_state.audio_connected);
+    portEXIT_CRITICAL(&s_reconnect_lock);
+
+    esp_err_t result = ESP_OK;
+    if (disconnect_hfp) {
+        esp_err_t err = esp_hf_client_disconnect(address);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "HFP deep-sleep disconnect failed: %s",
+                     esp_err_to_name(err));
+            result = err;
+        }
+    }
+    if (disconnect_hid) {
+        esp_err_t err = esp_bt_hid_device_disconnect();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "HID deep-sleep disconnect failed: %s",
+                     esp_err_to_name(err));
+            if (result == ESP_OK) {
+                result = err;
+            }
+        }
+    }
+
+    const int64_t deadline_ms = now_ms() + timeout_ms;
+    vibe_bt_composite_state_t state = state_snapshot();
+    while ((state.hid_connected || state.hfp_connected ||
+            state.audio_connected) && now_ms() < deadline_ms) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        state = state_snapshot();
+    }
+    if (state.hid_connected || state.hfp_connected ||
+        state.audio_connected) {
+        ESP_LOGW(TAG,
+                 "Bluetooth deep-sleep disconnect timed out hid=%d hfp=%d audio=%d",
+                 state.hid_connected, state.hfp_connected,
+                 state.audio_connected);
+        return result == ESP_OK ? ESP_ERR_TIMEOUT : result;
+    }
+    ESP_LOGI(TAG, "Bluetooth profiles disconnected for deep sleep");
+    return result;
+}
+
 vibe_bt_composite_state_t vibe_bt_composite_state(void)
 {
-    return s_state;
+    return state_snapshot();
 }
 
 static esp_err_t send_keyboard_report(uint8_t modifier, uint8_t keycode)

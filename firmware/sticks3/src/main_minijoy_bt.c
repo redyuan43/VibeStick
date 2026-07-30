@@ -88,6 +88,7 @@ typedef enum {
     APP_EVENT_SERIAL_RECONNECT,
     APP_EVENT_SERIAL_PTT_DOWN,
     APP_EVENT_SERIAL_PTT_UP,
+    APP_EVENT_SERIAL_SLEEP,
     APP_EVENT_SERIAL_REBOOT,
 } app_event_t;
 
@@ -234,6 +235,9 @@ static vibe_bt_composite_state_t bt_state(void)
     return state;
 }
 
+static bool deep_sleep_has_active_work(int64_t current_ms);
+static bool enter_deep_sleep(void);
+
 static void serial_reply(const char *payload)
 {
     char line[M5CTL_RESPONSE_BYTES + 16];
@@ -315,6 +319,9 @@ static void serial_handle_line(char *line)
     } else if (strcasecmp(command, "PTT_UP") == 0) {
         queue_serial_event(APP_EVENT_SERIAL_PTT_UP, 0);
         serial_reply("{\"ok\":true,\"queued\":\"ptt_up\"}");
+    } else if (strcasecmp(command, "SLEEP") == 0) {
+        queue_serial_event(APP_EVENT_SERIAL_SLEEP, 0);
+        serial_reply("{\"ok\":true,\"queued\":\"sleep\"}");
     } else if (strcasecmp(command, "REBOOT") == 0) {
         queue_serial_event(APP_EVENT_SERIAL_REBOOT, 0);
         serial_reply("{\"ok\":true,\"queued\":\"reboot\"}");
@@ -974,6 +981,17 @@ static void handle_event(const app_event_message_t *message)
         register_activity();
         stop_ptt(false);
         break;
+    case APP_EVENT_SERIAL_SLEEP:
+        if (deep_sleep_has_active_work(now_ms())) {
+            ESP_LOGW(TAG, "serial deep sleep deferred: active work");
+            break;
+        }
+        ESP_LOGI(TAG, "serial deep sleep requested");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (!enter_deep_sleep()) {
+            ESP_LOGW(TAG, "serial deep sleep request failed");
+        }
+        break;
     case APP_EVENT_SERIAL_REBOOT:
         ESP_LOGI(TAG, "serial reboot requested");
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -1305,6 +1323,19 @@ static bool enter_deep_sleep(void)
         }
         return false;
     }
+    err = vibe_bt_composite_prepare_deep_sleep(1200);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep Bluetooth preparation failed: %s",
+                 esp_err_to_name(err));
+        if (bt_state().paired) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                vibe_bt_composite_request_reconnect());
+        }
+        if (resume_motion_on_error) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_motion_resume());
+        }
+        return false;
+    }
 
     set_minijoy_led(MINIJOY_LED_OFF);
     set_board_status_led(false);
@@ -1331,17 +1362,6 @@ static void maybe_enter_deep_sleep(int64_t current_ms)
         return;
     }
     s_next_deep_sleep_attempt_ms = current_ms + DEEP_SLEEP_RETRY_MS;
-
-    bool usb_powered = false;
-    esp_err_t power_err = vibe_board_usb_powered(&usb_powered);
-    if (power_err != ESP_OK) {
-        ESP_LOGW(TAG, "deep sleep deferred: USB status unavailable: %s",
-                 esp_err_to_name(power_err));
-        return;
-    }
-    if (usb_powered) {
-        return;
-    }
     (void)enter_deep_sleep();
 }
 
@@ -1489,9 +1509,7 @@ void app_main(void)
         s_startup_pairing_due_ms = now_ms() + STARTUP_PAIRING_DELAY_MS;
         ESP_LOGI(TAG, "startup pairing window scheduled");
     } else {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            vibe_bt_composite_request_reconnect());
-        ESP_LOGI(TAG, "bonded host found; automatic reconnect started");
+        ESP_LOGI(TAG, "bonded host found; delayed automatic reconnect scheduled");
     }
     update_status();
 
