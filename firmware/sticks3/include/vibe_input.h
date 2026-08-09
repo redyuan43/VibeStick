@@ -15,6 +15,8 @@ typedef struct {
     vibe_input_callback_t front_confirm;
     vibe_input_callback_t front_up;
     vibe_input_callback_t side_up;
+    vibe_input_callback_t side_single;
+    vibe_input_callback_t side_double;
     vibe_input_callback_t side_mode_hold;
     vibe_input_callback_t side_calibration_hold;
     void *context;

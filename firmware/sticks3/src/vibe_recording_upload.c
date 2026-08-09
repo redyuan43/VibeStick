@@ -82,6 +82,7 @@ static void upload_task(void *arg)
             &s_stats, post_duration_ms, audio_len, err == ESP_OK);
         if (err != ESP_OK) {
             set_failed();
+            break;
         }
     }
 

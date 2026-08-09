@@ -489,6 +489,8 @@ esp_err_t vibe_board_cancel_motion_wake(void)
 esp_err_t vibe_board_prepare_deep_sleep(void)
 {
     ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    ESP_RETURN_ON_ERROR(vibe_board_status_led_set(false),
+                        TAG, "disable status LED");
     ESP_RETURN_ON_ERROR(vibe_board_speaker_set_enabled(false),
                         TAG, "disable speaker");
     ESP_RETURN_ON_ERROR(update_reg(M5PM1_REG_GPIO_OUT,
@@ -719,6 +721,19 @@ esp_err_t vibe_board_prepare_deep_sleep(void)
 }
 
 #endif
+
+esp_err_t vibe_board_status_led_set(bool enabled)
+{
+#if VIBE_BOARD_HAS_ES8311
+    ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
+    return update_reg(M5PM1_REG_PWR_CFG,
+                      enabled ? 0 : M5PM1_PWR_CFG_LED_CTRL,
+                      enabled ? M5PM1_PWR_CFG_LED_CTRL : 0);
+#else
+    (void)enabled;
+    return ESP_OK;
+#endif
+}
 
 vibe_board_boot_power_status_t vibe_board_boot_power_status(void)
 {

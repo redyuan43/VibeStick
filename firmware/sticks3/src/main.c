@@ -17,6 +17,7 @@
 #include "vibe_power_policy.h"
 #include "vibe_recording_policy.h"
 #include "vibe_recording_upload.h"
+#include "vibe_settings.h"
 #include "vibe_stick_anim_assets.h"
 #include "vibe_stick_config.h"
 #include "vibe_stick_pet_assets.h"
@@ -78,6 +79,7 @@
 #define BATTERY_HIGH_THRESHOLD_PERCENT 50
 #define RECORDING_UPLOAD_BATCH_CHUNKS 4
 #define RECORDING_UPLOAD_BUFFER_BYTES 8192
+#define RECORDING_UPLOAD_HTTP_TIMEOUT_MS 5000
 #define RECORDING_START_TIMEOUT_MS 1200
 #define RECORDING_STOP_TIMEOUT_MS 210000
 #define PTT_ENTER_GRACE_MS 3000
@@ -99,9 +101,9 @@
 #define VIBE_STICK_FOLLOWUP_PRIORITY 6
 #define VIBE_STICK_IDLE_DIM_MS 30000
 #define VIBE_STICK_IDLE_OFF_MS 60000
-#define VIBE_STICK_DEEP_SLEEP_MS 300000
 #define VIBE_STICK_DEEP_SLEEP_RETRY_MS 5000
 #define VIBE_STICK_DEEP_SLEEP_DIAGNOSTIC_REPORT_MS 30000
+#define VIBE_STICK_SETTINGS_TIMEOUT_MS 30000
 #define VIBE_STICK_MOTION_WAKE_QUIET_MS 5000
 #define VIBE_STICK_MOTION_WAKE_SETTLE_TIMEOUT_MS 15000
 #define VIBE_STICK_MOTION_WAKE_NETWORK_TIMEOUT_MS 15000
@@ -157,6 +159,7 @@
 #define DEVICE_PREF_RECORDING_MODE_KEY "rec_mode"
 #define DEVICE_PREF_RECORDING_TRIGGER_KEY "rec_trig"
 #define DEVICE_PREF_RECORDING_INTENT_KEY "rec_intent"
+#define DEVICE_PREF_SLEEP_MINUTES_KEY "sleep_min"
 #define DEVICE_PREF_MOTION_CALIBRATION_KEY "motion_cal_v1"
 #define MOTION_CALIBRATION_MAGIC 0x564d4341u
 #define MOTION_CALIBRATION_STORE_VERSION 1
@@ -263,6 +266,10 @@ typedef enum {
     VIBE_STICK_EVENT_TTS_PROBE,
     VIBE_STICK_EVENT_OTA_CHECK,
     VIBE_STICK_EVENT_BRIDGE_SCAN_FULL,
+    VIBE_STICK_EVENT_SETTINGS_ENTER,
+    VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT,
+    VIBE_STICK_EVENT_SETTINGS_VALUE_NEXT,
+    VIBE_STICK_EVENT_SETTINGS_CONFIRM,
 } agent_event_type_t;
 
 typedef struct {
@@ -412,6 +419,14 @@ static bridge_target_t s_bridge_target = {
     .available = false,
 };
 static bool s_recording_overlay_visible;
+static atomic_bool s_settings_active;
+static atomic_int_fast64_t s_settings_deadline_ms;
+static vibe_settings_page_t s_settings_page = VIBE_SETTINGS_PAGE_MODE;
+static recording_trigger_mode_t s_settings_draft_trigger =
+    RECORDING_TRIGGER_PUSH_TO_TALK;
+static uint8_t s_sleep_minutes = VIBE_SETTINGS_DEFAULT_SLEEP_MINUTES;
+static uint8_t s_settings_draft_sleep_minutes =
+    VIBE_SETTINGS_DEFAULT_SLEEP_MINUTES;
 static bool s_long_press_active;
 static bool s_motion_recording_active;
 static bool s_motion_calibrating;
@@ -432,8 +447,10 @@ static char s_last_alert_type[24];
 static bool s_alert_sound_baseline_ready;
 static char s_recording_session_id[40];
 static uint32_t s_recording_chunk_id;
+static uint32_t s_recording_uploaded_bytes;
 static bool s_recording_local_capture;
 static bool s_recording_bridge_stop_required;
+static bool s_recording_upload_abort_requested;
 static uint32_t s_device_command_cursor;
 static atomic_bool s_recording_session_active;
 static TaskHandle_t s_recording_finalize_task;
@@ -487,6 +504,8 @@ static volatile bool s_side_button_mode_hold_reached;
 static volatile bool s_side_button_calibration_hold_reached;
 static volatile int64_t s_front_button_iot_single_ms;
 static volatile int64_t s_front_button_iot_up_ms;
+static bool s_front_status_led_pressed;
+static bool s_status_led_on;
 
 static lv_display_t *s_display;
 static esp_lcd_panel_handle_t s_panel;
@@ -572,9 +591,31 @@ static void set_recording_finalize_active(bool active)
     atomic_store(&s_recording_finalize_active, active);
 }
 
+static bool settings_active(void)
+{
+    return atomic_load(&s_settings_active);
+}
+
+static void update_status_led(void)
+{
+    const bool enabled =
+        s_front_status_led_pressed || atomic_load(&s_recording_session_active);
+    if (enabled == s_status_led_on) {
+        return;
+    }
+    esp_err_t err = vibe_board_status_led_set(enabled);
+    if (err == ESP_OK) {
+        s_status_led_on = enabled;
+    } else {
+        ESP_LOGW(TAG, "status LED update failed enabled=%d: %s",
+                 enabled ? 1 : 0, esp_err_to_name(err));
+    }
+}
+
 static void set_recording_session_active(bool active)
 {
     atomic_store(&s_recording_session_active, active);
+    update_status_led();
 }
 
 static bool recording_network_busy(void)
@@ -1060,12 +1101,45 @@ static esp_err_t save_recording_mode_preference(void)
                          (uint8_t)s_recording_intent);
     }
     if (err == ESP_OK) {
+        err = nvs_set_u8(handle, DEVICE_PREF_SLEEP_MINUTES_KEY,
+                         s_sleep_minutes);
+    }
+    if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
     ESP_RETURN_ON_ERROR(err, TAG, "write recording mode preference");
-    ESP_LOGI(TAG, "saved recording preference trigger=%s intent=%s",
-             recording_mode_label(), recording_intent_label());
+    ESP_LOGI(TAG, "saved device preferences trigger=%s intent=%s sleep=%umin",
+             recording_mode_label(), recording_intent_label(),
+             (unsigned)s_sleep_minutes);
+    return ESP_OK;
+}
+
+static esp_err_t restore_sleep_preference(void)
+{
+    s_sleep_minutes = VIBE_SETTINGS_DEFAULT_SLEEP_MINUTES;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DEVICE_PREF_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "open sleep preference NVS");
+
+    uint8_t stored_minutes = 0;
+    err = nvs_get_u8(handle, DEVICE_PREF_SLEEP_MINUTES_KEY, &stored_minutes);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "read sleep preference");
+    if (!vibe_settings_sleep_minutes_valid(stored_minutes)) {
+        ESP_LOGW(TAG, "stored sleep preference rejected value=%u; using %umin",
+                 (unsigned)stored_minutes,
+                 VIBE_SETTINGS_DEFAULT_SLEEP_MINUTES);
+        return ESP_OK;
+    }
+    s_sleep_minutes = stored_minutes;
+    ESP_LOGI(TAG, "restored sleep preference=%umin", (unsigned)s_sleep_minutes);
     return ESP_OK;
 }
 
@@ -1396,6 +1470,7 @@ static bool external_powered(void)
 static bool display_should_stay_active(void)
 {
     const bool active_work =
+           settings_active() ||
            s_recording_overlay_visible ||
            recording_network_busy() ||
            s_tap_recording_active ||
@@ -1440,7 +1515,7 @@ static bool front_button_iot_handled_press(int64_t now_ms)
 
 static void poll_front_button_fallback(int64_t now_ms)
 {
-    if (!recording_intent_is_cyber() ||
+    if (settings_active() || !recording_intent_is_cyber() ||
         s_recording_trigger_mode != RECORDING_TRIGGER_PUSH_TO_TALK) {
         reset_front_button_fallback();
         return;
@@ -1873,8 +1948,13 @@ static bool enter_deep_sleep(void)
     set_display_rendering_suspended(true);
     set_backlight(LCD_BACKLIGHT_OFF);
 
-    ESP_LOGI(TAG, "entering deep sleep board=%s mode=%s wake_mask=0x%llx",
-             VIBE_BOARD_NAME, recording_mode_label(), (unsigned long long)wake_mask);
+    s_front_status_led_pressed = false;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_status_led_set(false));
+    s_status_led_on = false;
+    ESP_LOGI(TAG,
+             "entering deep sleep board=%s mode=%s timeout=%umin wake_mask=0x%llx",
+             VIBE_BOARD_NAME, recording_mode_label(), (unsigned)s_sleep_minutes,
+             (unsigned long long)wake_mask);
     atomic_store(&s_deep_sleep_committed, true);
     if (s_wifi_reconnect_timer &&
         esp_timer_is_active(s_wifi_reconnect_timer)) {
@@ -1933,7 +2013,8 @@ static void maybe_enter_deep_sleep(int64_t now_ms)
         return;
     }
     if (!false_wake_sleep_due &&
-        (now_ms - s_last_activity_ms) < VIBE_STICK_DEEP_SLEEP_MS) {
+        (now_ms - s_last_activity_ms) <
+            vibe_settings_sleep_timeout_ms(s_sleep_minutes)) {
         return;
     }
     if (deep_sleep_should_stay_awake()) {
@@ -2435,6 +2516,183 @@ static void show_persistent_mode_switch_visual(const char *title, const char *hi
     show_mode_switch_visual_internal(title, hint, frames, frame_count, accent, true);
 }
 
+static void settings_touch(void)
+{
+    atomic_store(&s_settings_deadline_ms,
+                 esp_timer_get_time() / 1000 + VIBE_STICK_SETTINGS_TIMEOUT_MS);
+}
+
+static void render_settings_visual(void)
+{
+    if (!settings_active()) {
+        return;
+    }
+
+    char title[40] = {0};
+    char hint[48] = {0};
+    switch (s_settings_page) {
+    case VIBE_SETTINGS_PAGE_MODE:
+        snprintf(title, sizeof(title), "MODE: %s",
+                 s_settings_draft_trigger == RECORDING_TRIGGER_LIFT_TO_TALK
+                     ? "LIFT"
+                     : "PTT");
+        strlcpy(hint, "FRONT NEXT  HOLD SAVE", sizeof(hint));
+        break;
+    case VIBE_SETTINGS_PAGE_SLEEP:
+        snprintf(title, sizeof(title), "SLEEP: %u MIN",
+                 (unsigned)s_settings_draft_sleep_minutes);
+        strlcpy(hint, "FRONT NEXT  HOLD SAVE", sizeof(hint));
+        break;
+    case VIBE_SETTINGS_PAGE_VERSION:
+        snprintf(title, sizeof(title), "FW %s", FIRMWARE_VERSION);
+        snprintf(hint, sizeof(hint), "STICKS3 %.11s", FIRMWARE_BUILD_ID);
+        break;
+    default:
+        s_settings_page = VIBE_SETTINGS_PAGE_MODE;
+        strlcpy(title, "MODE: PTT", sizeof(title));
+        strlcpy(hint, "FRONT NEXT  HOLD SAVE", sizeof(hint));
+        break;
+    }
+
+    show_persistent_mode_switch_visual(
+        title, hint,
+        s_mode_switch_dict_frames,
+        sizeof(s_mode_switch_dict_frames) / sizeof(s_mode_switch_dict_frames[0]),
+        current_provider_config()->accent_color);
+    ESP_LOGI(TAG, "settings page=%d draft_trigger=%d draft_sleep=%umin",
+             (int)s_settings_page, (int)s_settings_draft_trigger,
+             (unsigned)s_settings_draft_sleep_minutes);
+}
+
+static void close_settings(bool saved)
+{
+    atomic_store(&s_settings_active, false);
+    atomic_store(&s_settings_deadline_ms, 0);
+    lvgl_lock();
+    finish_mode_switch_visual();
+    lvgl_unlock();
+    render_state();
+    ESP_LOGI(TAG, "settings exited saved=%d", saved ? 1 : 0);
+}
+
+static void enter_settings(void)
+{
+    register_activity();
+    if (settings_active()) {
+        settings_touch();
+        return;
+    }
+    if (recording_network_busy() || ota_in_progress() || s_motion_calibrating ||
+        atomic_load(&s_bridge_selection_active)) {
+        ESP_LOGI(TAG, "settings entry ignored while device is busy");
+        (void)vibe_audio_play_sound(VIBE_STICK_SOUND_ERROR);
+        return;
+    }
+
+    atomic_store(&s_bridge_selection_entry_deadline_ms, 0);
+    clear_ptt_followup_enter_window();
+    set_motion_arm_prompt(false);
+    s_settings_page = VIBE_SETTINGS_PAGE_MODE;
+    s_settings_draft_trigger = s_recording_trigger_mode;
+    s_settings_draft_sleep_minutes = s_sleep_minutes;
+    atomic_store(&s_settings_active, true);
+    settings_touch();
+    render_settings_visual();
+    ESP_LOGI(TAG, "settings entered trigger=%s sleep=%umin",
+             recording_mode_label(), (unsigned)s_sleep_minutes);
+}
+
+static void next_settings_page(void)
+{
+    if (!settings_active()) {
+        return;
+    }
+    register_activity();
+    settings_touch();
+    s_settings_page = vibe_settings_next_page(s_settings_page);
+    render_settings_visual();
+}
+
+static void next_settings_value(void)
+{
+    if (!settings_active()) {
+        return;
+    }
+    register_activity();
+    settings_touch();
+    if (s_settings_page == VIBE_SETTINGS_PAGE_MODE) {
+        s_settings_draft_trigger =
+            s_settings_draft_trigger == RECORDING_TRIGGER_PUSH_TO_TALK
+                ? RECORDING_TRIGGER_LIFT_TO_TALK
+                : RECORDING_TRIGGER_PUSH_TO_TALK;
+    } else if (s_settings_page == VIBE_SETTINGS_PAGE_SLEEP) {
+        s_settings_draft_sleep_minutes =
+            vibe_settings_next_sleep_minutes(s_settings_draft_sleep_minutes);
+    }
+    render_settings_visual();
+}
+
+static void confirm_settings(void)
+{
+    if (!settings_active()) {
+        return;
+    }
+    register_activity();
+    settings_touch();
+
+    const recording_trigger_mode_t previous_trigger = s_recording_trigger_mode;
+    const uint8_t previous_sleep_minutes = s_sleep_minutes;
+    esp_err_t err = ESP_OK;
+    if (s_settings_draft_trigger != s_recording_trigger_mode) {
+        if (s_settings_draft_trigger == RECORDING_TRIGGER_LIFT_TO_TALK) {
+            err = set_lift_to_talk_trigger_mode("settings");
+        } else {
+            set_push_to_talk_trigger_mode();
+        }
+    }
+    if (err == ESP_OK) {
+        s_sleep_minutes = vibe_settings_sleep_minutes_sanitize(
+            s_settings_draft_sleep_minutes);
+        err = save_recording_mode_preference();
+    }
+    if (err != ESP_OK) {
+        s_sleep_minutes = previous_sleep_minutes;
+        if (previous_trigger == RECORDING_TRIGGER_LIFT_TO_TALK) {
+            (void)set_lift_to_talk_trigger_mode("settings rollback");
+        } else {
+            set_push_to_talk_trigger_mode();
+        }
+        show_persistent_mode_switch_visual(
+            "SAVE FAILED", "HOLD TO RETRY",
+            s_pet_error_frames,
+            sizeof(s_pet_error_frames) / sizeof(s_pet_error_frames[0]),
+            lv_color_hex(0xfca5a5));
+        ESP_LOGW(TAG, "settings save failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    close_settings(true);
+    esp_err_t sound_err = vibe_audio_play_sound(VIBE_STICK_SOUND_APPROVAL);
+    if (sound_err != ESP_OK) {
+        ESP_LOGW(TAG, "settings confirmation sound skipped: %s",
+                 esp_err_to_name(sound_err));
+    }
+    ESP_LOGI(TAG, "settings saved trigger=%s sleep=%umin",
+             recording_mode_label(), (unsigned)s_sleep_minutes);
+}
+
+static void maybe_timeout_settings(int64_t now_ms)
+{
+    if (!settings_active()) {
+        return;
+    }
+    const int64_t deadline_ms = atomic_load(&s_settings_deadline_ms);
+    if (deadline_ms > 0 && now_ms >= deadline_ms) {
+        ESP_LOGI(TAG, "settings timed out; discarding draft");
+        close_settings(false);
+    }
+}
+
 static void bridge_selection_title(char *title, size_t title_len)
 {
     bridge_target_t target;
@@ -2494,7 +2752,7 @@ static void show_trigger_mode_switch_visual(void)
     const bool lift = s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK;
     const agent_provider_config_t *provider = current_provider_config();
     show_mode_switch_visual(lift ? "LIFT TO TALK" : "PUSH TO TALK",
-                            lift ? "SIDE 3S  LIFT" : "SIDE 3S  PTT",
+                            "SETTINGS MODE",
                             lift ? s_mode_switch_lift_frames : s_mode_switch_ptt_frames,
                             lift ? (int)(sizeof(s_mode_switch_lift_frames) /
                                          sizeof(s_mode_switch_lift_frames[0]))
@@ -4173,7 +4431,7 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     }
     esp_http_client_config_t config = {
         .url = url,
-        .timeout_ms = 20000,
+        .timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS,
         .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
         .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
         .event_handler = http_event_handler,
@@ -5130,8 +5388,8 @@ static bool parse_recording_session_id(const char *json, char *session_id, size_
 static bool parse_recording_capture_mode(const char *json, char *capture_mode,
                                          size_t capture_mode_len)
 {
-    if (capture_mode_len > 0) {
-        capture_mode[0] = '\0';
+    if (!capture_mode || capture_mode_len == 0) {
+        return false;
     }
     cJSON *root = cJSON_Parse(json);
     if (!root) {
@@ -5160,7 +5418,20 @@ static bool is_recording_failure_status(const char *status)
            strcmp(status, "cyber_failed") == 0 ||
            strcmp(status, "cyber_unconfigured") == 0 ||
            strcmp(status, "start_failed") == 0 ||
-           strcmp(status, "stop_failed") == 0;
+           strcmp(status, "stop_failed") == 0 ||
+           strcmp(status, "recording_failed") == 0;
+}
+
+static uint32_t recording_crc32(const uint8_t *data, size_t len)
+{
+    uint32_t crc = UINT32_MAX;
+    for (size_t index = 0; index < len; ++index) {
+        crc ^= data[index];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ ((crc & 1U) ? 0xedb88320U : 0U);
+        }
+    }
+    return crc ^ UINT32_MAX;
 }
 
 static bool parse_recording_status(const char *json, char *status_text, size_t status_text_len)
@@ -5219,10 +5490,12 @@ static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len,
     if (!audio || audio_len == 0 || s_recording_session_id[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
-    char path[128];
-    snprintf(path, sizeof(path), "%s?session_id=%s&chunk_id=%lu",
+    char path[160];
+    uint32_t chunk_crc32 = recording_crc32(audio, audio_len);
+    snprintf(path, sizeof(path), "%s?session_id=%s&chunk_id=%lu&chunk_crc32=%08lx",
              VIBE_STICK_RECORDING_AUDIO_PATH, s_recording_session_id,
-             (unsigned long)s_recording_chunk_id);
+             (unsigned long)s_recording_chunk_id,
+             (unsigned long)chunk_crc32);
     char response[512] = {0};
     esp_err_t err = http_post_binary(path, audio, audio_len, response, sizeof(response));
     if (err != ESP_OK) {
@@ -5231,6 +5504,7 @@ static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len,
         return err;
     }
     s_recording_chunk_id++;
+    s_recording_uploaded_bytes += (uint32_t)audio_len;
     (void)response;
     return ESP_OK;
 }
@@ -5274,6 +5548,8 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         return false;
     }
     s_recording_chunk_id = 0;
+    s_recording_uploaded_bytes = 0;
+    s_recording_upload_abort_requested = false;
     s_recording_local_capture = true;
     s_recording_bridge_stop_required = notify_bridge;
     set_recording_session_active(true);
@@ -5287,11 +5563,11 @@ static bool handle_recording_start_internal(const char *event_name, const char *
              recording_mode_intent(),
              s_recording_session_id);
     if (notify_bridge) {
-        char body[240];
+        char body[288];
         snprintf(body, sizeof(body),
                  "{\"event\":\"%s\",\"source\":\"%s\","
                  "\"audio_source\":\"%s\",\"session_id\":\"%s\","
-                 "\"intent\":\"%s\",\"mode\":\"%s\"}",
+                 "\"intent\":\"%s\",\"mode\":\"%s\",\"protocol_version\":2}",
                  event_name,
                  VIBE_BOARD_EVENT_SOURCE,
                  VIBE_BOARD_AUDIO_SOURCE,
@@ -5380,6 +5656,7 @@ static bool handle_recording_start(const char *event_name, const char *hint)
 
 static void finish_recording_stop(const char *event_name)
 {
+    bool upload_failed = vibe_recording_upload_failed();
     if (s_recording_local_capture) {
         esp_err_t audio_err = vibe_audio_stop();
         if (audio_err != ESP_OK) {
@@ -5387,6 +5664,7 @@ static void finish_recording_stop(const char *event_name)
                      esp_err_to_name(audio_err));
         }
         vibe_recording_upload_wait();
+        upload_failed = vibe_recording_upload_failed();
         vibe_recording_upload_log_diagnostics(VIBE_BOARD_NAME,
                                               current_wifi_rssi());
         vibe_audio_clear();
@@ -5418,16 +5696,21 @@ static void finish_recording_stop(const char *event_name)
              recording_mode_intent(),
              s_recording_session_id,
              paste_result ? 1 : 0);
-    char body[256];
+    char body[384];
     snprintf(body, sizeof(body),
              "{\"event\":\"%s\",\"source\":\"%s\",\"paste\":%s,"
-             "\"session_id\":\"%s\",\"intent\":\"%s\",\"mode\":\"%s\"}",
+             "\"session_id\":\"%s\",\"intent\":\"%s\",\"mode\":\"%s\","
+             "\"protocol_version\":2,\"total_chunks\":%lu,\"total_bytes\":%lu,"
+             "\"upload_failed\":%s}",
              event_name,
              VIBE_BOARD_EVENT_SOURCE,
              paste_result ? "true" : "false",
              s_recording_session_id,
              recording_mode_intent(),
-             recording_mode_label());
+             recording_mode_label(),
+             (unsigned long)s_recording_chunk_id,
+             (unsigned long)s_recording_uploaded_bytes,
+             upload_failed ? "true" : "false");
     char response[1024] = {0};
     esp_err_t err = http_request_timeout("POST", VIBE_STICK_RECORDING_STOP_PATH, body, response,
                                          sizeof(response), RECORDING_STOP_TIMEOUT_MS);
@@ -5445,7 +5728,7 @@ static void finish_recording_stop(const char *event_name)
             render_state();
         }
     }
-    if (err != ESP_OK || recording_failed || vibe_recording_upload_failed()) {
+    if (err != ESP_OK || recording_failed || upload_failed) {
         ESP_LOGW(TAG, "recording stop bridge request failed: %s", esp_err_to_name(err));
         const char *title = (strcmp(recording_status, "audio_skipped") == 0 ||
                              strcmp(recording_status, "transcript_rejected") == 0)
@@ -5463,6 +5746,7 @@ static void finish_recording_stop(const char *event_name)
     s_recording_session_id[0] = '\0';
     s_recording_local_capture = false;
     s_recording_bridge_stop_required = false;
+    s_recording_upload_abort_requested = false;
     set_recording_session_active(false);
     s_tap_recording_active = false;
     s_motion_recording_active = false;
@@ -5961,6 +6245,13 @@ static void button_press_down_cb(void *button_handle, void *usr_data)
     register_activity();
     const int64_t now_ms = esp_timer_get_time() / 1000;
     s_front_button_iot_down_ms = now_ms;
+    s_front_status_led_pressed = true;
+    update_status_led();
+    if (settings_active()) {
+        settings_touch();
+        ESP_LOGI(TAG, "front button reserved for settings");
+        return;
+    }
     const int64_t entry_deadline =
         atomic_load(&s_bridge_selection_entry_deadline_ms);
     const bool entry_open =
@@ -5996,6 +6287,11 @@ static void button_single_click_cb(void *button_handle, void *usr_data)
     register_activity();
     const int64_t now_ms = esp_timer_get_time() / 1000;
     s_front_button_iot_single_ms = now_ms;
+    if (settings_active()) {
+        settings_touch();
+        queue_event(VIBE_STICK_EVENT_SETTINGS_VALUE_NEXT);
+        return;
+    }
     if (atomic_load(&s_bridge_selection_active) ||
         atomic_load(&s_front_bridge_gesture_active) ||
         now_ms <= atomic_load(&s_front_bridge_click_suppress_until_ms)) {
@@ -6034,6 +6330,11 @@ static void button_double_click_cb(void *button_handle, void *usr_data)
     (void)usr_data;
     register_activity();
     const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (settings_active()) {
+        settings_touch();
+        ESP_LOGI(TAG, "front double click ignored in settings");
+        return;
+    }
     if (atomic_load(&s_bridge_selection_active) ||
         atomic_load(&s_front_bridge_gesture_active) ||
         now_ms <= atomic_load(&s_front_bridge_click_suppress_until_ms)) {
@@ -6081,6 +6382,12 @@ static void side_button_up_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
+    if (settings_active()) {
+        s_side_button_calibration_hold_reached = false;
+        s_side_button_mode_hold_reached = false;
+        settings_touch();
+        return;
+    }
     if (s_side_button_calibration_hold_reached) {
         s_side_button_calibration_hold_reached = false;
         s_side_button_mode_hold_reached = false;
@@ -6093,7 +6400,32 @@ static void side_button_up_cb(void *button_handle, void *usr_data)
     }
     if (s_side_button_mode_hold_reached) {
         s_side_button_mode_hold_reached = false;
-        queue_event(VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE);
+        queue_event(VIBE_STICK_EVENT_SETTINGS_ENTER);
+        return;
+    }
+}
+
+static void side_button_single_click_cb(void *button_handle, void *usr_data)
+{
+    (void)button_handle;
+    (void)usr_data;
+    register_activity();
+    if (settings_active()) {
+        settings_touch();
+        queue_event(VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT);
+        return;
+    }
+    ESP_LOGI(TAG, "side button single click ignored; double click to scan");
+}
+
+static void side_button_double_click_cb(void *button_handle, void *usr_data)
+{
+    (void)button_handle;
+    (void)usr_data;
+    register_activity();
+    if (settings_active()) {
+        settings_touch();
+        ESP_LOGI(TAG, "side double click ignored in settings");
         return;
     }
     const bool can_arm = !recording_network_busy();
@@ -6101,7 +6433,7 @@ static void side_button_up_cb(void *button_handle, void *usr_data)
                  can_arm ? esp_timer_get_time() / 1000 +
                                BRIDGE_SELECTION_ENTRY_WINDOW_MS
                          : 0);
-    ESP_LOGI(TAG, "side button release: full bridge scan entry_window=%d",
+    ESP_LOGI(TAG, "side button double click: full bridge scan entry_window=%d",
              can_arm ? 1 : 0);
     queue_event(VIBE_STICK_EVENT_BRIDGE_SCAN_FULL);
 }
@@ -6111,6 +6443,11 @@ static void button_long_start_cb(void *button_handle, void *usr_data)
     (void)button_handle;
     (void)usr_data;
     register_activity();
+    if (settings_active()) {
+        settings_touch();
+        ESP_LOGI(TAG, "front PTT hold suppressed in settings");
+        return;
+    }
     if (atomic_load(&s_bridge_selection_active) ||
         atomic_load(&s_front_bridge_gesture_active)) {
         ESP_LOGI(TAG, "front PTT long press consumed by bridge selection");
@@ -6151,6 +6488,11 @@ static void bridge_selection_confirm_long_cb(void *button_handle, void *usr_data
     (void)button_handle;
     (void)usr_data;
     register_activity();
+    if (settings_active()) {
+        settings_touch();
+        queue_event(VIBE_STICK_EVENT_SETTINGS_CONFIRM);
+        return;
+    }
     if (!atomic_load(&s_bridge_selection_active) ||
         !atomic_load(&s_front_bridge_gesture_active) ||
         atomic_exchange(&s_bridge_selection_confirming, true)) {
@@ -6168,6 +6510,13 @@ static void button_up_cb(void *button_handle, void *usr_data)
     register_activity();
     const int64_t now_ms = esp_timer_get_time() / 1000;
     s_front_button_iot_up_ms = now_ms;
+    s_front_status_led_pressed = false;
+    update_status_led();
+    if (settings_active()) {
+        s_long_press_active = false;
+        s_wake_front_button_pending = false;
+        return;
+    }
     if (atomic_load(&s_front_bridge_gesture_active)) {
         if (!atomic_load(&s_front_bridge_gesture_confirmed) &&
             !atomic_load(&s_bridge_selection_confirming)) {
@@ -6211,6 +6560,8 @@ static esp_err_t init_button(void)
         .front_confirm = bridge_selection_confirm_long_cb,
         .front_up = button_up_cb,
         .side_up = side_button_up_cb,
+        .side_single = side_button_single_click_cb,
+        .side_double = side_button_double_click_cb,
         .side_mode_hold = side_button_long_start_cb,
         .side_calibration_hold = side_button_calibration_long_start_cb,
     };
@@ -6376,10 +6727,20 @@ static void app_task(void *arg)
         maybe_refresh_power_status(now_ms);
         maybe_timeout_cyber_tts_wait(now_ms);
         maybe_timeout_motion_calibration(now_ms);
+        maybe_timeout_settings(now_ms);
         update_power_saving(now_ms);
         maybe_enter_deep_sleep(now_ms);
         handle_deep_sleep_front_button_intent();
         poll_front_button_fallback(now_ms);
+        if (s_recording_local_capture &&
+            atomic_load(&s_recording_session_active) &&
+            vibe_recording_upload_failed() &&
+            !recording_finalize_active() &&
+            !s_recording_upload_abort_requested) {
+            s_recording_upload_abort_requested = true;
+            ESP_LOGW(TAG, "recording stopped automatically after audio upload failure");
+            handle_recording_stop("audio_upload_failed");
+        }
         const bool network_busy = recording_network_busy();
         if (s_display_power_state == DISPLAY_POWER_ACTIVE &&
             wifi_connected() && !network_busy &&
@@ -6392,7 +6753,7 @@ static void app_task(void *arg)
         bool ota_power_policy_allows =
             external_powered() ||
             s_display_power_state == DISPLAY_POWER_ACTIVE;
-        if (ota_power_policy_allows &&
+        if (ota_power_policy_allows && !settings_active() &&
             wifi_connected() && !network_busy && !ota_in_progress() &&
             now_ms - s_last_ota_check_ms >= ota_interval_ms) {
             s_last_ota_check_ms = now_ms;
@@ -6410,7 +6771,7 @@ static void app_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(700));
             show_recording_overlay(NULL, NULL, false);
         }
-        if (vibe_motion_available() &&
+        if (!settings_active() && vibe_motion_available() &&
             s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK) {
             vibe_motion_event_t motion_event = vibe_motion_poll(now_ms);
             if (s_motion_calibrating && !vibe_motion_is_calibrating()) {
@@ -6526,6 +6887,18 @@ static void app_task(void *arg)
         case VIBE_STICK_EVENT_BRIDGE_SCAN_FULL:
             (void)start_bridge_discovery_task(true);
             break;
+        case VIBE_STICK_EVENT_SETTINGS_ENTER:
+            enter_settings();
+            break;
+        case VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT:
+            next_settings_page();
+            break;
+        case VIBE_STICK_EVENT_SETTINGS_VALUE_NEXT:
+            next_settings_value();
+            break;
+        case VIBE_STICK_EVENT_SETTINGS_CONFIRM:
+            confirm_settings();
+            break;
         case VIBE_STICK_EVENT_MOTION_START:
             if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
                 !s_motion_recording_active) {
@@ -6590,8 +6963,8 @@ static void serial_debug_task(void *arg)
             continue;
         }
         if (input == 's' || input == 'S') {
-            ESP_LOGI(TAG, "serial debug command: side button full scan");
-            side_button_up_cb(NULL, NULL);
+            ESP_LOGI(TAG, "serial debug command: side double-click full scan");
+            side_button_double_click_cb(NULL, NULL);
         } else if (input == 'c' || input == 'C') {
             ESP_LOGI(TAG, "serial debug command: clear runtime bridge profiles");
             bridge_profiles_clear();
@@ -6693,8 +7066,11 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs);
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(load_deep_sleep_record());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(restore_sleep_preference());
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_init_power());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_status_led_set(false));
+    s_status_led_on = false;
     s_boot_power_status = vibe_board_boot_power_status();
     s_event_queue = xQueueCreate(16, sizeof(agent_event_t));
     s_bridge_control_queue =
@@ -6730,6 +7106,7 @@ void app_main(void)
     }
     set_push_to_talk_trigger_mode();
     ESP_ERROR_CHECK_WITHOUT_ABORT(restore_recording_mode_preference());
+    ESP_LOGI(TAG, "deep sleep timeout=%umin", (unsigned)s_sleep_minutes);
     render_state();
     BaseType_t bridge_control_ok =
         xTaskCreatePinnedToCore(bridge_control_task, "bridge_control", 4096,

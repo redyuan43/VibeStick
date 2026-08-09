@@ -225,7 +225,8 @@ Starts a recording session:
   "event": "button_tap_start",
   "source": "sticks3",
   "audio_source": "sticks3_pcm",
-  "session_id": "<firmware-generated-id>"
+  "session_id": "<firmware-generated-id>",
+  "protocol_version": 2
 }
 ```
 
@@ -236,9 +237,20 @@ Push-to-talk uses `button_long_start`; lift-to-talk uses `motion_lift_start`.
 Uploads raw little-endian signed PCM for the active session:
 
 ```text
-POST /recording/audio?session_id=<id>
+POST /recording/audio?session_id=<id>&chunk_id=<zero-based>&chunk_crc32=<crc32>
 Content-Type: application/octet-stream
 ```
+
+Protocol v2 requires monotonically increasing chunk IDs and the lowercase
+eight-digit CRC32 of each request body. The bridge acknowledges the next
+expected chunk only after validation and local persistence.
+
+StickS3 records 60 ms PCM frames and normally uploads four frames per request
+(about 240 ms / 7680 bytes at 16 kHz mono PCM16). A chunk request uses a
+5-second timeout and is retried up to three times. The bridge allows 12 seconds
+for the first accepted chunk, then treats 10 seconds without accepted audio or
+a new upload attempt as a stalled stream. Realtime ASR starts only after the
+first chunk has been persisted.
 
 The bridge writes a local WAV file under:
 
@@ -253,7 +265,7 @@ The bridge rejects audio uploads larger than `VIBE_STICK_MAX_RECORDING_AUDIO_BYT
 Stops the session and runs transcription:
 
 ```json
-{"event":"button_tap_stop","source":"sticks3","paste":true}
+{"event":"button_tap_stop","source":"sticks3","paste":true,"protocol_version":2,"total_chunks":42,"total_bytes":322560,"upload_failed":false}
 ```
 
 Push-to-talk uses `button_long_stop`; lift-to-talk uses `motion_lift_stop`.

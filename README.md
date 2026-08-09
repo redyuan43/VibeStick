@@ -139,7 +139,7 @@ If Codex works but the Claude column shows `--%`, that is expected: Claude usage
 
 11. 👤 Open any text box, press the front blue button once, speak, and press it again to send. Long-press and release still works as push-to-talk. In both modes, VibeStick transcribes audio from the device microphone and pastes the text automatically.
 
-StickS3 and M5StickC Plus also support lift-to-talk mode. The default `PTT` mode supports front-button tap-to-talk and push-to-talk behavior. Long-press the side button to switch to `LIFT`; the device uses its boot-time flat desktop pose as the baseline, starts recording when lifted, and sends recognition after it is placed back flat and stable.
+StickS3 and M5StickC Plus also support lift-to-talk mode. The default `PTT` mode supports front-button tap-to-talk and push-to-talk behavior. On StickS3, hold the side button for 3 seconds to open settings; a single side-button click does nothing, while a quick double-click starts bridge discovery. Inside settings, a short side-button press cycles through `MODE`, `SLEEP`, and `VERSION`; a short front-button press changes the selected value; holding the front button for 1.5 seconds saves the settings. `MODE` selects `PTT` or `LIFT`, and `SLEEP` selects 1, 2, 5, or 10 minutes (5 minutes by default). In `LIFT`, the device uses its flat desktop pose as the baseline, starts recording when lifted, and sends recognition after it is placed back flat and stable. The onboard status LED lights while the front button is held or a recording is active, and is forced off before deep sleep.
 
 For development without installing LaunchAgents, run `./scripts/dev.sh` from the repository root instead of `./scripts/install.sh`.
 

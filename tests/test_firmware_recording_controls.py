@@ -254,10 +254,14 @@ def test_idle_pet_bobs_briefly_then_uses_a_low_frequency_static_timer() -> None:
     assert "set_pet_vertical_offset(14);" in update_pet
 
 
-def test_side_button_only_starts_full_scan_and_arms_selection_window() -> None:
+def test_side_button_only_scans_on_double_click_and_arms_selection_window() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     side_up = source.split("static void side_button_up_cb", 1)[1]
-    side_up = side_up.split("static void button_long_start_cb", 1)[0]
+    side_up = side_up.split("static void side_button_single_click_cb", 1)[0]
+    side_single = source.split("static void side_button_single_click_cb", 1)[1]
+    side_single = side_single.split("static void side_button_double_click_cb", 1)[0]
+    side_double = source.split("static void side_button_double_click_cb", 1)[1]
+    side_double = side_double.split("static void button_long_start_cb", 1)[0]
     start_task = source.split("static bool start_bridge_discovery_task", 1)[1]
     start_task = start_task.split("static void bridge_ensure_target", 1)[0]
     cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
@@ -269,9 +273,15 @@ def test_side_button_only_starts_full_scan_and_arms_selection_window() -> None:
     assert "bridge discovery already running" in start_task
     assert "xTaskCreatePinnedToCore(bridge_discovery_task" in start_task
     assert "#define BRIDGE_SELECTION_ENTRY_WINDOW_MS 5000" in source
-    assert "VIBE_STICK_EVENT_BRIDGE_SCAN_FULL" in side_up
-    assert "BRIDGE_SELECTION_ENTRY_WINDOW_MS" in side_up
-    assert "VIBE_STICK_EVENT_BRIDGE_SELECTION_NEXT" not in side_up
+    assert "VIBE_STICK_EVENT_BRIDGE_SCAN_FULL" not in side_up
+    assert "BRIDGE_SELECTION_ENTRY_WINDOW_MS" not in side_up
+    assert "VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT" not in side_up
+    assert "VIBE_STICK_EVENT_BRIDGE_SCAN_FULL" not in side_single
+    assert "side button single click ignored; double click to scan" in side_single
+    assert "VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT" in side_single
+    assert "VIBE_STICK_EVENT_BRIDGE_SCAN_FULL" in side_double
+    assert "BRIDGE_SELECTION_ENTRY_WINDOW_MS" in side_double
+    assert "VIBE_STICK_EVENT_BRIDGE_SELECTION_NEXT" not in side_double
     assert "start_bridge_discovery_task" not in cycle
     assert "bridge_saved_profile_count()" in cycle
     assert "bridge_target_set_profile(next_index, \"manual\", false)" in cycle
@@ -485,8 +495,8 @@ def test_serial_debug_command_uses_the_side_button_event_path() -> None:
     assert "esp_rom_output_rx_one_char(&input)" in serial_task
     assert "usb_serial_jtag_driver_install(&usb_config)" in serial_task
     assert "usb_serial_jtag_read_bytes(&input, 1" in serial_task
-    assert "serial debug command: side button full scan" in serial_task
-    assert "side_button_up_cb(NULL, NULL)" in serial_task
+    assert "serial debug command: side double-click full scan" in serial_task
+    assert "side_button_double_click_cb(NULL, NULL)" in serial_task
     assert "serial debug command: clear runtime bridge profiles" in serial_task
     assert "bridge_profiles_clear()" in serial_task
     assert "serial debug command: front button short press" in serial_task
@@ -559,8 +569,18 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
 
     assert "chunk_id=%lu" in source
+    assert "chunk_crc32=%08lx" in source
+    assert "recording_crc32" in source
+    assert '\\"protocol_version\\":2' in source
+    assert "if (!capture_mode || capture_mode_len == 0)" in source
+    assert '\\"total_chunks\\":%lu' in source
+    assert '\\"total_bytes\\":%lu' in source
+    assert "recording stopped automatically after audio upload failure" in source
     assert "s_recording_chunk_id++" in source
+    assert "RECORDING_UPLOAD_HTTP_TIMEOUT_MS 5000" in source
+    assert ".timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS" in source
     assert "RECORDING_UPLOAD_RETRY_COUNT 3" in upload_source
+    assert "set_failed();\n            break;" in upload_source
     assert "recording diagnostics board=%s" in upload_source
     assert "esp_wifi_sta_get_ap_info" in source
     assert "post_ms_min" in upload_source
@@ -826,7 +846,9 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
 
     assert "#define VIBE_STICK_IDLE_DIM_MS 30000" in source
     assert "#define VIBE_STICK_IDLE_OFF_MS 60000" in source
-    assert "#define VIBE_STICK_DEEP_SLEEP_MS 300000" in source
+    assert "#define VIBE_STICK_SETTINGS_TIMEOUT_MS 30000" in source
+    assert "vibe_settings_sleep_timeout_ms(s_sleep_minutes)" in source
+    assert 'DEVICE_PREF_SLEEP_MINUTES_KEY "sleep_min"' in source
     assert "maybe_enter_deep_sleep(now_ms)" in source
     assert "esp_deep_sleep_start()" in source
     assert "esp_sleep_enable_ext0_wakeup(ext0_gpio, 0)" in source
@@ -939,8 +961,9 @@ def test_recording_trigger_is_independent_from_disabled_cyber_intents() -> None:
     assert "case RECORDING_MODE_CYBER_FORTUNE:" in migration
     assert "case RECORDING_MODE_CYBER_ALMANAC:" in migration
     assert "VIBE_STICK_EVENT_RECORDING_INTENT_TOGGLE" in source
-    assert "side_button_double_click_cb" not in source
-    assert "BUTTON_DOUBLE_CLICK, NULL" not in side_button_setup
+    assert "side_button_double_click_cb" in source
+    assert "BUTTON_SINGLE_CLICK, NULL" in side_button_setup
+    assert "BUTTON_DOUBLE_CLICK, NULL" in side_button_setup
 
 
 def test_side_mode_switches_show_large_main_screen_visual_feedback() -> None:
@@ -1351,11 +1374,50 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.61"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.64"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.38"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
+
+
+def test_sticks3_settings_menu_preserves_normal_button_roles() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+
+    assert "VIBE_SETTINGS_PAGE_MODE" in source
+    assert "VIBE_SETTINGS_PAGE_SLEEP" in source
+    assert "VIBE_SETTINGS_PAGE_VERSION" in source
+    assert '"MODE: %s"' in source
+    assert '"SLEEP: %u MIN"' in source
+    assert '"FW %s"' in source
+    assert "VIBE_STICK_EVENT_SETTINGS_ENTER" in source
+    assert "VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT" in source
+    assert "VIBE_STICK_EVENT_SETTINGS_VALUE_NEXT" in source
+    assert "VIBE_STICK_EVENT_SETTINGS_CONFIRM" in source
+    assert "queue_event(VIBE_STICK_EVENT_SETTINGS_ENTER)" in source
+    assert "queue_event(VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT)" in source
+    assert "queue_event(VIBE_STICK_EVENT_SETTINGS_VALUE_NEXT)" in source
+    assert "queue_event(VIBE_STICK_EVENT_SETTINGS_CONFIRM)" in source
+    assert "SIDE_MANUAL_CALIBRATION_HOLD_MS 6000" in source
+    assert "queue_event(VIBE_STICK_EVENT_MOTION_CALIBRATE)" in source
+    assert "queue_event(VIBE_STICK_EVENT_BRIDGE_SCAN_FULL)" in source
+
+
+def test_sticks3_status_led_tracks_button_recording_and_deep_sleep() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    board = BOARD_C.read_text(encoding="utf-8")
+    board_header = (ROOT / "firmware/sticks3/include/vibe_board.h").read_text(
+        encoding="utf-8"
+    )
+
+    assert "esp_err_t vibe_board_status_led_set(bool enabled);" in board_header
+    assert "M5PM1_PWR_CFG_LED_CTRL BIT(4)" in board
+    assert "esp_err_t vibe_board_status_led_set(bool enabled)" in board
+    assert "s_front_status_led_pressed = true;" in source
+    assert "s_front_status_led_pressed = false;" in source
+    assert "atomic_load(&s_recording_session_active)" in source
+    assert "update_status_led();" in source
+    assert "vibe_board_status_led_set(false)" in source
 
 
 def test_ota_publisher_strips_null_padding_from_image_metadata() -> None:

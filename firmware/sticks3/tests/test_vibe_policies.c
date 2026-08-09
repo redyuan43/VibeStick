@@ -2,6 +2,7 @@
 #include "vibe_ota_policy.h"
 #include "vibe_power_policy.h"
 #include "vibe_recording_policy.h"
+#include "vibe_settings.h"
 #include "vibe_wifi_policy.h"
 #include "vibe_wav.h"
 
@@ -110,6 +111,33 @@ static void test_power_policy(void)
                                                         300, 1, 299));
     assert(!vibe_power_policy_should_attempt_deep_sleep(true, false, false,
                                                          300, 1, 299));
+}
+
+static void test_settings_policy(void)
+{
+    assert(vibe_settings_sleep_minutes_valid(1));
+    assert(vibe_settings_sleep_minutes_valid(2));
+    assert(vibe_settings_sleep_minutes_valid(5));
+    assert(vibe_settings_sleep_minutes_valid(10));
+    assert(!vibe_settings_sleep_minutes_valid(0));
+    assert(!vibe_settings_sleep_minutes_valid(3));
+    assert(vibe_settings_sleep_minutes_sanitize(3) == 5);
+    assert(vibe_settings_next_sleep_minutes(1) == 2);
+    assert(vibe_settings_next_sleep_minutes(2) == 5);
+    assert(vibe_settings_next_sleep_minutes(5) == 10);
+    assert(vibe_settings_next_sleep_minutes(10) == 1);
+    assert(vibe_settings_next_sleep_minutes(99) == 10);
+    assert(vibe_settings_sleep_timeout_ms(1) == 60000);
+    assert(vibe_settings_sleep_timeout_ms(10) == 600000);
+    assert(vibe_settings_sleep_timeout_ms(0) == 300000);
+    assert(vibe_settings_next_page(VIBE_SETTINGS_PAGE_MODE) ==
+           VIBE_SETTINGS_PAGE_SLEEP);
+    assert(vibe_settings_next_page(VIBE_SETTINGS_PAGE_SLEEP) ==
+           VIBE_SETTINGS_PAGE_VERSION);
+    assert(vibe_settings_next_page(VIBE_SETTINGS_PAGE_VERSION) ==
+           VIBE_SETTINGS_PAGE_MODE);
+    assert(vibe_settings_next_page(VIBE_SETTINGS_PAGE_COUNT) ==
+           VIBE_SETTINGS_PAGE_MODE);
 }
 
 static void test_bridge_identity_policy(void)
@@ -250,6 +278,7 @@ int main(void)
     test_followup_window();
     test_recording_upload_stats();
     test_power_policy();
+    test_settings_policy();
     test_bridge_identity_policy();
     test_wifi_profile_policy();
     test_wav_payload_policy();

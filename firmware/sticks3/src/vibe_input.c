@@ -25,6 +25,8 @@ DEFINE_INPUT_ADAPTER(front_long_adapter, front_long)
 DEFINE_INPUT_ADAPTER(front_confirm_adapter, front_confirm)
 DEFINE_INPUT_ADAPTER(front_up_adapter, front_up)
 DEFINE_INPUT_ADAPTER(side_up_adapter, side_up)
+DEFINE_INPUT_ADAPTER(side_single_adapter, side_single)
+DEFINE_INPUT_ADAPTER(side_double_adapter, side_double)
 DEFINE_INPUT_ADAPTER(side_mode_adapter, side_mode_hold)
 DEFINE_INPUT_ADAPTER(side_calibration_adapter, side_calibration_hold)
 
@@ -96,6 +98,14 @@ esp_err_t vibe_input_init(const vibe_input_config_t *config,
                             side, BUTTON_PRESS_UP, NULL,
                             side_up_adapter, NULL),
                         TAG, "side up");
+    ESP_RETURN_ON_ERROR(iot_button_register_cb(
+                            side, BUTTON_SINGLE_CLICK, NULL,
+                            side_single_adapter, NULL),
+                        TAG, "side single");
+    ESP_RETURN_ON_ERROR(iot_button_register_cb(
+                            side, BUTTON_DOUBLE_CLICK, NULL,
+                            side_double_adapter, NULL),
+                        TAG, "side double");
     button_event_args_t side_mode = {
         .long_press = {.press_time = config->side_mode_ms},
     };

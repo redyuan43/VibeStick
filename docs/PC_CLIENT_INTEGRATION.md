@@ -50,9 +50,8 @@ M5_VOICE_BRIDGE_TOKEN=<desk-token>
 ```
 
 `GET /health` should return the configured `bridge_id` and requires the token
-when one is configured. A side-button single click first checks the NVS-backed
-known bridge list with a short health timeout and switches to the next reachable
-profile. It also starts one background `/24` discovery pass when a scan is not
+when one is configured. A quick side-button double-click starts one background
+`/24` discovery pass when a scan is not
 already running. Legacy bridges without
 `bridge_id`, and bridges still using the generic default ID, receive an
 IP-derived local identity so multiple instances remain distinguishable.
@@ -60,13 +59,13 @@ Recording stays bound to the selected profile for the entire session.
 
 `VIBE_STICK_BRIDGE_PROFILES` remains the fallback list and supplies known
 tokens for authenticated discovery. Once a scan succeeds, future IP additions
-or changes do not require another firmware build; press the side button to
+or changes do not require another firmware build; quickly double-click the side button to
 refresh the NVS-backed list.
 
 Discovery first performs a short TCP port probe across the subnet, then sends
 `GET /health` only to hosts that accept the bridge port. Background discovery
 merges each newly found or changed profile into NVS as it is found, so another
-side-button click during the same scan can use the growing known list. Discovery
+side-button double-click during the same scan can use the growing known list. Discovery
 does not automatically move away from the active target. If no target is
 currently available and the user explicitly starts discovery with the side
 button, the first discovered bridge can become the selected target. While
@@ -103,6 +102,12 @@ unknown instead of empty.
 The firmware records on the M5Stack microphone and uploads raw PCM to the PC
 bridge. The PC bridge must not assume the desktop microphone is the source.
 
+The first accepted PCM chunk is the boundary between device startup and live
+streaming. The PC client waits up to 12 seconds for that first chunk and starts
+realtime ASR only after it is persisted. During live streaming, 10 seconds
+without accepted audio or a new upload attempt is treated as a stalled stream.
+StickS3 uses a 5-second HTTP timeout per chunk with up to three attempts.
+
 Start:
 
 ```text
@@ -117,21 +122,24 @@ Example:
   "event": "button_long_start",
   "source": "stickc_plus",
   "audio_source": "stickc_plus_pcm",
-  "session_id": "firmware-generated-id"
+  "session_id": "firmware-generated-id",
+  "protocol_version": 2
 }
 ```
 
 Audio chunks:
 
 ```text
-POST /recording/audio?session_id=<id>&append=1
+POST /recording/audio?session_id=<id>&chunk_id=<zero-based>&chunk_crc32=<crc32>
 Content-Type: application/octet-stream
 X-Vibe-Stick-Sample-Rate: 16000
 X-Vibe-Stick-Channels: 1
 X-Vibe-Stick-Bits-Per-Sample: 16
 ```
 
-Payload format is raw little-endian signed 16-bit mono PCM at 16 kHz.
+Payload format is raw little-endian signed 16-bit mono PCM at 16 kHz. The
+bridge verifies and persists each chunk before acknowledging it. Reusing the
+same chunk ID is an idempotent retry; gaps and CRC mismatches are rejected.
 
 Stop:
 
@@ -146,13 +154,19 @@ Example:
 {
   "event": "button_long_stop",
   "source": "stickc_plus",
-  "paste": true
+  "paste": true,
+  "total_chunks": 42,
+  "total_bytes": 322560,
+  "upload_failed": false
 }
 ```
 
 The bridge should finalize the PCM stream as WAV, run ASR, then paste the result
 into the target desktop app if `paste` is true. For Vibe Coding workflows, keep
 the target window stable from recording start through paste injection.
+
+The CapsWriter bridge accepts up to four isolated recording sessions. PCM is
+never mixed between session IDs; completed sessions are sent to ASR serially.
 
 Common event names:
 
