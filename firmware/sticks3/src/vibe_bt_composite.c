@@ -30,6 +30,7 @@
 #define RECONNECT_TASK_PERIOD_MS 250
 #define RECONNECT_REQUEST_GAP_MS 1000
 #define RECONNECT_INITIAL_DELAY_MS 5000
+#define HFP_AFTER_HID_STABLE_MS 3000
 #define RECONNECT_ATTEMPT_TIMEOUT_MS 8000
 #define RECONNECT_BACKOFF_MAX_MS 30000
 
@@ -267,6 +268,17 @@ static void hid_callback(void *arg, esp_event_base_t base, int32_t id,
         s_hid_connecting = false;
         if (hid_connected) {
             s_hid_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+            /*
+             * BlueZ still tears down the old HID/RFCOMM state briefly after a
+             * deep-sleep wake.  Starting HFP immediately here intermittently
+             * causes a page timeout, so make the two profiles a deliberate
+             * two-stage reconnect.
+             */
+            if (!s_state.hfp_connected) {
+                s_hfp_connecting = false;
+                s_hfp_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+                s_hfp_retry_at_ms = now_ms() + HFP_AFTER_HID_STABLE_MS;
+            }
         } else {
             schedule_hid_retry(now_ms(), false);
         }
@@ -366,13 +378,7 @@ static uint32_t hfp_outgoing_audio(uint8_t *buffer, uint32_t length)
         return 0;
     }
     size_t copied = s_pcm_reader(buffer, length, s_pcm_context);
-    if (copied == 0) {
-        return 0;
-    }
-    if (copied < length) {
-        memset(buffer + copied, 0, length - copied);
-    }
-    return length;
+    return copied;
 }
 
 static void audio_pump_task(void *arg)
@@ -416,7 +422,8 @@ static void reconnect_task(void *arg)
                 s_last_reconnect_request_ms = current_ms;
                 connect_hid = true;
                 memcpy(address, s_reconnect_address, sizeof(address));
-            } else if (s_hfp_ready && !s_state.hfp_connected &&
+            } else if (s_state.hid_connected && s_hfp_ready &&
+                       !s_state.hfp_connected &&
                        !s_hfp_connecting &&
                        current_ms >= s_hfp_retry_at_ms) {
                 s_hfp_connecting = true;

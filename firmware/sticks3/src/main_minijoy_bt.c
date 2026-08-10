@@ -50,6 +50,7 @@
 #define MINIJOY_LED_MICROPHONE 0x400000
 #define MINIJOY_LED_JOYSTICK 0x004000
 #define STARTUP_PAIRING_DELAY_MS 1000
+#define PAIRING_DISCOVERABILITY_REFRESH_MS 5000
 #define CONFIRM_WINDOW_MS 5000
 #define PTT_RELEASE_AUDIO_TAIL_MS 350
 #define STARTUP_OTA_HOLD_MS 600
@@ -58,6 +59,7 @@
 #define OTA_TASK_STACK_BYTES 8192
 #define DEEP_SLEEP_IDLE_MS 600000
 #define DEEP_SLEEP_RETRY_MS 5000
+#define DEEP_SLEEP_POWERED_RECHECK_MS 60000
 #define WAKE_RELEASE_STABLE_MS 80
 #define IMU_READ_ERROR_LIMIT 5
 #define AIR_MOUSE_CALIBRATION_LOG_MS 1000
@@ -119,6 +121,7 @@ static bool s_minijoy_button_down;
 static bool s_joystick_motion_active;
 static int64_t s_minijoy_retry_ms;
 static int64_t s_pairing_deadline_ms;
+static int64_t s_pairing_discoverability_refresh_ms;
 static int64_t s_startup_pairing_due_ms;
 static int64_t s_pairing_led_toggle_ms;
 static int64_t s_joystick_led_until_ms;
@@ -912,6 +915,8 @@ static void start_pairing_window(uint32_t seconds, bool clear_bonds,
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
     s_pairing_deadline_ms = now_ms() + (int64_t)seconds * 1000;
+    s_pairing_discoverability_refresh_ms = now_ms() +
+        PAIRING_DISCOVERABILITY_REFRESH_MS;
     s_startup_pairing_due_ms = 0;
     s_pairing_led_toggle_ms = 0;
     vibe_bt_status_ui_set(VIBE_BT_UI_PAIRING, s_minijoy_ready);
@@ -1293,8 +1298,28 @@ static esp_err_t configure_deep_sleep_wake_sources(void)
         1ULL << VIBE_BOARD_PIN_BUTTON_SIDE, ESP_EXT1_WAKEUP_ALL_LOW);
 }
 
+static bool external_power_blocks_deep_sleep(void)
+{
+    bool usb_powered = false;
+    esp_err_t err = vibe_board_usb_powered(&usb_powered);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "deep sleep deferred: external power status unavailable: %s",
+                 esp_err_to_name(err));
+        return true;
+    }
+    if (usb_powered) {
+        ESP_LOGI(TAG,
+                 "deep sleep deferred: external power keeps Bluetooth and audio active");
+    }
+    return usb_powered;
+}
+
 static bool enter_deep_sleep(void)
 {
+    if (external_power_blocks_deep_sleep()) {
+        return false;
+    }
     if (gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0 ||
         gpio_get_level(VIBE_BOARD_PIN_BUTTON_SIDE) == 0) {
         ESP_LOGW(TAG, "deep sleep deferred: wake button is active");
@@ -1359,6 +1384,11 @@ static void maybe_enter_deep_sleep(int64_t current_ms)
         deep_sleep_has_active_work(current_ms) ||
         (s_next_deep_sleep_attempt_ms > 0 &&
          current_ms < s_next_deep_sleep_attempt_ms)) {
+        return;
+    }
+    if (external_power_blocks_deep_sleep()) {
+        s_next_deep_sleep_attempt_ms =
+            current_ms + DEEP_SLEEP_POWERED_RECHECK_MS;
         return;
     }
     s_next_deep_sleep_attempt_ms = current_ms + DEEP_SLEEP_RETRY_MS;
@@ -1538,12 +1568,21 @@ void app_main(void)
             s_startup_pairing_due_ms = 0;
             ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
             s_pairing_deadline_ms = current_ms + PAIRING_WINDOW_MS;
+            s_pairing_discoverability_refresh_ms = current_ms +
+                PAIRING_DISCOVERABILITY_REFRESH_MS;
             s_pairing_led_toggle_ms = 0;
             ESP_LOGI(TAG, "startup pairing window started");
         }
         if (s_pairing_deadline_ms > 0 && current_ms >= s_pairing_deadline_ms) {
             vibe_bt_composite_end_pairing();
             s_pairing_deadline_ms = 0;
+            s_pairing_discoverability_refresh_ms = 0;
+        } else if (s_pairing_discoverability_refresh_ms > 0 &&
+                   current_ms >= s_pairing_discoverability_refresh_ms) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_composite_begin_pairing());
+            s_pairing_discoverability_refresh_ms = current_ms +
+                PAIRING_DISCOVERABILITY_REFRESH_MS;
+            ESP_LOGI(TAG, "refreshed pairing discoverability");
         }
         update_status();
         update_status_leds(current_ms);

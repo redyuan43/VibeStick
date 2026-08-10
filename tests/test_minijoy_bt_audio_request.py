@@ -4,6 +4,7 @@ from pathlib import Path
 MAIN_SOURCE = Path("firmware/sticks3/src/main_minijoy_bt.c").read_text()
 COMPOSITE_SOURCE = Path("firmware/sticks3/src/vibe_bt_composite.c").read_text()
 COMPOSITE_HEADER = Path("firmware/sticks3/include/vibe_bt_composite.h").read_text()
+OTA_PUBLISHER = Path("scripts/ota_publish.py").read_text()
 
 
 def _function(source: str, signature: str, next_signature: str) -> str:
@@ -46,15 +47,43 @@ def test_deep_sleep_gracefully_disconnects_profiles_before_power_off() -> None:
     assert "return false;" in bluetooth_prepare
 
 
-def test_usb_power_does_not_block_deep_sleep() -> None:
+def test_usb_power_blocks_sleep_before_bluetooth_or_audio_disconnect() -> None:
+    power_guard = _function(
+        MAIN_SOURCE,
+        "static bool external_power_blocks_deep_sleep(void)",
+        "static bool enter_deep_sleep(void)",
+    )
+    enter_sleep = _function(
+        MAIN_SOURCE,
+        "static bool enter_deep_sleep(void)",
+        "static void maybe_enter_deep_sleep",
+    )
+
+    assert "vibe_board_usb_powered(&usb_powered)" in power_guard
+    assert "if (err != ESP_OK)" in power_guard
+    assert "return true;" in power_guard
+    assert "return usb_powered;" in power_guard
+    assert enter_sleep.index("external_power_blocks_deep_sleep()") < enter_sleep.index(
+        "vibe_audio_prepare_deep_sleep()"
+    )
+    assert enter_sleep.index("external_power_blocks_deep_sleep()") < enter_sleep.index(
+        "vibe_bt_composite_prepare_deep_sleep(1200)"
+    )
     maybe_sleep = _function(
         MAIN_SOURCE,
         "static void maybe_enter_deep_sleep(int64_t current_ms)",
         "static esp_err_t init_nvs",
     )
+    assert "DEEP_SLEEP_POWERED_RECHECK_MS 60000" in MAIN_SOURCE
+    assert "current_ms + DEEP_SLEEP_POWERED_RECHECK_MS" in maybe_sleep
 
-    assert "vibe_board_usb_powered" not in maybe_sleep
-    assert "enter_deep_sleep();" in maybe_sleep
+
+def test_se_minijoy_ota_target_has_an_independent_manifest() -> None:
+    assert '"stickc_plus_se_minijoy_bt"' in OTA_PUBLISHER
+    assert (
+        '"stickc_plus_se_minijoy_bt": '
+        '"VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_MINIJOY_BT"'
+    ) in OTA_PUBLISHER
 
 
 def test_serial_sleep_uses_the_production_deep_sleep_path() -> None:
