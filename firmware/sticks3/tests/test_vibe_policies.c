@@ -119,17 +119,18 @@ static void test_settings_policy(void)
     assert(vibe_settings_sleep_minutes_valid(2));
     assert(vibe_settings_sleep_minutes_valid(5));
     assert(vibe_settings_sleep_minutes_valid(10));
-    assert(!vibe_settings_sleep_minutes_valid(0));
+    assert(vibe_settings_sleep_minutes_valid(0));
     assert(!vibe_settings_sleep_minutes_valid(3));
     assert(vibe_settings_sleep_minutes_sanitize(3) == 5);
     assert(vibe_settings_next_sleep_minutes(1) == 2);
     assert(vibe_settings_next_sleep_minutes(2) == 5);
     assert(vibe_settings_next_sleep_minutes(5) == 10);
-    assert(vibe_settings_next_sleep_minutes(10) == 1);
+    assert(vibe_settings_next_sleep_minutes(10) == 0);
+    assert(vibe_settings_next_sleep_minutes(0) == 1);
     assert(vibe_settings_next_sleep_minutes(99) == 10);
     assert(vibe_settings_sleep_timeout_ms(1) == 60000);
     assert(vibe_settings_sleep_timeout_ms(10) == 600000);
-    assert(vibe_settings_sleep_timeout_ms(0) == 300000);
+    assert(vibe_settings_sleep_timeout_ms(0) == 0);
     assert(vibe_settings_next_page(VIBE_SETTINGS_PAGE_MODE) ==
            VIBE_SETTINGS_PAGE_SLEEP);
     assert(vibe_settings_next_page(VIBE_SETTINGS_PAGE_SLEEP) ==
@@ -262,6 +263,14 @@ static void test_wav_payload_policy(void)
                                 &pcm, &pcm_len));
     assert(pcm == wav + 44);
     assert(pcm_len == 4);
+    size_t pcm_offset = 0;
+    size_t stream_pcm_len = 0;
+    assert(vibe_wav_pcm_stream_info(wav, 44, sizeof(wav), 16000, 1, 16,
+                                    &pcm_offset, &stream_pcm_len));
+    assert(pcm_offset == 44);
+    assert(stream_pcm_len == 4);
+    assert(!vibe_wav_pcm_stream_info(wav, 36, sizeof(wav), 16000, 1, 16,
+                                     &pcm_offset, &stream_pcm_len));
 
     wav[22] = 2;
     assert(!vibe_wav_pcm_payload(wav, sizeof(wav), 16000, 1, 16,

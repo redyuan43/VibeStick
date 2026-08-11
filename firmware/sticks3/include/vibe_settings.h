@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define VIBE_SETTINGS_DEFAULT_SLEEP_MINUTES 5
+#define VIBE_SETTINGS_SLEEP_DISABLED_MINUTES 0
 
 typedef enum {
     VIBE_SETTINGS_PAGE_MODE = 0,

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 
-BOARDS = {"sticks3", "stickc_plus", "stickc_plus_se"}
+BOARDS = {"sticks3", "cardputer_adv", "stickc_plus", "stickc_plus_se"}
 
 
 def repo_root() -> Path:
@@ -92,6 +92,7 @@ def firmware_version(board: str) -> str:
         return ""
     macro = {
         "sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3",
+        "cardputer_adv": "VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV",
         "stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS",
         "stickc_plus_se": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE",
     }[board]

@@ -12,6 +12,7 @@
 #include "vibe_board_profile.h"
 #include "vibe_bridge_profile_policy.h"
 #include "vibe_input.h"
+#include "vibe_keyboard.h"
 #include "vibe_motion.h"
 #include "vibe_ota_policy.h"
 #include "vibe_power_policy.h"
@@ -66,8 +67,18 @@
 #define LCD_X_GAP VIBE_BOARD_LCD_X_GAP
 #define LCD_Y_GAP VIBE_BOARD_LCD_Y_GAP
 #define LCD_PIXEL_CLOCK_HZ VIBE_BOARD_LCD_PIXEL_CLOCK_HZ
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+// Match M5GFX exactly: GPIO38 controls the Cardputer-Adv TFT/backlight rail.
+#define LCD_BACKLIGHT_PWM_HZ 256
+#define LCD_BACKLIGHT_PWM_TIMER LEDC_TIMER_3
+#define LCD_BACKLIGHT_PWM_CHANNEL LEDC_CHANNEL_7
+#define LCD_BACKLIGHT_PWM_RESOLUTION LEDC_TIMER_9_BIT
+#else
 #define LCD_BACKLIGHT_PWM_HZ 5000
-#define LCD_BACKLIGHT_PWM_MAX 255
+#define LCD_BACKLIGHT_PWM_TIMER LEDC_TIMER_0
+#define LCD_BACKLIGHT_PWM_CHANNEL LEDC_CHANNEL_0
+#define LCD_BACKLIGHT_PWM_RESOLUTION LEDC_TIMER_8_BIT
+#endif
 #define LCD_BACKLIGHT_DEFAULT VIBE_BOARD_LCD_BACKLIGHT_DEFAULT
 #define LCD_BACKLIGHT_IDLE VIBE_BOARD_LCD_BACKLIGHT_IDLE
 #define LCD_BACKLIGHT_OFF VIBE_BOARD_LCD_BACKLIGHT_OFF
@@ -104,6 +115,10 @@
 #define VIBE_STICK_DEEP_SLEEP_RETRY_MS 5000
 #define VIBE_STICK_DEEP_SLEEP_DIAGNOSTIC_REPORT_MS 30000
 #define VIBE_STICK_SETTINGS_TIMEOUT_MS 30000
+#define CARD_FN_CLICK_WINDOW_MS 180
+#define CARD_KEYBOARD_REPORT_QUEUE_LENGTH 64
+#define CARD_KEYBOARD_REPORT_TIMEOUT_MS 700
+#define CARD_KEYBOARD_HEARTBEAT_MS 250
 #define VIBE_STICK_MOTION_WAKE_QUIET_MS 5000
 #define VIBE_STICK_MOTION_WAKE_SETTLE_TIMEOUT_MS 15000
 #define VIBE_STICK_MOTION_WAKE_NETWORK_TIMEOUT_MS 15000
@@ -180,6 +195,7 @@
 #define BRIDGE_PROFILE_STORE_KEY "profiles"
 #define BRIDGE_PROFILE_STORE_MAGIC 0x56424250u
 #define BRIDGE_PROFILE_STORE_VERSION 1
+#define CARD_SETUP_MANUAL_BRIDGE_ID "cardputer-manual"
 #define BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS 250
 #define BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE 6
 #define BRIDGE_DISCOVERY_HEALTH_TIMEOUT_MS 900
@@ -204,7 +220,13 @@ typedef struct {
     { { VIBE_STICK_WIFI_SSID, VIBE_STICK_WIFI_PASSWORD } }
 #endif
 
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static const vibe_wifi_profile_t k_configured_wifi_profiles[] = {
+    {VIBE_STICK_CARDPUTER_WIFI_SSID, VIBE_STICK_CARDPUTER_WIFI_PASSWORD},
+};
+#else
 static const vibe_wifi_profile_t k_configured_wifi_profiles[] = VIBE_STICK_WIFI_PROFILES;
+#endif
 
 #ifndef VIBE_STICK_BRIDGE_PROFILES
 #define VIBE_STICK_BRIDGE_PROFILES \
@@ -212,7 +234,19 @@ static const vibe_wifi_profile_t k_configured_wifi_profiles[] = VIBE_STICK_WIFI_
         VIBE_STICK_BRIDGE_PORT, VIBE_STICK_BRIDGE_TOKEN } }
 #endif
 
-static const bridge_profile_config_t k_configured_bridge_profiles[] = VIBE_STICK_BRIDGE_PROFILES;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+#define VIBE_STICK_DEFAULT_BRIDGE_HOST "192.168.100.142"
+#define VIBE_STICK_DEFAULT_BRIDGE_PORT 8765
+static const bridge_profile_config_t k_configured_bridge_profiles[] = {
+    {VIBE_STICK_BRIDGE_ID, VIBE_STICK_BRIDGE_LABEL,
+     VIBE_STICK_DEFAULT_BRIDGE_HOST, VIBE_STICK_DEFAULT_BRIDGE_PORT, ""},
+};
+#else
+#define VIBE_STICK_DEFAULT_BRIDGE_HOST VIBE_STICK_BRIDGE_HOST
+#define VIBE_STICK_DEFAULT_BRIDGE_PORT VIBE_STICK_BRIDGE_PORT
+static const bridge_profile_config_t k_configured_bridge_profiles[] =
+    VIBE_STICK_BRIDGE_PROFILES;
+#endif
 _Static_assert(sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]) > 0,
                "at least one bridge profile is required");
 _Static_assert(sizeof(k_configured_bridge_profiles) / sizeof(k_configured_bridge_profiles[0]) <=
@@ -377,10 +411,38 @@ typedef enum {
     BRIDGE_SELECTION_UI_CONFIRMED,
 } bridge_selection_ui_phase_t;
 
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+typedef enum {
+    CARD_SETUP_WIFI_SSID = 0,
+    CARD_SETUP_WIFI_PASSWORD,
+    CARD_SETUP_BRIDGE_HOST,
+    CARD_SETUP_BRIDGE_PORT,
+    CARD_SETUP_BRIDGE_TOKEN,
+    CARD_SETUP_FIELD_COUNT,
+} card_setup_field_t;
+
+typedef struct {
+    char wifi_ssid[WIFI_PROFILE_SSID_LEN];
+    char wifi_password[WIFI_PROFILE_PASSWORD_LEN];
+    char bridge_host[BRIDGE_TARGET_HOST_LEN];
+    char bridge_port[12];
+    char bridge_token[BRIDGE_TARGET_TOKEN_LEN];
+} card_setup_draft_t;
+
+typedef struct {
+    uint8_t modifiers;
+    uint8_t keys[6];
+    uint8_t key_count;
+} card_keyboard_report_t;
+#endif
+
 static QueueHandle_t s_event_queue;
 static QueueHandle_t s_bridge_control_queue;
 static SemaphoreHandle_t s_lvgl_lock;
 static atomic_bool s_wifi_connected;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static bool s_wifi_started;
+#endif
 static vibe_wifi_profile_t s_wifi_profiles[WIFI_PROFILE_MAX_COUNT];
 static size_t s_wifi_profile_count;
 static size_t s_wifi_profile_index;
@@ -409,8 +471,8 @@ static atomic_bool s_front_bridge_gesture_confirmed;
 static atomic_int_fast64_t s_bridge_selection_entry_deadline_ms;
 static atomic_int_fast64_t s_front_bridge_click_suppress_until_ms;
 static bridge_target_t s_bridge_target = {
-    .host = VIBE_STICK_BRIDGE_HOST,
-    .port = VIBE_STICK_BRIDGE_PORT,
+    .host = VIBE_STICK_DEFAULT_BRIDGE_HOST,
+    .port = VIBE_STICK_DEFAULT_BRIDGE_PORT,
     .profile_index = 0,
     .profile_id = VIBE_STICK_BRIDGE_ID,
     .source = "boot",
@@ -560,6 +622,29 @@ static lv_obj_t *s_recording_wave_group;
 static lv_obj_t *s_recording_wave_bars[5];
 static lv_obj_t *s_recording_title;
 static lv_obj_t *s_recording_hint;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static bool s_card_setup_active;
+static card_setup_field_t s_card_setup_field;
+static card_setup_draft_t s_card_setup_draft;
+static char s_card_setup_error[48];
+static lv_obj_t *s_card_home_hint;
+static lv_obj_t *s_card_setup_layer;
+static lv_obj_t *s_card_setup_title;
+static lv_obj_t *s_card_setup_field_label;
+static lv_obj_t *s_card_setup_value;
+static lv_obj_t *s_card_setup_hint;
+static QueueHandle_t s_card_keyboard_report_queue;
+static uint8_t s_card_host_usages[4][14];
+static uint8_t s_card_host_modifiers;
+static bool s_card_local_consumed[4][14];
+static esp_timer_handle_t s_card_fn_long_timer;
+static esp_timer_handle_t s_card_fn_confirm_timer;
+static esp_timer_handle_t s_card_fn_click_timer;
+static atomic_bool s_card_fn_down;
+static atomic_bool s_card_fn_chord;
+static atomic_bool s_card_fn_button_committed;
+static atomic_int s_card_fn_pending_clicks;
+#endif
 
 static bool wifi_connected(void)
 {
@@ -671,6 +756,7 @@ static provider_display_state_t s_provider_states[PROVIDER_COUNT] = {
 };
 
 #define FONT_ASCII (&lv_font_montserrat_10)
+#define FONT_UI FONT_ASCII
 
 static const agent_provider_config_t s_provider_configs[] = {
     {
@@ -725,6 +811,10 @@ static void clear_ptt_followup_enter_window(void);
 static bool start_ptt_followup_key_dispatch(const char *event_name, agent_sound_t sound);
 static void show_recording_overlay(const char *title, const char *hint, bool visible);
 static void post_deep_sleep_diagnostic(const char *reason);
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static void card_setup_enter(void);
+static void card_keyboard_event(const vibe_key_event_t *event, void *context);
+#endif
 
 static bool queue_event(agent_event_type_t type)
 {
@@ -1343,8 +1433,17 @@ static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t 
 static void set_backlight(uint8_t brightness)
 {
 #if VIBE_BOARD_HAS_GPIO_BACKLIGHT
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, brightness);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    uint32_t duty = brightness;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    if (brightness != 0) {
+        const uint32_t offset = (16U * 259U) >> 8;
+        duty = brightness * (257U - offset) + offset * 255U;
+        duty += 1U << 6;
+        duty >>= 7;
+    }
+#endif
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LCD_BACKLIGHT_PWM_CHANNEL, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LCD_BACKLIGHT_PWM_CHANNEL);
 #else
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_set_lcd_brightness(brightness));
 #endif
@@ -1698,9 +1797,21 @@ static bool wait_for_motion_wake_idle(void)
 }
 #endif
 
+static gpio_num_t sleep_button_wake_gpio(void)
+{
+#if VIBE_BOARD_HAS_FRONT_BUTTON
+    return VIBE_BOARD_PIN_BUTTON_FRONT;
+#elif VIBE_BOARD_HAS_SIDE_BUTTON
+    return VIBE_BOARD_PIN_BUTTON_SIDE;
+#else
+    return GPIO_NUM_NC;
+#endif
+}
+
 static uint64_t sleep_button_wake_mask(void)
 {
-    return 1ULL << VIBE_BOARD_PIN_BUTTON_FRONT;
+    const gpio_num_t gpio = sleep_button_wake_gpio();
+    return gpio == GPIO_NUM_NC ? 0 : 1ULL << gpio;
 }
 
 #if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
@@ -1720,12 +1831,22 @@ static esp_err_t configure_motion_wake_gpio_input(void)
 #if !defined(CONFIG_IDF_TARGET_ESP32)
 static esp_err_t configure_deep_sleep_button_pullups(uint64_t wake_mask)
 {
+#if VIBE_BOARD_HAS_FRONT_BUTTON
     if ((wake_mask & (1ULL << VIBE_BOARD_PIN_BUTTON_FRONT)) != 0) {
         ESP_RETURN_ON_ERROR(rtc_gpio_pullup_en(VIBE_BOARD_PIN_BUTTON_FRONT),
                             TAG, "front wake pull-up");
         ESP_RETURN_ON_ERROR(rtc_gpio_pulldown_dis(VIBE_BOARD_PIN_BUTTON_FRONT),
                             TAG, "front wake pull-down");
     }
+#endif
+#if !VIBE_BOARD_HAS_FRONT_BUTTON && VIBE_BOARD_HAS_SIDE_BUTTON
+    if ((wake_mask & (1ULL << VIBE_BOARD_PIN_BUTTON_SIDE)) != 0) {
+        ESP_RETURN_ON_ERROR(rtc_gpio_pullup_en(VIBE_BOARD_PIN_BUTTON_SIDE),
+                            TAG, "side wake pull-up");
+        ESP_RETURN_ON_ERROR(rtc_gpio_pulldown_dis(VIBE_BOARD_PIN_BUTTON_SIDE),
+                            TAG, "side wake pull-down");
+    }
+#endif
 #if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
     if ((wake_mask & (1ULL << VIBE_BOARD_PIN_MOTION_WAKE)) != 0) {
         ESP_RETURN_ON_ERROR(rtc_gpio_pullup_en(VIBE_BOARD_PIN_MOTION_WAKE),
@@ -1881,7 +2002,7 @@ static esp_err_t save_deep_sleep_record(uint64_t wake_mask)
 static bool enter_deep_sleep(void)
 {
     uint64_t wake_mask = sleep_button_wake_mask();
-    gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;
+    gpio_num_t ext0_gpio = sleep_button_wake_gpio();
 #if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
     const bool motion_wake_enabled =
         s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK &&
@@ -2006,6 +2127,13 @@ static bool enter_deep_sleep(void)
 
 static void maybe_enter_deep_sleep(int64_t now_ms)
 {
+#if !VIBE_BOARD_HAS_AUTOMATIC_DEEP_SLEEP
+    (void)now_ms;
+    return;
+#else
+    if (s_sleep_minutes == VIBE_SETTINGS_SLEEP_DISABLED_MINUTES) {
+        return;
+    }
     const bool false_wake_sleep_due =
         s_motion_false_wake_sleep_deadline_ms != 0 &&
         now_ms >= s_motion_false_wake_sleep_deadline_ms;
@@ -2056,6 +2184,7 @@ static void maybe_enter_deep_sleep(int64_t now_ms)
             post_deep_sleep_diagnostic(s_deep_sleep_block_reason);
         }
     }
+#endif
 }
 
 static const char *wake_cause_label(esp_sleep_wakeup_cause_t cause)
@@ -2116,8 +2245,8 @@ static void init_backlight(void)
 #if VIBE_BOARD_HAS_GPIO_BACKLIGHT
     ledc_timer_config_t timer = {
         .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = LEDC_TIMER_0,
-        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LCD_BACKLIGHT_PWM_TIMER,
+        .duty_resolution = LCD_BACKLIGHT_PWM_RESOLUTION,
         .freq_hz = LCD_BACKLIGHT_PWM_HZ,
         .clk_cfg = LEDC_USE_XTAL_CLK,
     };
@@ -2125,12 +2254,15 @@ static void init_backlight(void)
     ledc_channel_config_t channel = {
         .gpio_num = VIBE_BOARD_LCD_BACKLIGHT_GPIO,
         .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_0,
-        .timer_sel = LEDC_TIMER_0,
+        .channel = LCD_BACKLIGHT_PWM_CHANNEL,
+        .timer_sel = LCD_BACKLIGHT_PWM_TIMER,
         .duty = 0,
         .hpoint = 0,
     };
     ESP_ERROR_CHECK(ledc_channel_config(&channel));
+    ESP_LOGI(TAG, "backlight gpio=%d frequency=%dHz resolution=%d-bit",
+             VIBE_BOARD_LCD_BACKLIGHT_GPIO, LCD_BACKLIGHT_PWM_HZ,
+             LCD_BACKLIGHT_PWM_RESOLUTION);
 #endif
     set_backlight(LCD_BACKLIGHT_DEFAULT);
 }
@@ -2174,6 +2306,10 @@ static esp_err_t init_display(void)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "panel reset");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_panel, true), TAG, "panel invert");
+#if VIBE_BOARD_LCD_ROTATION == 1
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(s_panel, true), TAG, "panel swap xy");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(s_panel, true, false), TAG, "panel mirror");
+#endif
     ESP_RETURN_ON_ERROR(esp_lcd_panel_set_gap(s_panel, LCD_X_GAP, LCD_Y_GAP), TAG, "panel gap");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "panel on");
 
@@ -2536,16 +2672,33 @@ static void render_settings_visual(void)
                  s_settings_draft_trigger == RECORDING_TRIGGER_LIFT_TO_TALK
                      ? "LIFT"
                      : "PTT");
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        strlcpy(hint, "FN VALUE  GO PAGE\nHOLD FN SAVE", sizeof(hint));
+#else
         strlcpy(hint, "FRONT NEXT  HOLD SAVE", sizeof(hint));
+#endif
         break;
     case VIBE_SETTINGS_PAGE_SLEEP:
-        snprintf(title, sizeof(title), "SLEEP: %u MIN",
-                 (unsigned)s_settings_draft_sleep_minutes);
+        if (s_settings_draft_sleep_minutes ==
+            VIBE_SETTINGS_SLEEP_DISABLED_MINUTES) {
+            strlcpy(title, "SLEEP: OFF", sizeof(title));
+        } else {
+            snprintf(title, sizeof(title), "SLEEP: %u MIN",
+                     (unsigned)s_settings_draft_sleep_minutes);
+        }
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        strlcpy(hint, "FN VALUE  GO PAGE\nHOLD FN SAVE", sizeof(hint));
+#else
         strlcpy(hint, "FRONT NEXT  HOLD SAVE", sizeof(hint));
+#endif
         break;
     case VIBE_SETTINGS_PAGE_VERSION:
         snprintf(title, sizeof(title), "FW %s", FIRMWARE_VERSION);
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        snprintf(hint, sizeof(hint), "CARD %.11s", FIRMWARE_BUILD_ID);
+#else
         snprintf(hint, sizeof(hint), "STICKS3 %.11s", FIRMWARE_BUILD_ID);
+#endif
         break;
     default:
         s_settings_page = VIBE_SETTINGS_PAGE_MODE;
@@ -3020,11 +3173,16 @@ static void create_ui(void)
     lv_obj_align(s_intent_label, LV_ALIGN_TOP_MID, 12, 9);
 
     s_bridge_label = make_label(screen, "B CapsWriter", &lv_font_montserrat_10,
-                                 lv_color_hex(0x686e78), 128, LV_TEXT_ALIGN_CENTER);
+                                 lv_color_hex(0x686e78),
+                                 128,
+                                 LV_TEXT_ALIGN_CENTER);
     lv_label_set_long_mode(s_bridge_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_bridge_label, LV_ALIGN_BOTTOM_MID, 0, -20);
 
-    s_ip_label = make_label(screen, "IP --", &lv_font_montserrat_10, lv_color_hex(0x686e78), 128, LV_TEXT_ALIGN_CENTER);
+    s_ip_label = make_label(screen, "IP --", &lv_font_montserrat_10,
+                            lv_color_hex(0x686e78),
+                            128,
+                            LV_TEXT_ALIGN_CENTER);
     lv_obj_align(s_ip_label, LV_ALIGN_BOTTOM_MID, 0, -7);
 
     s_pet_image = lv_image_create(screen);
@@ -3071,6 +3229,16 @@ static void create_ui(void)
     s_pet_timer = lv_timer_create(pet_timer_cb, VIBE_STICK_PET_ACTIVE_TIMER_MS, NULL);
 #endif
 
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    s_card_home_hint = make_label(screen,
+                                  "Fn TAP TALK\nGO 2X SCAN\nGO HOLD SETUP",
+                                  FONT_UI,
+                                  lv_color_hex(0x8a9099), 120,
+                                  LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_height(s_card_home_hint, 50);
+    lv_obj_align(s_card_home_hint, LV_ALIGN_CENTER, 0, 55);
+#endif
+
     s_mode_switch_layer = lv_obj_create(screen);
     lv_obj_remove_style_all(s_mode_switch_layer);
     lv_obj_set_size(s_mode_switch_layer, LCD_H_RES, LCD_V_RES);
@@ -3110,14 +3278,49 @@ static void create_ui(void)
                                                   lv_color_hex(0xf4f5f7), LV_OPA_COVER, 3);
     }
 
-    s_recording_title = make_label(s_recording_overlay, "LISTENING", FONT_ASCII,
-                                   lv_color_hex(0xf4f5f7), 120, LV_TEXT_ALIGN_CENTER);
-    lv_obj_set_style_text_font(s_recording_title, FONT_ASCII, 0);
+    s_recording_title = make_label(s_recording_overlay, "LISTENING",
+                                   FONT_UI, lv_color_hex(0xf4f5f7), 120,
+                                   LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_style_text_font(s_recording_title, FONT_UI, 0);
     lv_obj_align(s_recording_title, LV_ALIGN_CENTER, 0, 22);
-    s_recording_hint = make_label(s_recording_overlay, "RELEASE TO SEND", FONT_ASCII,
-                                  lv_color_hex(0x8b9098), 120, LV_TEXT_ALIGN_CENTER);
-    lv_obj_set_style_text_font(s_recording_hint, FONT_ASCII, 0);
+    s_recording_hint = make_label(s_recording_overlay, "RELEASE SPACE TO SEND",
+                                  FONT_UI, lv_color_hex(0x8b9098), 120,
+                                  LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_style_text_font(s_recording_hint, FONT_UI, 0);
     lv_obj_align(s_recording_hint, LV_ALIGN_BOTTOM_MID, 0, -22);
+
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    s_card_setup_layer = lv_obj_create(screen);
+    lv_obj_set_size(s_card_setup_layer, LCD_H_RES, LCD_V_RES);
+    lv_obj_align(s_card_setup_layer, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(s_card_setup_layer, 0, 0);
+    lv_obj_set_style_bg_color(s_card_setup_layer, lv_color_hex(0x050608), 0);
+    lv_obj_set_style_bg_opa(s_card_setup_layer, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_card_setup_layer, 0, 0);
+    lv_obj_set_style_pad_all(s_card_setup_layer, 0, 0);
+    lv_obj_clear_flag(s_card_setup_layer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_card_setup_layer, LV_OBJ_FLAG_HIDDEN);
+
+    s_card_setup_title = make_label(s_card_setup_layer, "CONNECTION", FONT_UI,
+                                    lv_color_hex(0xf4f5f7), 115,
+                                    LV_TEXT_ALIGN_LEFT);
+    lv_obj_align(s_card_setup_title, LV_ALIGN_TOP_LEFT, 10, 8);
+    s_card_setup_field_label = make_label(s_card_setup_layer, "WI-FI SSID", FONT_UI,
+                                          lv_color_hex(0x93c5fd), 115,
+                                          LV_TEXT_ALIGN_LEFT);
+    lv_obj_align(s_card_setup_field_label, LV_ALIGN_TOP_LEFT, 10, 34);
+    s_card_setup_value = make_label(s_card_setup_layer, "_", FONT_UI,
+                                    lv_color_hex(0xf4f5f7), 115,
+                                    LV_TEXT_ALIGN_LEFT);
+    lv_obj_align(s_card_setup_value, LV_ALIGN_TOP_LEFT, 10, 61);
+    s_card_setup_hint = make_label(s_card_setup_layer,
+                                   "Tab NEXT\nEnter SAVE\nFn+` CANCEL",
+                                   FONT_UI, lv_color_hex(0x8a9099), 115,
+                                   LV_TEXT_ALIGN_LEFT);
+    lv_label_set_long_mode(s_card_setup_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_height(s_card_setup_hint, 58);
+    lv_obj_align(s_card_setup_hint, LV_ALIGN_BOTTOM_LEFT, 10, -9);
+#endif
 }
 
 static void render_state(void)
@@ -3173,11 +3376,11 @@ static void show_recording_overlay(const char *title, const char *hint, bool vis
     lvgl_lock();
     if (visible) {
         if (title) {
-            lv_obj_set_style_text_font(s_recording_title, FONT_ASCII, 0);
+            lv_obj_set_style_text_font(s_recording_title, FONT_UI, 0);
             lv_label_set_text(s_recording_title, title);
         }
         if (hint) {
-            lv_obj_set_style_text_font(s_recording_hint, FONT_ASCII, 0);
+            lv_obj_set_style_text_font(s_recording_hint, FONT_UI, 0);
             lv_label_set_text(s_recording_hint, hint);
             if (hint[0] == '\0') {
                 lv_obj_add_flag(s_recording_hint, LV_OBJ_FLAG_HIDDEN);
@@ -3570,12 +3773,9 @@ static esp_err_t bridge_profiles_load_nvs(const char *current_ssid)
     return ESP_OK;
 }
 
-static esp_err_t bridge_profiles_save_nvs(const char *expected_ssid)
+static esp_err_t bridge_profiles_save_nvs_for_ssid(const char *ssid)
 {
-    char current_ssid[WIFI_PROFILE_SSID_LEN] = {0};
-    current_wifi_ssid(current_ssid, sizeof(current_ssid));
-    if (current_ssid[0] == '\0' ||
-        !expected_ssid || strcmp(current_ssid, expected_ssid) != 0) {
+    if (!ssid || ssid[0] == '\0') {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -3592,7 +3792,7 @@ static esp_err_t bridge_profiles_save_nvs(const char *expected_ssid)
         return ESP_ERR_INVALID_STATE;
     }
     store->count = (uint16_t)s_discovered_bridge_profile_count;
-    strlcpy(store->ssid, current_ssid, sizeof(store->ssid));
+    strlcpy(store->ssid, ssid, sizeof(store->ssid));
     memcpy(store->profiles, s_discovered_bridge_profiles,
            s_discovered_bridge_profile_count * sizeof(store->profiles[0]));
     bridge_profiles_unlock();
@@ -3613,9 +3813,20 @@ static esp_err_t bridge_profiles_save_nvs(const char *expected_ssid)
     free(store);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "bridge profiles saved ssid=%s count=%u",
-                 current_ssid, (unsigned int)saved_count);
+                 ssid, (unsigned int)saved_count);
     }
     return err;
+}
+
+static esp_err_t bridge_profiles_save_nvs(const char *expected_ssid)
+{
+    char current_ssid[WIFI_PROFILE_SSID_LEN] = {0};
+    current_wifi_ssid(current_ssid, sizeof(current_ssid));
+    if (current_ssid[0] == '\0' || !expected_ssid ||
+        strcmp(current_ssid, expected_ssid) != 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return bridge_profiles_save_nvs_for_ssid(current_ssid);
 }
 
 static int bridge_profile_index_by_id(const char *id)
@@ -3693,8 +3904,11 @@ static bool bridge_target_needs_selection(void)
     bridge_target_t target;
     bridge_profile_snapshot_t profile;
     bridge_target_copy(&target);
-    return target.host[0] == '\0' || target.port <= 0 ||
-           !bridge_target_profile_snapshot(&target, &profile);
+    if (target.host[0] == '\0' || target.port <= 0 ||
+        !bridge_target_profile_snapshot(&target, &profile)) {
+        return true;
+    }
+    return strcmp(target.host, profile.host) != 0 || target.port != profile.port;
 }
 
 static esp_err_t bridge_target_load_nvs(void)
@@ -3983,6 +4197,10 @@ static bool bridge_probe_profile(const bridge_profile_config_t *profile, int tim
     cJSON *bridge_name = cJSON_GetObjectItemCaseSensitive(root, "bridge_name");
     cJSON *bridge_id = cJSON_GetObjectItemCaseSensitive(root, "bridge_id");
     bool generic_profile_id = strncmp(profile->id, "lan-", 4) == 0;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    generic_profile_id = generic_profile_id ||
+                         strcmp(profile->id, CARD_SETUP_MANUAL_BRIDGE_ID) == 0;
+#endif
     bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok) &&
                    cJSON_IsString(bridge_name) &&
                    vibe_bridge_health_name_supported(bridge_name->valuestring) &&
@@ -4464,6 +4682,174 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     return err;
 }
 
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+typedef struct {
+    bool has_carry;
+    uint8_t carry;
+} tts_pcm_stream_state_t;
+
+static esp_err_t write_tts_pcm_stream(tts_pcm_stream_state_t *state,
+                                      const uint8_t *data, size_t len)
+{
+    if (state->has_carry && len > 0) {
+        const uint8_t pair[2] = {state->carry, data[0]};
+        ESP_RETURN_ON_ERROR(vibe_audio_play_stream_write(pair, sizeof(pair)),
+                            TAG, "write TTS carry");
+        state->has_carry = false;
+        data++;
+        len--;
+    }
+    const size_t even_len = len & ~(size_t)1;
+    if (even_len > 0) {
+        ESP_RETURN_ON_ERROR(vibe_audio_play_stream_write(data, even_len),
+                            TAG, "write TTS stream");
+        data += even_len;
+        len -= even_len;
+    }
+    if (len == 1) {
+        state->carry = data[0];
+        state->has_carry = true;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t play_latest_tts_audio(void)
+{
+    bridge_target_t target;
+    ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG,
+                        "prepare bridge target");
+    char url[256];
+    build_bridge_url(VIBE_STICK_RECORDING_TTS_PATH, url, sizeof(url));
+    const esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = 30000,
+        .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
+        .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "tts http init");
+    bridge_profile_snapshot_t profile;
+    set_common_http_headers(client,
+                            bridge_target_profile_snapshot(&target, &profile)
+                                ? profile.token
+                                : VIBE_STICK_BRIDGE_TOKEN);
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(client);
+        bridge_target_note_result(target.profile_id, err);
+        return err;
+    }
+    const int64_t content_length = esp_http_client_fetch_headers(client);
+    const int status_code = esp_http_client_get_status_code(client);
+    if (status_code != 200 || content_length <= 0 ||
+        content_length > TTS_AUDIO_MAX_BYTES) {
+        ESP_LOGW(TAG, "tts stream rejected status=%d length=%lld",
+                 status_code, (long long)content_length);
+        err = ESP_ERR_INVALID_RESPONSE;
+        goto cleanup;
+    }
+
+    const size_t buffer_capacity = 4096;
+    uint8_t *buffer = heap_caps_malloc(buffer_capacity, MALLOC_CAP_8BIT);
+    if (!buffer) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    size_t buffered = 0;
+    size_t pcm_offset = 0;
+    size_t pcm_len = 0;
+    while (buffered < buffer_capacity &&
+           !vibe_wav_pcm_stream_info(buffer, buffered, (size_t)content_length,
+                                     VIBE_STICK_AUDIO_SAMPLE_RATE,
+                                     VIBE_STICK_AUDIO_CHANNELS,
+                                     VIBE_STICK_AUDIO_BITS_PER_SAMPLE,
+                                     &pcm_offset, &pcm_len)) {
+        int count = esp_http_client_read(client, (char *)buffer + buffered,
+                                         (int)(buffer_capacity - buffered));
+        if (count < 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        if (count == 0) {
+            if (esp_http_client_is_complete_data_received(client)) {
+                err = ESP_ERR_INVALID_RESPONSE;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        buffered += (size_t)count;
+    }
+    if (err == ESP_OK &&
+        !vibe_wav_pcm_stream_info(buffer, buffered, (size_t)content_length,
+                                  VIBE_STICK_AUDIO_SAMPLE_RATE,
+                                  VIBE_STICK_AUDIO_CHANNELS,
+                                  VIBE_STICK_AUDIO_BITS_PER_SAMPLE,
+                                  &pcm_offset, &pcm_len)) {
+        err = ESP_ERR_INVALID_RESPONSE;
+    }
+    if (err != ESP_OK) {
+        heap_caps_free(buffer);
+        goto cleanup;
+    }
+
+    ESP_LOGI(TAG, "streaming tts audio pcm_bytes=%u", (unsigned)pcm_len);
+    err = vibe_audio_play_stream_begin();
+    bool stream_open = err == ESP_OK;
+    tts_pcm_stream_state_t stream_state = {0};
+    size_t pcm_received = 0;
+    if (stream_open && buffered > pcm_offset) {
+        size_t available = buffered - pcm_offset;
+        if (available > pcm_len) {
+            available = pcm_len;
+        }
+        err = write_tts_pcm_stream(&stream_state, buffer + pcm_offset, available);
+        pcm_received = available;
+    }
+    while (err == ESP_OK && pcm_received < pcm_len) {
+        size_t request = pcm_len - pcm_received;
+        if (request > buffer_capacity) {
+            request = buffer_capacity;
+        }
+        int count = esp_http_client_read(client, (char *)buffer, (int)request);
+        if (count < 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        if (count == 0) {
+            if (esp_http_client_is_complete_data_received(client)) {
+                err = ESP_ERR_INVALID_SIZE;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        err = write_tts_pcm_stream(&stream_state, buffer, (size_t)count);
+        pcm_received += (size_t)count;
+    }
+    if (err == ESP_OK && (pcm_received != pcm_len || stream_state.has_carry)) {
+        err = ESP_ERR_INVALID_SIZE;
+    }
+    if (stream_open) {
+        esp_err_t end_err = vibe_audio_play_stream_end();
+        if (err == ESP_OK) {
+            err = end_err;
+        }
+    }
+    heap_caps_free(buffer);
+
+cleanup:
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    bridge_target_note_result(target.profile_id, err);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "tts streaming failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+#else
 static esp_err_t download_tts_audio(uint8_t **audio, size_t *audio_len)
 {
     if (!audio || !audio_len) {
@@ -4577,6 +4963,7 @@ static esp_err_t play_latest_tts_audio(void)
     heap_caps_free(audio);
     return err;
 }
+#endif
 
 static bool parse_ota_manifest(const char *json, vibe_ota_manifest_t *manifest)
 {
@@ -6091,11 +6478,26 @@ static esp_err_t wifi_apply_profile(size_t index)
     wifi_config_t wifi_config = {0};
     strlcpy((char *)wifi_config.sta.ssid, profile->ssid, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, profile->password, sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.threshold.authmode =
+        profile->password[0] == '\0' ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
     ESP_LOGI(TAG, "using Wi-Fi profile %u/%u ssid=%s",
              (unsigned)(index + 1), (unsigned)s_wifi_profile_count, profile->ssid);
     return esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
 }
+
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static esp_err_t card_wifi_configure_started_radio(void)
+{
+#if VIBE_BOARD_WIFI_MAX_TX_POWER > 0
+    ESP_RETURN_ON_ERROR(
+        esp_wifi_set_max_tx_power(VIBE_BOARD_WIFI_MAX_TX_POWER),
+        TAG, "wifi tx power");
+    ESP_LOGI(TAG, "Wi-Fi max TX power set to %.2f dBm",
+             VIBE_BOARD_WIFI_MAX_TX_POWER / 4.0);
+#endif
+    return esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS);
+}
+#endif
 
 static void wifi_reconnect_timer_cb(void *arg)
 {
@@ -6218,6 +6620,9 @@ static esp_err_t init_wifi(void)
 
     ESP_RETURN_ON_ERROR(wifi_apply_profile(s_wifi_profile_index), TAG, "wifi config");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    s_wifi_started = true;
+#endif
 #if VIBE_BOARD_WIFI_MAX_TX_POWER > 0
     ESP_RETURN_ON_ERROR(
         esp_wifi_set_max_tx_power(VIBE_BOARD_WIFI_MAX_TX_POWER),
@@ -6567,6 +6972,650 @@ static esp_err_t init_button(void)
     };
     return vibe_input_init(&config, &callbacks);
 }
+
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static char *card_setup_field_buffer(size_t *capacity)
+{
+    switch (s_card_setup_field) {
+    case CARD_SETUP_WIFI_SSID:
+        *capacity = sizeof(s_card_setup_draft.wifi_ssid);
+        return s_card_setup_draft.wifi_ssid;
+    case CARD_SETUP_WIFI_PASSWORD:
+        *capacity = sizeof(s_card_setup_draft.wifi_password);
+        return s_card_setup_draft.wifi_password;
+    case CARD_SETUP_BRIDGE_HOST:
+        *capacity = sizeof(s_card_setup_draft.bridge_host);
+        return s_card_setup_draft.bridge_host;
+    case CARD_SETUP_BRIDGE_PORT:
+        *capacity = sizeof(s_card_setup_draft.bridge_port);
+        return s_card_setup_draft.bridge_port;
+    case CARD_SETUP_BRIDGE_TOKEN:
+        *capacity = sizeof(s_card_setup_draft.bridge_token);
+        return s_card_setup_draft.bridge_token;
+    default:
+        *capacity = 0;
+        return NULL;
+    }
+}
+
+static const char *card_setup_field_name(void)
+{
+    static const char *const names[CARD_SETUP_FIELD_COUNT] = {
+        "WI-FI SSID",
+        "WI-FI PASSWORD",
+        "BRIDGE HOST",
+        "BRIDGE PORT",
+        "BRIDGE TOKEN",
+    };
+    return names[s_card_setup_field];
+}
+
+static void card_setup_render(void)
+{
+    if (!s_card_setup_active || !s_card_setup_layer) {
+        return;
+    }
+    size_t capacity = 0;
+    const char *value = card_setup_field_buffer(&capacity);
+    (void)capacity;
+    char title[32];
+    char display[40] = {0};
+    snprintf(title, sizeof(title), "CONNECTION %u/%u",
+             (unsigned)s_card_setup_field + 1,
+             (unsigned)CARD_SETUP_FIELD_COUNT);
+    if (s_card_setup_field == CARD_SETUP_WIFI_PASSWORD ||
+        s_card_setup_field == CARD_SETUP_BRIDGE_TOKEN) {
+        size_t length = value ? strlen(value) : 0;
+        if (length > sizeof(display) - 2) {
+            length = sizeof(display) - 2;
+        }
+        memset(display, '*', length);
+        display[length] = '_';
+        display[length + 1] = '\0';
+    } else if (value && value[0] != '\0') {
+        const size_t length = strlen(value);
+        const char *visible = length > 28 ? value + length - 28 : value;
+        snprintf(display, sizeof(display), "%.28s_", visible);
+    } else {
+        strlcpy(display, "(empty)_", sizeof(display));
+    }
+
+    lvgl_lock();
+    lv_label_set_text(s_card_setup_title, title);
+    lv_label_set_text(s_card_setup_field_label, card_setup_field_name());
+    lv_label_set_text(s_card_setup_value, display);
+    if (s_card_setup_error[0] != '\0') {
+        lv_label_set_text(s_card_setup_hint, s_card_setup_error);
+        lv_obj_set_style_text_color(s_card_setup_hint, lv_color_hex(0xfca5a5), 0);
+    } else {
+        lv_label_set_text(s_card_setup_hint,
+                          "Tab NEXT\nEnter SAVE\nFn+` CANCEL");
+        lv_obj_set_style_text_color(s_card_setup_hint, lv_color_hex(0x8a9099), 0);
+    }
+    lvgl_unlock();
+}
+
+static void card_setup_close(void)
+{
+    s_card_setup_active = false;
+    s_card_setup_error[0] = '\0';
+    lvgl_lock();
+    lv_obj_add_flag(s_card_setup_layer, LV_OBJ_FLAG_HIDDEN);
+    lvgl_unlock();
+    render_state();
+}
+
+static void card_setup_enter(void)
+{
+    if (s_card_setup_active) {
+        return;
+    }
+    if (recording_network_busy() || ota_in_progress() || s_motion_calibrating ||
+        atomic_load(&s_bridge_selection_active)) {
+        (void)vibe_audio_play_sound(VIBE_STICK_SOUND_ERROR);
+        return;
+    }
+
+    memset(&s_card_setup_draft, 0, sizeof(s_card_setup_draft));
+    if (s_wifi_profile_count > 0 && s_wifi_profile_index < s_wifi_profile_count) {
+        strlcpy(s_card_setup_draft.wifi_ssid,
+                s_wifi_profiles[s_wifi_profile_index].ssid,
+                sizeof(s_card_setup_draft.wifi_ssid));
+        strlcpy(s_card_setup_draft.wifi_password,
+                s_wifi_profiles[s_wifi_profile_index].password,
+                sizeof(s_card_setup_draft.wifi_password));
+    }
+    bridge_target_t target;
+    bridge_profile_snapshot_t profile;
+    bridge_target_copy(&target);
+    if (bridge_target_profile_snapshot(&target, &profile)) {
+        strlcpy(s_card_setup_draft.bridge_host, profile.host,
+                sizeof(s_card_setup_draft.bridge_host));
+        snprintf(s_card_setup_draft.bridge_port,
+                 sizeof(s_card_setup_draft.bridge_port), "%d", profile.port);
+        strlcpy(s_card_setup_draft.bridge_token, profile.token,
+                sizeof(s_card_setup_draft.bridge_token));
+    } else {
+        strlcpy(s_card_setup_draft.bridge_host, target.host,
+                sizeof(s_card_setup_draft.bridge_host));
+        snprintf(s_card_setup_draft.bridge_port,
+                 sizeof(s_card_setup_draft.bridge_port), "%d",
+                 target.port > 0 ? target.port : VIBE_STICK_BRIDGE_PORT);
+    }
+    s_card_setup_field = CARD_SETUP_WIFI_SSID;
+    s_card_setup_error[0] = '\0';
+    s_card_setup_active = true;
+    register_activity();
+    lvgl_lock();
+    lv_obj_clear_flag(s_card_setup_layer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_card_setup_layer);
+    lvgl_unlock();
+    card_setup_render();
+    ESP_LOGI(TAG, "Cardputer connection setup entered");
+}
+
+static esp_err_t card_setup_store_manual_bridge(const char *ssid, int port)
+{
+    bridge_discovered_profile_t manual = {0};
+    strlcpy(manual.id, CARD_SETUP_MANUAL_BRIDGE_ID, sizeof(manual.id));
+    strlcpy(manual.label, "Cardputer Bridge", sizeof(manual.label));
+    strlcpy(manual.host, s_card_setup_draft.bridge_host, sizeof(manual.host));
+    manual.port = port;
+    strlcpy(manual.token, s_card_setup_draft.bridge_token, sizeof(manual.token));
+
+    size_t manual_index = 0;
+    bridge_profiles_lock();
+    if (strcmp(s_bridge_profiles_loaded_ssid, ssid) != 0) {
+        memset(s_discovered_bridge_profiles, 0,
+               sizeof(s_discovered_bridge_profiles));
+        s_discovered_bridge_profile_count = 0;
+    }
+    bool found = false;
+    for (size_t i = 0; i < s_discovered_bridge_profile_count; ++i) {
+        if (strcmp(s_discovered_bridge_profiles[i].id,
+                   CARD_SETUP_MANUAL_BRIDGE_ID) == 0) {
+            manual_index = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        if (s_discovered_bridge_profile_count >=
+            VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT) {
+            manual_index = s_discovered_bridge_profile_count - 1;
+        } else {
+            manual_index = s_discovered_bridge_profile_count++;
+        }
+    }
+    s_discovered_bridge_profiles[manual_index] = manual;
+    bridge_profile_views_rebuild();
+    strlcpy(s_bridge_profiles_loaded_ssid, ssid,
+            sizeof(s_bridge_profiles_loaded_ssid));
+    bridge_profiles_unlock();
+
+    ESP_RETURN_ON_ERROR(bridge_profiles_save_nvs_for_ssid(ssid), TAG,
+                        "save manual bridge");
+    if (s_bridge_target_lock) {
+        xSemaphoreTake(s_bridge_target_lock, portMAX_DELAY);
+    }
+    strlcpy(s_bridge_target.host, manual.host, sizeof(s_bridge_target.host));
+    s_bridge_target.port = manual.port;
+    s_bridge_target.profile_index = manual_index;
+    strlcpy(s_bridge_target.profile_id, manual.id,
+            sizeof(s_bridge_target.profile_id));
+    strlcpy(s_bridge_target.source, "keyboard", sizeof(s_bridge_target.source));
+    strlcpy(s_bridge_target.ssid, ssid, sizeof(s_bridge_target.ssid));
+    s_bridge_target.failure_count = 0;
+    s_bridge_target.available = false;
+    if (s_bridge_target_lock) {
+        xSemaphoreGive(s_bridge_target_lock);
+    }
+    return bridge_target_save_nvs();
+}
+
+static esp_err_t card_setup_save(void)
+{
+    if (s_card_setup_draft.wifi_ssid[0] == '\0') {
+        strlcpy(s_card_setup_error, "WI-FI SSID REQUIRED", sizeof(s_card_setup_error));
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_card_setup_draft.bridge_host[0] == '\0') {
+        strlcpy(s_card_setup_error, "BRIDGE HOST REQUIRED", sizeof(s_card_setup_error));
+        return ESP_ERR_INVALID_ARG;
+    }
+    char *end = NULL;
+    long port_value = strtol(s_card_setup_draft.bridge_port, &end, 10);
+    if (!end || *end != '\0' || port_value < 1 || port_value > 65535) {
+        strlcpy(s_card_setup_error, "INVALID BRIDGE PORT", sizeof(s_card_setup_error));
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    vibe_wifi_profile_t candidate = {0};
+    strlcpy(candidate.ssid, s_card_setup_draft.wifi_ssid,
+            sizeof(candidate.ssid));
+    strlcpy(candidate.password, s_card_setup_draft.wifi_password,
+            sizeof(candidate.password));
+    vibe_wifi_profile_merge_result_t merge =
+        vibe_wifi_profiles_merge(s_wifi_profiles, &s_wifi_profile_count,
+                                 WIFI_PROFILE_MAX_COUNT, &candidate);
+    if (merge == VIBE_WIFI_PROFILE_FULL) {
+        size_t replace_index =
+            s_wifi_profile_index < s_wifi_profile_count ? s_wifi_profile_index : 0;
+        vibe_wifi_profile_copy(&s_wifi_profiles[replace_index], &candidate);
+    } else if (merge == VIBE_WIFI_PROFILE_INVALID) {
+        strlcpy(s_card_setup_error, "INVALID WI-FI PROFILE", sizeof(s_card_setup_error));
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t profile_index = 0;
+    for (size_t i = 0; i < s_wifi_profile_count; ++i) {
+        if (strcmp(s_wifi_profiles[i].ssid, candidate.ssid) == 0) {
+            profile_index = i;
+            break;
+        }
+    }
+    ESP_RETURN_ON_ERROR(wifi_profiles_save_nvs(), TAG, "save keyboard Wi-Fi");
+    ESP_RETURN_ON_ERROR(card_setup_store_manual_bridge(
+                            candidate.ssid, (int)port_value),
+                        TAG, "save keyboard bridge");
+
+    s_wifi_profile_index = profile_index;
+    s_wifi_profile_retry_count = 0;
+    s_wifi_reconnect_attempt = 0;
+    if (!s_wifi_started) {
+        ESP_RETURN_ON_ERROR(wifi_apply_profile(profile_index), TAG,
+                            "apply keyboard Wi-Fi");
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start keyboard Wi-Fi");
+        s_wifi_started = true;
+        ESP_RETURN_ON_ERROR(card_wifi_configure_started_radio(), TAG,
+                            "keyboard Wi-Fi radio config");
+    } else {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+        ESP_RETURN_ON_ERROR(wifi_apply_profile(profile_index), TAG,
+                            "apply keyboard Wi-Fi");
+    }
+    ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "connect keyboard Wi-Fi");
+    ESP_LOGI(TAG, "Cardputer connection setup saved ssid=%s bridge=%s:%ld",
+             candidate.ssid, s_card_setup_draft.bridge_host, port_value);
+    return ESP_OK;
+}
+
+static void card_setup_edit(const vibe_key_event_t *event)
+{
+    if (!event->pressed) {
+        return;
+    }
+    s_card_setup_error[0] = '\0';
+    register_activity();
+    if (event->key == VIBE_KEY_ESCAPE) {
+        card_setup_close();
+        return;
+    }
+    if (event->key == VIBE_KEY_TAB || event->key == VIBE_KEY_DOWN ||
+        event->key == VIBE_KEY_UP) {
+        const bool previous = event->shift || event->key == VIBE_KEY_UP;
+        s_card_setup_field = previous
+                                 ? (card_setup_field_t)((s_card_setup_field +
+                                                        CARD_SETUP_FIELD_COUNT - 1) %
+                                                       CARD_SETUP_FIELD_COUNT)
+                                 : (card_setup_field_t)((s_card_setup_field + 1) %
+                                                       CARD_SETUP_FIELD_COUNT);
+        card_setup_render();
+        return;
+    }
+    if (event->key == VIBE_KEY_ENTER) {
+        esp_err_t err = card_setup_save();
+        if (err == ESP_OK) {
+            card_setup_close();
+            show_mode_switch_visual(
+                "SETTINGS SAVED", "CONNECTING WI-FI",
+                s_pet_done_frames,
+                sizeof(s_pet_done_frames) / sizeof(s_pet_done_frames[0]),
+                lv_color_hex(0x86efac));
+        } else {
+            if (s_card_setup_error[0] == '\0') {
+                snprintf(s_card_setup_error, sizeof(s_card_setup_error),
+                         "SAVE FAILED: %s", esp_err_to_name(err));
+            }
+            card_setup_render();
+        }
+        return;
+    }
+
+    size_t capacity = 0;
+    char *buffer = card_setup_field_buffer(&capacity);
+    if (!buffer || capacity == 0) {
+        return;
+    }
+    size_t length = strlen(buffer);
+    if (event->key == VIBE_KEY_BACKSPACE || event->key == VIBE_KEY_DELETE) {
+        if (length > 0) {
+            buffer[length - 1] = '\0';
+        }
+        card_setup_render();
+        return;
+    }
+    if (event->character >= 32 && event->character <= 126 &&
+        length + 1 < capacity) {
+        if (s_card_setup_field == CARD_SETUP_BRIDGE_PORT &&
+            (event->character < '0' || event->character > '9')) {
+            return;
+        }
+        buffer[length] = event->character;
+        buffer[length + 1] = '\0';
+        card_setup_render();
+    }
+}
+
+static bool card_keyboard_report_has_keys(const card_keyboard_report_t *report)
+{
+    return report && (report->modifiers != 0 || report->key_count != 0);
+}
+
+static void card_keyboard_queue_current_report(void)
+{
+    if (!s_card_keyboard_report_queue) {
+        return;
+    }
+    card_keyboard_report_t report = {
+        .modifiers = s_card_host_modifiers,
+    };
+    for (size_t row = 0; row < 4 && report.key_count < sizeof(report.keys); ++row) {
+        for (size_t col = 0; col < 14 && report.key_count < sizeof(report.keys); ++col) {
+            if (s_card_host_usages[row][col] != 0) {
+                report.keys[report.key_count++] = s_card_host_usages[row][col];
+            }
+        }
+    }
+    if (xQueueSend(s_card_keyboard_report_queue, &report, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Cardputer keyboard report queue overflow; resyncing");
+        xQueueReset(s_card_keyboard_report_queue);
+        (void)xQueueSend(s_card_keyboard_report_queue, &report, 0);
+    }
+}
+
+static void card_keyboard_release_host_state(void)
+{
+    bool changed = s_card_host_modifiers != 0;
+    for (size_t row = 0; row < 4; ++row) {
+        for (size_t col = 0; col < 14; ++col) {
+            changed |= s_card_host_usages[row][col] != 0;
+        }
+    }
+    memset(s_card_host_usages, 0, sizeof(s_card_host_usages));
+    s_card_host_modifiers = 0;
+    if (changed) {
+        card_keyboard_queue_current_report();
+    }
+}
+
+static void card_keyboard_report_task(void *arg)
+{
+    (void)arg;
+    char session_id[24];
+    snprintf(session_id, sizeof(session_id), "%08lx-%08lx",
+             (unsigned long)esp_random(), (unsigned long)esp_random());
+    uint32_t sequence = 0;
+    bool suspended_until_release = false;
+    bool have_report = false;
+    int64_t last_failure_log_ms = 0;
+    card_keyboard_report_t current = {0};
+
+    while (true) {
+        card_keyboard_report_t next;
+        const BaseType_t received = xQueueReceive(
+            s_card_keyboard_report_queue, &next,
+            pdMS_TO_TICKS(CARD_KEYBOARD_HEARTBEAT_MS));
+        if (received == pdTRUE) {
+            current = next;
+            have_report = true;
+        } else if (!card_keyboard_report_has_keys(&current)) {
+            continue;
+        }
+
+        if (!wifi_connected()) {
+            if (card_keyboard_report_has_keys(&current)) {
+                suspended_until_release = true;
+            }
+            continue;
+        }
+        if (suspended_until_release) {
+            if (card_keyboard_report_has_keys(&current)) {
+                continue;
+            }
+            suspended_until_release = false;
+        }
+        if (!have_report && !card_keyboard_report_has_keys(&current)) {
+            continue;
+        }
+
+        char keys_json[48] = {0};
+        size_t used = 0;
+        for (uint8_t i = 0; i < current.key_count; ++i) {
+            int written = snprintf(keys_json + used, sizeof(keys_json) - used,
+                                   "%s%u", i == 0 ? "" : ",",
+                                   (unsigned)current.keys[i]);
+            if (written < 0 || (size_t)written >= sizeof(keys_json) - used) {
+                break;
+            }
+            used += (size_t)written;
+        }
+        char body[224];
+        snprintf(body, sizeof(body),
+                 "{\"protocol_version\":1,\"session_id\":\"%s\","
+                 "\"sequence\":%lu,\"modifiers\":%u,\"keys\":[%s]}",
+                 session_id, (unsigned long)sequence++,
+                 (unsigned)current.modifiers, keys_json);
+        char response[128] = {0};
+        esp_err_t err = http_request_timeout(
+            "POST", VIBE_STICK_DEVICE_KEYBOARD_REPORT_PATH, body,
+            response, sizeof(response), CARD_KEYBOARD_REPORT_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            if (card_keyboard_report_has_keys(&current)) {
+                suspended_until_release = true;
+            }
+            const int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - last_failure_log_ms >= 5000) {
+                ESP_LOGW(TAG, "Cardputer keyboard report failed: %s",
+                         esp_err_to_name(err));
+                last_failure_log_ms = now_ms;
+            }
+        }
+        have_report = false;
+    }
+}
+
+static void card_fn_stop_timer(esp_timer_handle_t timer)
+{
+    if (timer) {
+        (void)esp_timer_stop(timer);
+    }
+}
+
+static void card_fn_cancel_hold_timers(void)
+{
+    card_fn_stop_timer(s_card_fn_long_timer);
+    card_fn_stop_timer(s_card_fn_confirm_timer);
+}
+
+static void card_fn_long_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!atomic_load(&s_card_fn_down) || atomic_load(&s_card_fn_chord)) {
+        return;
+    }
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_card_fn_button_committed,
+                                        &expected, true)) {
+        return;
+    }
+    button_press_down_cb(NULL, NULL);
+    button_long_start_cb(NULL, NULL);
+}
+
+static void card_fn_confirm_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!atomic_load(&s_card_fn_down) || atomic_load(&s_card_fn_chord)) {
+        return;
+    }
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&s_card_fn_button_committed,
+                                       &expected, true)) {
+        button_press_down_cb(NULL, NULL);
+    }
+    bridge_selection_confirm_long_cb(NULL, NULL);
+}
+
+static void card_fn_click_timer_cb(void *arg)
+{
+    (void)arg;
+    if (atomic_exchange(&s_card_fn_pending_clicks, 0) == 1) {
+        button_single_click_cb(NULL, NULL);
+    }
+}
+
+static esp_err_t card_fn_gesture_init(void)
+{
+    const esp_timer_create_args_t long_args = {
+        .callback = card_fn_long_timer_cb,
+        .name = "card_fn_long",
+        .skip_unhandled_events = true,
+    };
+    const esp_timer_create_args_t confirm_args = {
+        .callback = card_fn_confirm_timer_cb,
+        .name = "card_fn_confirm",
+        .skip_unhandled_events = true,
+    };
+    const esp_timer_create_args_t click_args = {
+        .callback = card_fn_click_timer_cb,
+        .name = "card_fn_click",
+        .skip_unhandled_events = true,
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&long_args, &s_card_fn_long_timer),
+                        TAG, "create Cardputer Fn long timer");
+    ESP_RETURN_ON_ERROR(esp_timer_create(&confirm_args, &s_card_fn_confirm_timer),
+                        TAG, "create Cardputer Fn confirm timer");
+    return esp_timer_create(&click_args, &s_card_fn_click_timer);
+}
+
+static void card_fn_press(void)
+{
+    if (atomic_exchange(&s_card_fn_down, true)) {
+        return;
+    }
+    atomic_store(&s_card_fn_chord, false);
+    atomic_store(&s_card_fn_button_committed, false);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(
+        s_card_fn_long_timer, FRONT_PTT_LONG_PRESS_MS * 1000ULL));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(
+        s_card_fn_confirm_timer, BRIDGE_SELECTION_CONFIRM_HOLD_MS * 1000ULL));
+}
+
+static bool card_fn_mark_chord(void)
+{
+    if (!atomic_load(&s_card_fn_down)) {
+        return true;
+    }
+    if (atomic_load(&s_card_fn_button_committed)) {
+        return false;
+    }
+    atomic_store(&s_card_fn_chord, true);
+    card_fn_cancel_hold_timers();
+    return true;
+}
+
+static void card_fn_release(void)
+{
+    if (!atomic_exchange(&s_card_fn_down, false)) {
+        return;
+    }
+    card_fn_cancel_hold_timers();
+    if (atomic_exchange(&s_card_fn_chord, false)) {
+        atomic_store(&s_card_fn_button_committed, false);
+        return;
+    }
+    if (atomic_exchange(&s_card_fn_button_committed, false)) {
+        button_up_cb(NULL, NULL);
+        return;
+    }
+
+    button_press_down_cb(NULL, NULL);
+    button_up_cb(NULL, NULL);
+    const int clicks = atomic_fetch_add(&s_card_fn_pending_clicks, 1) + 1;
+    if (clicks >= 2) {
+        atomic_store(&s_card_fn_pending_clicks, 0);
+        card_fn_stop_timer(s_card_fn_click_timer);
+        button_double_click_cb(NULL, NULL);
+    } else {
+        card_fn_stop_timer(s_card_fn_click_timer);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(
+            s_card_fn_click_timer, CARD_FN_CLICK_WINDOW_MS * 1000ULL));
+    }
+}
+
+static void card_keyboard_event(const vibe_key_event_t *event, void *context)
+{
+    (void)context;
+    if (!event) {
+        return;
+    }
+    const uint8_t row = event->row;
+    const uint8_t col = event->column;
+    if (row >= 4 || col >= 14) {
+        return;
+    }
+
+    if (s_card_setup_active || s_card_local_consumed[row][col]) {
+        const bool edit_active = s_card_setup_active;
+        if (event->pressed) {
+            s_card_local_consumed[row][col] = true;
+        }
+        if (edit_active) {
+            card_setup_edit(event);
+        }
+        if (event->key == VIBE_KEY_FN && !event->pressed) {
+            card_fn_release();
+        }
+        if (!event->pressed) {
+            s_card_local_consumed[row][col] = false;
+        }
+        card_keyboard_release_host_state();
+        return;
+    }
+
+    if (event->key == VIBE_KEY_FN) {
+        if (event->pressed) {
+            register_activity();
+            card_fn_press();
+        } else {
+            card_fn_release();
+        }
+        return;
+    }
+
+    if (event->pressed && atomic_load(&s_card_fn_down)) {
+        if (!card_fn_mark_chord()) {
+            return;
+        }
+        if (row == 2 && col == 3) { // Official Fn+S has no HID value.
+            s_card_local_consumed[row][col] = true;
+            card_keyboard_release_host_state();
+            card_setup_enter();
+            return;
+        }
+    }
+    if (event->pressed) {
+        register_activity();
+    }
+
+    s_card_host_modifiers = event->hid_modifiers;
+    if (event->hid_usage != 0) {
+        s_card_host_usages[row][col] = event->pressed ? event->hid_usage : 0;
+    }
+    card_keyboard_queue_current_report();
+}
+#endif
 
 static void capture_deep_sleep_front_button_intent(void)
 {
@@ -7033,8 +8082,10 @@ void app_main(void)
     s_woke_from_deep_sleep =
         s_boot_wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED;
     if (s_woke_from_deep_sleep) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_FRONT));
+        const gpio_num_t wake_gpio = sleep_button_wake_gpio();
+        if (wake_gpio != GPIO_NUM_NC) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(rtc_gpio_deinit(wake_gpio));
+        }
 #if VIBE_BOARD_HAS_IMU_DEEP_SLEEP_WAKE
         if ((s_boot_ext1_wake_status &
              (1ULL << VIBE_BOARD_PIN_MOTION_WAKE)) != 0) {
@@ -7106,13 +8157,28 @@ void app_main(void)
     }
     set_push_to_talk_trigger_mode();
     ESP_ERROR_CHECK_WITHOUT_ABORT(restore_recording_mode_preference());
-    ESP_LOGI(TAG, "deep sleep timeout=%umin", (unsigned)s_sleep_minutes);
+    if (s_sleep_minutes == VIBE_SETTINGS_SLEEP_DISABLED_MINUTES) {
+        ESP_LOGI(TAG, "deep sleep disabled by preference");
+    } else {
+        ESP_LOGI(TAG, "deep sleep timeout=%umin", (unsigned)s_sleep_minutes);
+    }
     render_state();
     BaseType_t bridge_control_ok =
         xTaskCreatePinnedToCore(bridge_control_task, "bridge_control", 4096,
                                 NULL, 5, NULL, VIBE_STICK_APP_CORE);
     ESP_ERROR_CHECK(bridge_control_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(init_button());
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    s_card_keyboard_report_queue = xQueueCreate(
+        CARD_KEYBOARD_REPORT_QUEUE_LENGTH, sizeof(card_keyboard_report_t));
+    ESP_ERROR_CHECK(s_card_keyboard_report_queue ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(card_fn_gesture_init());
+    BaseType_t keyboard_report_ok = xTaskCreatePinnedToCore(
+        card_keyboard_report_task, "keyboard_report", 6144, NULL, 3, NULL,
+        VIBE_STICK_NETWORK_CORE);
+    ESP_ERROR_CHECK(keyboard_report_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(vibe_keyboard_init(card_keyboard_event, NULL));
+#endif
     capture_deep_sleep_front_button_intent();
     capture_deep_sleep_motion_intent();
     ESP_ERROR_CHECK(vibe_audio_init());

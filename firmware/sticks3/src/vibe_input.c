@@ -18,21 +18,29 @@ static vibe_input_callbacks_t s_callbacks;
         } \
     }
 
+#if VIBE_BOARD_HAS_FRONT_BUTTON
 DEFINE_INPUT_ADAPTER(front_down_adapter, front_down)
 DEFINE_INPUT_ADAPTER(front_single_adapter, front_single)
 DEFINE_INPUT_ADAPTER(front_double_adapter, front_double)
 DEFINE_INPUT_ADAPTER(front_long_adapter, front_long)
 DEFINE_INPUT_ADAPTER(front_confirm_adapter, front_confirm)
 DEFINE_INPUT_ADAPTER(front_up_adapter, front_up)
+#endif
+#if VIBE_BOARD_HAS_SIDE_BUTTON
 DEFINE_INPUT_ADAPTER(side_up_adapter, side_up)
 DEFINE_INPUT_ADAPTER(side_single_adapter, side_single)
 DEFINE_INPUT_ADAPTER(side_double_adapter, side_double)
 DEFINE_INPUT_ADAPTER(side_mode_adapter, side_mode_hold)
 DEFINE_INPUT_ADAPTER(side_calibration_adapter, side_calibration_hold)
+#endif
 
 bool vibe_input_front_pressed(void)
 {
+#if VIBE_BOARD_HAS_FRONT_BUTTON
     return gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0;
+#else
+    return false;
+#endif
 }
 
 esp_err_t vibe_input_init(const vibe_input_config_t *config,
@@ -42,9 +50,9 @@ esp_err_t vibe_input_init(const vibe_input_config_t *config,
                         "input config");
     s_callbacks = *callbacks;
 
-    button_handle_t front = NULL;
-    button_handle_t side = NULL;
     const button_config_t button_config = {0};
+#if VIBE_BOARD_HAS_FRONT_BUTTON
+    button_handle_t front = NULL;
     const button_gpio_config_t front_gpio = {
         .gpio_num = VIBE_BOARD_PIN_BUTTON_FRONT,
         .active_level = 0,
@@ -84,7 +92,10 @@ esp_err_t vibe_input_init(const vibe_input_config_t *config,
                             front, BUTTON_PRESS_UP, NULL,
                             front_up_adapter, NULL),
                         TAG, "front up");
+#endif
 
+#if VIBE_BOARD_HAS_SIDE_BUTTON
+    button_handle_t side = NULL;
     const button_gpio_config_t side_gpio = {
         .gpio_num = VIBE_BOARD_PIN_BUTTON_SIDE,
         .active_level = 0,
@@ -120,5 +131,6 @@ esp_err_t vibe_input_init(const vibe_input_config_t *config,
                             side, BUTTON_LONG_PRESS_START, &side_calibration,
                             side_calibration_adapter, NULL),
                         TAG, "side calibration");
+#endif
     return ESP_OK;
 }

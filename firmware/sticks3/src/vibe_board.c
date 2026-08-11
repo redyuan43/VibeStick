@@ -5,6 +5,11 @@
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
+#endif
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
@@ -13,13 +18,19 @@
 
 static const char *TAG = "vibe_board";
 static i2c_master_bus_handle_t s_i2c_bus;
+#if VIBE_BOARD_HAS_M5PM1 || VIBE_BOARD_HAS_AXP192
 static i2c_master_dev_handle_t s_pmic_dev;
-#if !VIBE_BOARD_HAS_ES8311
+#endif
+#if VIBE_BOARD_HAS_AXP192
 static i2c_master_dev_handle_t s_rtc_dev;
+#endif
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static adc_oneshot_unit_handle_t s_battery_adc;
+static adc_cali_handle_t s_battery_adc_cali;
 #endif
 static vibe_board_boot_power_status_t s_boot_power_status;
 
-#if VIBE_BOARD_HAS_ES8311
+#if VIBE_BOARD_HAS_M5PM1
 
 #define M5PM1_ADDR 0x6e
 #define M5PM1_I2C_FREQ_HZ 100000
@@ -64,7 +75,7 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 #define M5PM1_GPIO_FUNC_GPIO(pin) (0x00 << ((pin) * 2))
 #define M5PM1_GPIO_FUNC_IRQ(pin)  (0x01 << ((pin) * 2))
 
-#else
+#elif VIBE_BOARD_HAS_AXP192
 
 #define AXP192_ADDR 0x34
 #define AXP192_REG_INPUT_STATUS 0x00
@@ -101,6 +112,7 @@ static vibe_board_boot_power_status_t s_boot_power_status;
 
 #endif
 
+#if VIBE_BOARD_HAS_M5PM1 || VIBE_BOARD_HAS_AXP192
 static esp_err_t read_reg(uint8_t reg, uint8_t *value)
 {
     return i2c_master_transmit_receive(s_pmic_dev, &reg, 1, value, 1, 100);
@@ -132,7 +144,7 @@ static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, ui
         i2c_del_master_bus(s_i2c_bus);
         s_i2c_bus = NULL;
         s_pmic_dev = NULL;
-#if !VIBE_BOARD_HAS_ES8311
+#if VIBE_BOARD_HAS_AXP192
         s_rtc_dev = NULL;
 #endif
     }
@@ -151,25 +163,24 @@ static esp_err_t init_i2c_on(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, ui
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = address,
         .scl_speed_hz =
-#if VIBE_BOARD_HAS_ES8311
+#if VIBE_BOARD_HAS_M5PM1
             (address == M5PM1_ADDR) ? M5PM1_I2C_FREQ_HZ :
 #endif
             I2C_FREQ_HZ,
     };
     return i2c_master_bus_add_device(s_i2c_bus, &dev_config, &s_pmic_dev);
 }
+#endif
 
-#if !VIBE_BOARD_HAS_ES8311
+#if VIBE_BOARD_HAS_AXP192 || defined(VIBE_BOARD_CARDPUTER_ADV)
 static int voltage_to_percent(int voltage_mv)
 {
     static const struct {
         int voltage_mv;
         int percent;
     } curve[] = {
-        /*
-         * M5StickC Plus 1.1 AXP192 curve calibrated from the 2026-07-14
-         * 4046 mV to 3038 mV full discharge under an always-on screen load.
-         */
+#if VIBE_BOARD_HAS_AXP192
+        /* Calibrated M5StickC Plus 1.1 AXP192 discharge curve. */
         {3082, 0},
         {3313, 5},
         {3372, 10},
@@ -191,6 +202,20 @@ static int voltage_to_percent(int voltage_mv)
         {3940, 90},
         {3979, 95},
         {4042, 100},
+#else
+        /* Initial Cardputer-Adv LiPo curve; refine from device telemetry. */
+        {3300, 0},
+        {3500, 10},
+        {3600, 20},
+        {3680, 30},
+        {3740, 40},
+        {3790, 50},
+        {3840, 60},
+        {3890, 70},
+        {3950, 80},
+        {4050, 90},
+        {4200, 100},
+#endif
     };
 
     if (voltage_mv <= curve[0].voltage_mv) {
@@ -212,7 +237,7 @@ static int voltage_to_percent(int voltage_mv)
 }
 #endif
 
-#if VIBE_BOARD_HAS_ES8311
+#if VIBE_BOARD_HAS_M5PM1
 
 static esp_err_t init_i2c(void)
 {
@@ -500,7 +525,7 @@ esp_err_t vibe_board_prepare_deep_sleep(void)
     return ESP_OK;
 }
 
-#else
+#elif VIBE_BOARD_HAS_AXP192
 
 static uint16_t read_12bit_adc(uint8_t reg)
 {
@@ -556,11 +581,6 @@ esp_err_t vibe_board_init_power(void)
              VIBE_BOARD_MODEL_NAME, VIBE_BOARD_BATTERY_CAPACITY_MAH,
              VIBE_BOARD_AXP192_CHARGE_CURRENT_MA);
     return ESP_OK;
-}
-
-i2c_master_bus_handle_t vibe_board_i2c_bus(void)
-{
-    return s_i2c_bus;
 }
 
 esp_err_t vibe_board_battery_voltage_mv(int *voltage_mv)
@@ -720,11 +740,145 @@ esp_err_t vibe_board_prepare_deep_sleep(void)
     return ESP_OK;
 }
 
+#else
+
+static esp_err_t init_i2c(void)
+{
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = VIBE_BOARD_I2C_PORT,
+        .sda_io_num = VIBE_BOARD_PIN_I2C_SDA,
+        .scl_io_num = VIBE_BOARD_PIN_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    return i2c_new_master_bus(&bus_config, &s_i2c_bus);
+}
+
+esp_err_t vibe_board_init_power(void)
+{
+    if (!s_i2c_bus) {
+        ESP_RETURN_ON_ERROR(init_i2c(), TAG, "init shared i2c");
+    }
+    if (!s_battery_adc) {
+        const adc_oneshot_unit_init_cfg_t unit_cfg = {
+            .unit_id = ADC_UNIT_1,
+            .ulp_mode = ADC_ULP_MODE_DISABLE,
+        };
+        ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&unit_cfg, &s_battery_adc),
+                            TAG, "battery adc unit");
+        const adc_oneshot_chan_cfg_t channel_cfg = {
+            .atten = ADC_ATTEN_DB_12,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ESP_RETURN_ON_ERROR(
+            adc_oneshot_config_channel(s_battery_adc, ADC_CHANNEL_9, &channel_cfg),
+            TAG, "battery adc channel");
+
+        const adc_cali_curve_fitting_config_t cali_cfg = {
+            .unit_id = ADC_UNIT_1,
+            .chan = ADC_CHANNEL_9,
+            .atten = ADC_ATTEN_DB_12,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        esp_err_t cali_err = adc_cali_create_scheme_curve_fitting(
+            &cali_cfg, &s_battery_adc_cali);
+        if (cali_err != ESP_OK) {
+            s_battery_adc_cali = NULL;
+            ESP_LOGW(TAG, "battery ADC calibration unavailable: %s",
+                     esp_err_to_name(cali_err));
+        }
+    }
+    ESP_LOGI(TAG, "Cardputer-Adv shared I2C and battery ADC initialized");
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_battery_voltage_mv(int *voltage_mv)
+{
+    ESP_RETURN_ON_FALSE(voltage_mv != NULL, ESP_ERR_INVALID_ARG, TAG, "null voltage");
+    ESP_RETURN_ON_FALSE(s_battery_adc != NULL, ESP_ERR_INVALID_STATE, TAG, "adc missing");
+
+    int raw_sum = 0;
+    for (int i = 0; i < 8; ++i) {
+        int raw = 0;
+        ESP_RETURN_ON_ERROR(adc_oneshot_read(s_battery_adc, ADC_CHANNEL_9, &raw),
+                            TAG, "read battery adc");
+        raw_sum += raw;
+    }
+    const int raw = raw_sum / 8;
+    int pin_mv = 0;
+    if (s_battery_adc_cali) {
+        ESP_RETURN_ON_ERROR(adc_cali_raw_to_voltage(s_battery_adc_cali, raw, &pin_mv),
+                            TAG, "calibrate battery adc");
+    } else {
+        pin_mv = (raw * 3300 + 2047) / 4095;
+    }
+    *voltage_mv = (pin_mv * 204 + 50) / 100;
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_battery_level(int *level_percent)
+{
+    ESP_RETURN_ON_FALSE(level_percent != NULL, ESP_ERR_INVALID_ARG, TAG, "null level");
+    int voltage_mv = 0;
+    ESP_RETURN_ON_ERROR(vibe_board_battery_voltage_mv(&voltage_mv), TAG,
+                        "read battery voltage");
+    *level_percent = voltage_to_percent(voltage_mv);
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_battery_charging(bool *charging)
+{
+    ESP_RETURN_ON_FALSE(charging != NULL, ESP_ERR_INVALID_ARG, TAG, "null charging");
+    *charging = false;
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_usb_powered(bool *usb_powered)
+{
+    ESP_RETURN_ON_FALSE(usb_powered != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "null usb powered");
+    *usb_powered = false;
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_speaker_set_enabled(bool enabled)
+{
+    (void)enabled;
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_set_lcd_brightness(uint8_t brightness)
+{
+    (void)brightness;
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_prepare_motion_wake(void)
+{
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_clear_motion_wake_status(void)
+{
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_cancel_motion_wake(void)
+{
+    return ESP_OK;
+}
+
+esp_err_t vibe_board_prepare_deep_sleep(void)
+{
+    return ESP_OK;
+}
+
 #endif
 
 esp_err_t vibe_board_status_led_set(bool enabled)
 {
-#if VIBE_BOARD_HAS_ES8311
+#if VIBE_BOARD_HAS_M5PM1
     ESP_RETURN_ON_FALSE(s_pmic_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "pmic missing");
     return update_reg(M5PM1_REG_PWR_CFG,
                       enabled ? 0 : M5PM1_PWR_CFG_LED_CTRL,
@@ -740,9 +894,7 @@ vibe_board_boot_power_status_t vibe_board_boot_power_status(void)
     return s_boot_power_status;
 }
 
-#if VIBE_BOARD_HAS_ES8311
 i2c_master_bus_handle_t vibe_board_i2c_bus(void)
 {
     return s_i2c_bus;
 }
-#endif

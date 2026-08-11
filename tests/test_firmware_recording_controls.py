@@ -848,11 +848,12 @@ def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
     assert "#define VIBE_STICK_IDLE_OFF_MS 60000" in source
     assert "#define VIBE_STICK_SETTINGS_TIMEOUT_MS 30000" in source
     assert "vibe_settings_sleep_timeout_ms(s_sleep_minutes)" in source
+    assert "s_sleep_minutes == VIBE_SETTINGS_SLEEP_DISABLED_MINUTES" in source
     assert 'DEVICE_PREF_SLEEP_MINUTES_KEY "sleep_min"' in source
     assert "maybe_enter_deep_sleep(now_ms)" in source
     assert "esp_deep_sleep_start()" in source
     assert "esp_sleep_enable_ext0_wakeup(ext0_gpio, 0)" in source
-    assert "gpio_num_t ext0_gpio = VIBE_BOARD_PIN_BUTTON_FRONT;" in source
+    assert "gpio_num_t ext0_gpio = sleep_button_wake_gpio();" in source
     assert "ext0_gpio = VIBE_BOARD_PIN_IMU_INT;" not in source
     assert "esp_sleep_enable_ext1_wakeup_io(wake_mask" not in source
     assert "static bool sleep_wake_gpio_is_active(gpio_num_t gpio)" in source
@@ -950,7 +951,7 @@ def test_recording_trigger_is_independent_from_disabled_cyber_intents() -> None:
     )[1]
 
     assert "VIBE_STICK_ANIM_PREVIEW 0" in source
-    assert board_profile.count("#define VIBE_BOARD_HAS_CYBER_INTENTS 0") == 3
+    assert board_profile.count("#define VIBE_BOARD_HAS_CYBER_INTENTS 0") == 4
     assert "recording_intent_supported" in source
     assert "sanitize_recording_intent();" in source
     assert "cyber intents unavailable" in intent_toggle
@@ -1129,7 +1130,7 @@ def test_boot_diagnostics_survive_sleep_and_are_reported_to_bridge() -> None:
     irq_restore = board_source.index("M5PM1_GPIO_FUNC_IRQ(1)")
     wake_clear = board_source.index("write_reg(M5PM1_REG_WAKE_SRC, 0x00)")
     assert irq_restore < wake_clear
-    assert "rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_FRONT)" in source
+    assert "rtc_gpio_deinit(wake_gpio)" in source
     assert "DEEP_SLEEP_NAMESPACE" in source
     assert "nvs_set_blob(handle, DEEP_SLEEP_RECORD_KEY" in source
     assert "nvs_commit(handle)" in source
@@ -1374,8 +1375,8 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.64"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.38"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.65"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.39"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
@@ -1389,6 +1390,7 @@ def test_sticks3_settings_menu_preserves_normal_button_roles() -> None:
     assert "VIBE_SETTINGS_PAGE_VERSION" in source
     assert '"MODE: %s"' in source
     assert '"SLEEP: %u MIN"' in source
+    assert '"SLEEP: OFF"' in source
     assert '"FW %s"' in source
     assert "VIBE_STICK_EVENT_SETTINGS_ENTER" in source
     assert "VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT" in source

@@ -34,7 +34,13 @@
 #define MPU6886_ACCEL_INTEL_CTRL 0x69
 #define MPU6886_ACCEL_XOUT_H 0x3b
 
-#define BMI270_ADDR 0x68
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+#define BMI270_ADDR_PRIMARY 0x69
+#define BMI270_ADDR_ALTERNATE 0x68
+#else
+#define BMI270_ADDR_PRIMARY 0x68
+#define BMI270_ADDR_ALTERNATE 0x69
+#endif
 #define BMI270_CHIP_ID 0x00
 #define BMI270_CHIP_ID_VALUE 0x24
 #define BMI270_STATUS 0x03
@@ -382,11 +388,34 @@ static esp_err_t configure_bmi270_active(void)
 
 static esp_err_t init_bmi270(void)
 {
-    ESP_RETURN_ON_ERROR(add_imu_device(BMI270_ADDR), TAG, "add bmi270");
-
-    uint8_t chip_id = 0;
-    ESP_RETURN_ON_ERROR(read_regs(BMI270_CHIP_ID, &chip_id, 1), TAG, "whoami bmi270");
-    ESP_RETURN_ON_FALSE(chip_id == BMI270_CHIP_ID_VALUE, ESP_ERR_NOT_FOUND, TAG, "unexpected bmi270 whoami");
+    static const uint8_t addresses[] = {
+        BMI270_ADDR_PRIMARY,
+        BMI270_ADDR_ALTERNATE,
+    };
+    esp_err_t probe_err = ESP_ERR_NOT_FOUND;
+    uint8_t selected_address = 0;
+    for (size_t index = 0; index < sizeof(addresses); ++index) {
+        if (s_imu_dev) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_master_bus_rm_device(s_imu_dev));
+            s_imu_dev = NULL;
+        }
+        probe_err = add_imu_device(addresses[index]);
+        if (probe_err != ESP_OK) {
+            continue;
+        }
+        uint8_t chip_id = 0;
+        probe_err = read_regs(BMI270_CHIP_ID, &chip_id, 1);
+        if (probe_err == ESP_OK && chip_id == BMI270_CHIP_ID_VALUE) {
+            selected_address = addresses[index];
+            break;
+        }
+        if (probe_err == ESP_OK) {
+            probe_err = ESP_ERR_NOT_FOUND;
+        }
+    }
+    ESP_RETURN_ON_FALSE(selected_address != 0, probe_err, TAG,
+                        "BMI270 not found at primary or alternate address");
+    ESP_LOGI(TAG, "BMI270 detected address=0x%02x", selected_address);
 
     ESP_RETURN_ON_ERROR(write_reg(BMI270_CMD, BMI270_SOFT_RESET), TAG, "bmi270 reset");
     vTaskDelay(pdMS_TO_TICKS(10));

@@ -101,6 +101,9 @@ static i2s_chan_handle_t s_tx_handle;
 static i2s_chan_handle_t s_rx_handle;
 static bool s_tx_enabled;
 static bool s_rx_enabled;
+#if !VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+static bool s_streaming;
+#endif
 static vibe_audio_stats_t s_audio_stats;
 
 #if VIBE_BOARD_HAS_ES8311
@@ -112,6 +115,58 @@ static const audio_codec_if_t *s_codec_if;
 #endif
 
 #if VIBE_BOARD_HAS_ES8311
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+typedef struct {
+    uint8_t reg;
+    uint8_t value;
+} cardputer_codec_register_t;
+
+static esp_err_t apply_cardputer_codec_profile(esp_codec_dev_type_t dev_type)
+{
+    static const cardputer_codec_register_t speaker_profile[] = {
+        {0x00, 0x80},
+        {0x01, 0xB5},
+        {0x02, 0x18},
+        {0x0D, 0x01},
+        {0x12, 0x00},
+        {0x13, 0x10},
+        {0x32, 0xBF},
+        {0x37, 0x08},
+    };
+    static const cardputer_codec_register_t microphone_profile[] = {
+        {0x00, 0x80},
+        {0x01, 0xBA},
+        {0x02, 0x18},
+        {0x0D, 0x01},
+        {0x0E, 0x02},
+        {0x14, 0x10},
+        {0x17, 0xBF},
+        {0x1C, 0x6A},
+    };
+
+    const cardputer_codec_register_t *profile = NULL;
+    size_t profile_count = 0;
+    if (dev_type == ESP_CODEC_DEV_TYPE_OUT) {
+        profile = speaker_profile;
+        profile_count = sizeof(speaker_profile) / sizeof(speaker_profile[0]);
+    } else if (dev_type == ESP_CODEC_DEV_TYPE_IN) {
+        profile = microphone_profile;
+        profile_count = sizeof(microphone_profile) / sizeof(microphone_profile[0]);
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (size_t i = 0; i < profile_count; ++i) {
+        ESP_RETURN_ON_FALSE(
+            esp_codec_dev_write_reg(s_codec, profile[i].reg, profile[i].value) ==
+                ESP_CODEC_DEV_OK,
+            ESP_FAIL, TAG, "cardputer codec register 0x%02x",
+            profile[i].reg);
+    }
+    return ESP_OK;
+}
+#endif
+
 static esp_err_t init_i2s_std(bool enable_tx, bool enable_rx)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(VIBE_BOARD_I2S_PORT, I2S_ROLE_MASTER);
@@ -184,7 +239,7 @@ static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mo
         .pa_pin = -1,
         .pa_reverted = false,
         .master_mode = false,
-        .use_mclk = true,
+        .use_mclk = VIBE_BOARD_ES8311_USE_MCLK,
         .digital_mic = false,
         .invert_mclk = false,
         .invert_sclk = false,
@@ -213,6 +268,10 @@ static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mo
     };
     ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_codec, &sample_cfg) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "open codec");
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    ESP_RETURN_ON_ERROR(apply_cardputer_codec_profile(dev_type), TAG,
+                        "cardputer codec profile");
+#endif
     if (dev_type & ESP_CODEC_DEV_TYPE_IN) {
         ESP_RETURN_ON_FALSE(esp_codec_dev_set_in_gain(s_codec, 36.0) == ESP_CODEC_DEV_OK,
                             ESP_FAIL, TAG, "mic gain");
@@ -802,6 +861,77 @@ esp_err_t vibe_audio_play_sound(agent_sound_t sound)
     } else {
         ESP_LOGI(TAG, "sound played id=%d", (int)sound);
     }
+    return err;
+#endif
+}
+
+esp_err_t vibe_audio_play_stream_begin(void)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "not initialized");
+#if VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    ESP_RETURN_ON_FALSE(s_audio_mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "audio mutex missing");
+    ESP_RETURN_ON_FALSE(!vibe_audio_is_recording() && !s_streaming,
+                        ESP_ERR_INVALID_STATE, TAG, "audio busy");
+    ESP_RETURN_ON_FALSE(
+        xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(250)) == pdTRUE,
+        ESP_ERR_TIMEOUT, TAG, "audio lock");
+    if (vibe_audio_is_recording() || s_tx_handle != NULL || s_rx_handle != NULL) {
+        xSemaphoreGive(s_audio_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = vibe_board_speaker_set_enabled(true);
+#if VIBE_BOARD_HAS_ES8311
+    if (err == ESP_OK) {
+        err = init_i2s_std(true, false);
+    }
+    if (err == ESP_OK) {
+        err = init_codec(ESP_CODEC_DEV_TYPE_OUT, ESP_CODEC_DEV_WORK_MODE_DAC);
+    }
+#else
+    err = ESP_ERR_NOT_SUPPORTED;
+#endif
+    if (err != ESP_OK) {
+        release_session_resources();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_speaker_set_enabled(false));
+        xSemaphoreGive(s_audio_mutex);
+        return err;
+    }
+    s_streaming = true;
+    return ESP_OK;
+#endif
+}
+
+esp_err_t vibe_audio_play_stream_write(const uint8_t *pcm, size_t len)
+{
+    ESP_RETURN_ON_FALSE(pcm != NULL && len > 0 && (len % 2) == 0,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid stream pcm");
+#if VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    ESP_RETURN_ON_FALSE(s_streaming && s_codec != NULL,
+                        ESP_ERR_INVALID_STATE, TAG, "stream not open");
+    return esp_codec_dev_write(s_codec, (void *)pcm, (int)len) ==
+                   ESP_CODEC_DEV_OK
+               ? ESP_OK
+               : ESP_FAIL;
+#endif
+}
+
+esp_err_t vibe_audio_play_stream_end(void)
+{
+#if VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    ESP_RETURN_ON_FALSE(s_streaming, ESP_ERR_INVALID_STATE, TAG,
+                        "stream not open");
+    s_streaming = false;
+    release_session_resources();
+    esp_err_t err = vibe_board_speaker_set_enabled(false);
+    xSemaphoreGive(s_audio_mutex);
     return err;
 #endif
 }

@@ -35,6 +35,9 @@ esp_err_t vibe_audio_start(void);
 esp_err_t vibe_audio_stop(void);
 esp_err_t vibe_audio_play_sound(agent_sound_t sound);
 esp_err_t vibe_audio_play_pcm16_mono(const uint8_t *pcm, size_t len);
+esp_err_t vibe_audio_play_stream_begin(void);
+esp_err_t vibe_audio_play_stream_write(const uint8_t *pcm, size_t len);
+esp_err_t vibe_audio_play_stream_end(void);
 esp_err_t vibe_audio_read(uint8_t *buffer, size_t capacity, size_t *len, uint32_t timeout_ms);
 esp_err_t vibe_audio_read_batch(uint8_t *buffer, size_t capacity, size_t *len,
                                 size_t max_chunks, uint32_t timeout_ms);

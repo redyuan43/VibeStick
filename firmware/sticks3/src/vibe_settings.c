@@ -2,7 +2,13 @@
 
 #include <stddef.h>
 
-static const uint8_t SLEEP_MINUTES[] = {1, 2, 5, 10};
+static const uint8_t SLEEP_MINUTES[] = {
+    1,
+    2,
+    5,
+    10,
+    VIBE_SETTINGS_SLEEP_DISABLED_MINUTES,
+};
 
 bool vibe_settings_sleep_minutes_valid(uint8_t minutes)
 {
