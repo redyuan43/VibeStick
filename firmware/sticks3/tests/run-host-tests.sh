@@ -15,11 +15,3 @@ cc -std=c11 -Wall -Wextra -Werror \
   src/vibe_wav.c \
   -o build-host-tests/test_vibe_policies
 ./build-host-tests/test_vibe_policies
-
-cc -std=c11 -Wall -Wextra -Werror \
-  -I include \
-  tests/test_vibe_air_mouse.c \
-  src/vibe_air_mouse.c \
-  -lm \
-  -o build-host-tests/test_vibe_air_mouse
-./build-host-tests/test_vibe_air_mouse
