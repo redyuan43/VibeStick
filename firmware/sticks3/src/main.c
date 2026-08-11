@@ -11,6 +11,8 @@
 #include "vibe_board.h"
 #include "vibe_board_profile.h"
 #include "vibe_bridge_profile_policy.h"
+#include "vibe_cardputer_air_mouse.h"
+#include "vibe_cardputer_input_profile.h"
 #include "vibe_input.h"
 #include "vibe_keyboard.h"
 #include "vibe_motion.h"
@@ -115,10 +117,12 @@
 #define VIBE_STICK_DEEP_SLEEP_RETRY_MS 5000
 #define VIBE_STICK_DEEP_SLEEP_DIAGNOSTIC_REPORT_MS 30000
 #define VIBE_STICK_SETTINGS_TIMEOUT_MS 30000
-#define CARD_FN_CLICK_WINDOW_MS 180
+#define CARD_OPT_CLICK_WINDOW_MS 180
 #define CARD_KEYBOARD_REPORT_QUEUE_LENGTH 64
 #define CARD_KEYBOARD_REPORT_TIMEOUT_MS 700
 #define CARD_KEYBOARD_HEARTBEAT_MS 250
+#define CARD_POINTER_REPORT_TIMEOUT_MS 700
+#define CARD_POINTER_HEARTBEAT_MS 250
 #define VIBE_STICK_MOTION_WAKE_QUIET_MS 5000
 #define VIBE_STICK_MOTION_WAKE_SETTLE_TIMEOUT_MS 15000
 #define VIBE_STICK_MOTION_WAKE_NETWORK_TIMEOUT_MS 15000
@@ -304,6 +308,12 @@ typedef enum {
     VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT,
     VIBE_STICK_EVENT_SETTINGS_VALUE_NEXT,
     VIBE_STICK_EVENT_SETTINGS_CONFIRM,
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    VIBE_STICK_EVENT_CARD_OPT_TAP,
+    VIBE_STICK_EVENT_CARD_OPT_DOUBLE,
+    VIBE_STICK_EVENT_CARD_OPT_HOLD_START,
+    VIBE_STICK_EVENT_CARD_OPT_HOLD_STOP,
+#endif
 } agent_event_type_t;
 
 typedef struct {
@@ -434,6 +444,7 @@ typedef struct {
     uint8_t keys[6];
     uint8_t key_count;
 } card_keyboard_report_t;
+
 #endif
 
 static QueueHandle_t s_event_queue;
@@ -637,13 +648,15 @@ static QueueHandle_t s_card_keyboard_report_queue;
 static uint8_t s_card_host_usages[4][14];
 static uint8_t s_card_host_modifiers;
 static bool s_card_local_consumed[4][14];
-static esp_timer_handle_t s_card_fn_long_timer;
-static esp_timer_handle_t s_card_fn_confirm_timer;
-static esp_timer_handle_t s_card_fn_click_timer;
-static atomic_bool s_card_fn_down;
-static atomic_bool s_card_fn_chord;
-static atomic_bool s_card_fn_button_committed;
-static atomic_int s_card_fn_pending_clicks;
+static esp_timer_handle_t s_card_opt_long_timer;
+static esp_timer_handle_t s_card_opt_confirm_timer;
+static esp_timer_handle_t s_card_opt_click_timer;
+static atomic_bool s_card_opt_down;
+static atomic_bool s_card_opt_chord;
+static atomic_bool s_card_opt_button_committed;
+static atomic_int s_card_opt_pending_clicks;
+static vibe_card_input_profile_t s_card_input_profile;
+static vibe_card_input_route_t s_card_opt_active_hold_route;
 #endif
 
 static bool wifi_connected(void)
@@ -2072,6 +2085,9 @@ static bool enter_deep_sleep(void)
     s_front_status_led_pressed = false;
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_status_led_set(false));
     s_status_led_on = false;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    vibe_cardputer_air_mouse_stop();
+#endif
     ESP_LOGI(TAG,
              "entering deep sleep board=%s mode=%s timeout=%umin wake_mask=0x%llx",
              VIBE_BOARD_NAME, recording_mode_label(), (unsigned)s_sleep_minutes,
@@ -3231,7 +3247,7 @@ static void create_ui(void)
 
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
     s_card_home_hint = make_label(screen,
-                                  "Fn TAP TALK\nGO 2X SCAN\nGO HOLD SETUP",
+                                  "OPT TALK\nFN+M AIR MOUSE\nFN+S CONNECTION",
                                   FONT_UI,
                                   lv_color_hex(0x8a9099), 120,
                                   LV_TEXT_ALIGN_CENTER);
@@ -4002,6 +4018,9 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
     char pmic_irq[24] = {0};
     char pmic_timer[24] = {0};
     char pmic_gpio_wake[16] = {0};
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    char input_profile_revision[12] = {0};
+#endif
     device_id(id, sizeof(id));
     current_wifi_ssid(ssid, sizeof(ssid));
     current_wifi_bssid(bssid, sizeof(bssid));
@@ -4024,6 +4043,10 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
     snprintf(pmic_gpio_wake, sizeof(pmic_gpio_wake), "%02x/%02x",
              s_boot_power_status.gpio_wake_enable,
              s_boot_power_status.gpio_wake_config);
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    snprintf(input_profile_revision, sizeof(input_profile_revision), "%lu",
+             (unsigned long)s_card_input_profile.revision);
+#endif
     esp_http_client_set_header(client, "X-Vibe-Stick-Device-Id", id);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Ssid", ssid);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Bssid", bssid);
@@ -4036,6 +4059,10 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
                                reset_reason_label(s_boot_reset_reason));
     esp_http_client_set_header(client, "X-Vibe-Stick-Reset-Reason-Code", reset_code);
     esp_http_client_set_header(client, "X-Vibe-Stick-Boot-Count", boot_count);
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    esp_http_client_set_header(client, "X-Vibe-Stick-Input-Profile-Revision",
+                               input_profile_revision);
+#endif
     if (s_boot_power_status.available) {
         esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Wake", pmic_wake);
         esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Irq", pmic_irq);
@@ -5240,6 +5267,9 @@ static void start_ota_check_task(void)
                  wifi_connected(), ota_in_progress(), recording_network_busy());
         return;
     }
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    vibe_cardputer_air_mouse_stop();
+#endif
     set_ota_in_progress(true);
     BaseType_t ok = xTaskCreatePinnedToCore(ota_check_task, "ota_check", 8192, NULL, 3,
                                             &s_ota_task, VIBE_STICK_NETWORK_CORE);
@@ -5917,6 +5947,9 @@ static bool handle_recording_start_internal(const char *event_name, const char *
                                             bool notify_bridge)
 {
     register_activity();
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    vibe_cardputer_air_mouse_stop();
+#endif
     clear_ptt_followup_enter_window();
     clear_cyber_tts_wait();
     if (recording_network_busy() || s_tap_recording_active || s_motion_recording_active) {
@@ -6217,6 +6250,81 @@ static void post_device_command_ack(const char *command_id, const char *status,
     }
 }
 
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static bool json_number_in_range(cJSON *object, const char *key, float min,
+                                 float max, float *target)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsNumber(item) || item->valuedouble < min ||
+        item->valuedouble > max) {
+        return false;
+    }
+    *target = (float)item->valuedouble;
+    return true;
+}
+
+static bool json_bool_value(cJSON *object, const char *key, bool *target)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsBool(item)) return false;
+    *target = cJSON_IsTrue(item);
+    return true;
+}
+
+static esp_err_t apply_card_input_profile_payload(cJSON *payload)
+{
+    if (!cJSON_IsObject(payload)) return ESP_ERR_INVALID_ARG;
+    cJSON *revision = cJSON_GetObjectItemCaseSensitive(payload,
+                                                       "profile_revision");
+    cJSON *routes = cJSON_GetObjectItemCaseSensitive(payload, "opt_routes");
+    cJSON *mouse = cJSON_GetObjectItemCaseSensitive(payload, "air_mouse");
+    if (!cJSON_IsNumber(revision) || revision->valuedouble < 1 ||
+        !cJSON_IsObject(routes) || !cJSON_IsObject(mouse)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    vibe_card_input_profile_t next = s_card_input_profile;
+    next.revision = (uint32_t)revision->valuedouble;
+    cJSON *tap = cJSON_GetObjectItemCaseSensitive(routes, "opt_tap");
+    cJSON *double_click = cJSON_GetObjectItemCaseSensitive(routes,
+                                                           "opt_double");
+    cJSON *hold = cJSON_GetObjectItemCaseSensitive(routes, "opt_hold");
+    if (!cJSON_IsString(tap) || !cJSON_IsString(double_click) ||
+        !cJSON_IsString(hold) ||
+        !vibe_card_input_route_parse(tap->valuestring, &next.opt_tap) ||
+        !vibe_card_input_route_parse(double_click->valuestring,
+                                     &next.opt_double) ||
+        !vibe_card_input_route_parse(hold->valuestring, &next.opt_hold) ||
+        !json_bool_value(mouse, "invert_horizontal",
+                         &next.air_mouse.invert_horizontal) ||
+        !json_bool_value(mouse, "invert_vertical",
+                         &next.air_mouse.invert_vertical) ||
+        !json_bool_value(mouse, "invert_scroll",
+                         &next.air_mouse.invert_scroll) ||
+        !json_number_in_range(mouse, "pointer_speed", 0.5f, 2.5f,
+                              &next.air_mouse.pointer_speed) ||
+        !json_number_in_range(mouse, "wheel_speed", 0.5f, 2.0f,
+                              &next.air_mouse.wheel_speed) ||
+        !json_number_in_range(mouse, "pointer_deadzone_dps", 1.0f, 6.0f,
+                              &next.air_mouse.pointer_deadzone_dps) ||
+        !json_number_in_range(mouse, "wheel_deadzone_dps", 2.0f, 10.0f,
+                              &next.air_mouse.wheel_deadzone_dps) ||
+        !vibe_card_input_profile_valid(&next)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!vibe_cardputer_air_mouse_apply_settings(&next.air_mouse)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = vibe_card_input_profile_save(&next);
+    if (err == ESP_OK) {
+        s_card_input_profile = next;
+        ESP_LOGI(TAG, "Cardputer input profile applied revision=%lu",
+                 (unsigned long)next.revision);
+    }
+    return err;
+}
+#endif
+
 static void process_device_command(const char *response)
 {
     cJSON *root = cJSON_Parse(response);
@@ -6261,6 +6369,18 @@ static void process_device_command(const char *response)
     strlcpy(type_text, type->valuestring, sizeof(type_text));
     strlcpy(session_id_text, session_id->valuestring,
             sizeof(session_id_text));
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    if (strcmp(type_text, "input_profile_update") == 0) {
+        esp_err_t profile_err = apply_card_input_profile_payload(payload);
+        cJSON_Delete(root);
+        post_device_command_ack(command_id_text,
+                                profile_err == ESP_OK ? "completed" : "failed",
+                                session_id_text,
+                                profile_err == ESP_OK ? "" :
+                                esp_err_to_name(profile_err));
+        return;
+    }
+#endif
     cJSON_Delete(root);
 
     if (strcmp(type_text, "recording_start") == 0) {
@@ -7075,6 +7195,7 @@ static void card_setup_enter(void)
         (void)vibe_audio_play_sound(VIBE_STICK_SOUND_ERROR);
         return;
     }
+    vibe_cardputer_air_mouse_stop();
 
     memset(&s_card_setup_draft, 0, sizeof(s_card_setup_draft));
     if (s_wifi_profile_count > 0 && s_wifi_profile_index < s_wifi_profile_count) {
@@ -7425,133 +7546,276 @@ static void card_keyboard_report_task(void *arg)
     }
 }
 
-static void card_fn_stop_timer(esp_timer_handle_t timer)
+static void card_opt_stop_timer(esp_timer_handle_t timer)
 {
     if (timer) {
         (void)esp_timer_stop(timer);
     }
 }
 
-static void card_fn_cancel_hold_timers(void)
+static void card_opt_cancel_hold_timers(void)
 {
-    card_fn_stop_timer(s_card_fn_long_timer);
-    card_fn_stop_timer(s_card_fn_confirm_timer);
+    card_opt_stop_timer(s_card_opt_long_timer);
+    card_opt_stop_timer(s_card_opt_confirm_timer);
 }
 
-static void card_fn_long_timer_cb(void *arg)
+static void card_opt_long_timer_cb(void *arg)
 {
     (void)arg;
-    if (!atomic_load(&s_card_fn_down) || atomic_load(&s_card_fn_chord)) {
+    if (!atomic_load(&s_card_opt_down) || atomic_load(&s_card_opt_chord)) {
         return;
     }
     bool expected = false;
-    if (!atomic_compare_exchange_strong(&s_card_fn_button_committed,
+    if (!atomic_compare_exchange_strong(&s_card_opt_button_committed,
                                         &expected, true)) {
         return;
     }
-    button_press_down_cb(NULL, NULL);
-    button_long_start_cb(NULL, NULL);
+    s_card_opt_active_hold_route = s_card_input_profile.opt_hold;
+    queue_event(VIBE_STICK_EVENT_CARD_OPT_HOLD_START);
 }
 
-static void card_fn_confirm_timer_cb(void *arg)
+static void card_opt_confirm_timer_cb(void *arg)
 {
     (void)arg;
-    if (!atomic_load(&s_card_fn_down) || atomic_load(&s_card_fn_chord)) {
+    if (!atomic_load(&s_card_opt_down) || atomic_load(&s_card_opt_chord)) {
         return;
     }
     bool expected = false;
-    if (atomic_compare_exchange_strong(&s_card_fn_button_committed,
+    if (atomic_compare_exchange_strong(&s_card_opt_button_committed,
                                        &expected, true)) {
         button_press_down_cb(NULL, NULL);
     }
     bridge_selection_confirm_long_cb(NULL, NULL);
 }
 
-static void card_fn_click_timer_cb(void *arg)
+static void card_opt_click_timer_cb(void *arg)
 {
     (void)arg;
-    if (atomic_exchange(&s_card_fn_pending_clicks, 0) == 1) {
-        button_single_click_cb(NULL, NULL);
+    if (atomic_exchange(&s_card_opt_pending_clicks, 0) == 1) {
+        queue_event(VIBE_STICK_EVENT_CARD_OPT_TAP);
     }
 }
 
-static esp_err_t card_fn_gesture_init(void)
+static esp_err_t card_opt_gesture_init(void)
 {
     const esp_timer_create_args_t long_args = {
-        .callback = card_fn_long_timer_cb,
-        .name = "card_fn_long",
+        .callback = card_opt_long_timer_cb,
+        .name = "card_opt_long",
         .skip_unhandled_events = true,
     };
     const esp_timer_create_args_t confirm_args = {
-        .callback = card_fn_confirm_timer_cb,
-        .name = "card_fn_confirm",
+        .callback = card_opt_confirm_timer_cb,
+        .name = "card_opt_confirm",
         .skip_unhandled_events = true,
     };
     const esp_timer_create_args_t click_args = {
-        .callback = card_fn_click_timer_cb,
-        .name = "card_fn_click",
+        .callback = card_opt_click_timer_cb,
+        .name = "card_opt_click",
         .skip_unhandled_events = true,
     };
-    ESP_RETURN_ON_ERROR(esp_timer_create(&long_args, &s_card_fn_long_timer),
-                        TAG, "create Cardputer Fn long timer");
-    ESP_RETURN_ON_ERROR(esp_timer_create(&confirm_args, &s_card_fn_confirm_timer),
-                        TAG, "create Cardputer Fn confirm timer");
-    return esp_timer_create(&click_args, &s_card_fn_click_timer);
+    ESP_RETURN_ON_ERROR(esp_timer_create(&long_args, &s_card_opt_long_timer),
+                        TAG, "create Cardputer Opt long timer");
+    ESP_RETURN_ON_ERROR(esp_timer_create(&confirm_args, &s_card_opt_confirm_timer),
+                        TAG, "create Cardputer Opt confirm timer");
+    return esp_timer_create(&click_args, &s_card_opt_click_timer);
 }
 
-static void card_fn_press(void)
+static void card_opt_press(void)
 {
-    if (atomic_exchange(&s_card_fn_down, true)) {
+    if (atomic_exchange(&s_card_opt_down, true)) {
         return;
     }
-    atomic_store(&s_card_fn_chord, false);
-    atomic_store(&s_card_fn_button_committed, false);
+    atomic_store(&s_card_opt_chord, false);
+    atomic_store(&s_card_opt_button_committed, false);
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(
-        s_card_fn_long_timer, FRONT_PTT_LONG_PRESS_MS * 1000ULL));
+        s_card_opt_long_timer, FRONT_PTT_LONG_PRESS_MS * 1000ULL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(
-        s_card_fn_confirm_timer, BRIDGE_SELECTION_CONFIRM_HOLD_MS * 1000ULL));
+        s_card_opt_confirm_timer, BRIDGE_SELECTION_CONFIRM_HOLD_MS * 1000ULL));
 }
 
-static bool card_fn_mark_chord(void)
+static bool card_opt_mark_chord(void)
 {
-    if (!atomic_load(&s_card_fn_down)) {
+    if (!atomic_load(&s_card_opt_down)) {
         return true;
     }
-    if (atomic_load(&s_card_fn_button_committed)) {
+    if (atomic_load(&s_card_opt_button_committed)) {
         return false;
     }
-    atomic_store(&s_card_fn_chord, true);
-    card_fn_cancel_hold_timers();
+    atomic_store(&s_card_opt_chord, true);
+    card_opt_cancel_hold_timers();
     return true;
 }
 
-static void card_fn_release(void)
+static void card_opt_release(void)
 {
-    if (!atomic_exchange(&s_card_fn_down, false)) {
+    if (!atomic_exchange(&s_card_opt_down, false)) {
         return;
     }
-    card_fn_cancel_hold_timers();
-    if (atomic_exchange(&s_card_fn_chord, false)) {
-        atomic_store(&s_card_fn_button_committed, false);
+    card_opt_cancel_hold_timers();
+    if (atomic_exchange(&s_card_opt_chord, false)) {
+        atomic_store(&s_card_opt_button_committed, false);
         return;
     }
-    if (atomic_exchange(&s_card_fn_button_committed, false)) {
-        button_up_cb(NULL, NULL);
+    if (atomic_exchange(&s_card_opt_button_committed, false)) {
+        queue_event(VIBE_STICK_EVENT_CARD_OPT_HOLD_STOP);
         return;
     }
 
     button_press_down_cb(NULL, NULL);
     button_up_cb(NULL, NULL);
-    const int clicks = atomic_fetch_add(&s_card_fn_pending_clicks, 1) + 1;
+    const int clicks = atomic_fetch_add(&s_card_opt_pending_clicks, 1) + 1;
     if (clicks >= 2) {
-        atomic_store(&s_card_fn_pending_clicks, 0);
-        card_fn_stop_timer(s_card_fn_click_timer);
-        button_double_click_cb(NULL, NULL);
+        atomic_store(&s_card_opt_pending_clicks, 0);
+        card_opt_stop_timer(s_card_opt_click_timer);
+        queue_event(VIBE_STICK_EVENT_CARD_OPT_DOUBLE);
     } else {
-        card_fn_stop_timer(s_card_fn_click_timer);
+        card_opt_stop_timer(s_card_opt_click_timer);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(
-            s_card_fn_click_timer, CARD_FN_CLICK_WINDOW_MS * 1000ULL));
+            s_card_opt_click_timer, CARD_OPT_CLICK_WINDOW_MS * 1000ULL));
     }
+}
+
+static esp_err_t card_pointer_post(const char *path, const char *body,
+                                   char *response, size_t response_len,
+                                   int timeout_ms, void *context)
+{
+    (void)context;
+    return http_request_timeout("POST", path, body, response,
+                                (int)response_len, timeout_ms);
+}
+
+static bool card_pointer_online(void *context)
+{
+    (void)context;
+    return wifi_connected();
+}
+
+static void card_post_mapped_input(const char *control, const char *phase)
+{
+    static uint32_t sequence;
+    char body[256];
+    snprintf(body, sizeof(body),
+             "{\"protocol_version\":1,\"session_id\":\"%08lx\","
+             "\"sequence\":%lu,\"control\":\"%s\",\"phase\":\"%s\"}",
+             (unsigned long)s_retained_boot_count,
+             (unsigned long)sequence++, control, phase);
+    char response[160] = {0};
+    esp_err_t err = http_request_timeout(
+        "POST", VIBE_STICK_DEVICE_INPUT_EVENT_PATH, body, response,
+        sizeof(response), CARD_KEYBOARD_REPORT_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mapped input delivery failed control=%s phase=%s: %s",
+                 control, phase, esp_err_to_name(err));
+        show_recording_overlay("HOST OFFLINE", "MAPPING UNAVAILABLE", true);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        show_recording_overlay(NULL, NULL, false);
+    }
+}
+
+static void card_dispatch_input_route(vibe_card_input_route_t route,
+                                      const char *control,
+                                      const char *phase)
+{
+    switch (route) {
+    case VIBE_CARD_ROUTE_HOST:
+        card_post_mapped_input(control, phase);
+        break;
+    case VIBE_CARD_ROUTE_DEVICE_RECORDING_TOGGLE:
+        if (strcmp(phase, "trigger") == 0) {
+            button_single_click_cb(NULL, NULL);
+        }
+        break;
+    case VIBE_CARD_ROUTE_DEVICE_RECORDING_HOLD:
+        if (strcmp(phase, "press") == 0) {
+            button_press_down_cb(NULL, NULL);
+            button_long_start_cb(NULL, NULL);
+        } else if (strcmp(phase, "release") == 0) {
+            button_up_cb(NULL, NULL);
+        }
+        break;
+    case VIBE_CARD_ROUTE_DEVICE_LEGACY_DOUBLE:
+        if (strcmp(phase, "trigger") == 0) {
+            button_double_click_cb(NULL, NULL);
+        }
+        break;
+    case VIBE_CARD_ROUTE_NONE:
+    default:
+        break;
+    }
+}
+
+static bool card_air_mouse_busy(void *context)
+{
+    (void)context;
+    return recording_network_busy() || ota_in_progress() ||
+           settings_active() || s_motion_calibrating ||
+           atomic_load(&s_bridge_selection_active);
+}
+
+static bool card_air_mouse_keep_motion_active(void *context)
+{
+    (void)context;
+    return s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK;
+}
+
+static void card_air_mouse_release_keyboard(void *context)
+{
+    (void)context;
+    card_keyboard_release_host_state();
+}
+
+static void card_air_mouse_activity(void *context)
+{
+    (void)context;
+    register_activity();
+}
+
+static void card_air_mouse_status(vibe_card_air_mouse_status_t status,
+                                  uint16_t progress, void *context)
+{
+    (void)context;
+    const char *title = "AIR MOUSE";
+    const char *detail = "FN+M TO START";
+    const vibe_stick_pet_frame_id_t *frames = s_mode_switch_dict_frames;
+    size_t frame_count = sizeof(s_mode_switch_dict_frames) /
+                         sizeof(s_mode_switch_dict_frames[0]);
+    lv_color_t color = lv_color_hex(0x8a9099);
+    char progress_text[32];
+
+    switch (status) {
+    case VIBE_CARD_AIR_MOUSE_DISABLED:
+        title = "AIR MOUSE OFF";
+        break;
+    case VIBE_CARD_AIR_MOUSE_CALIBRATING:
+        snprintf(progress_text, sizeof(progress_text), "KEEP STILL %u/%u",
+                 (unsigned)progress,
+                 (unsigned)VIBE_AIR_MOUSE_CALIBRATION_SAMPLES);
+        detail = progress_text;
+        color = lv_color_hex(0x93c5fd);
+        break;
+    case VIBE_CARD_AIR_MOUSE_READY:
+        detail = "SPACE LEFT  ENTER RIGHT";
+        frames = s_pet_done_frames;
+        frame_count = sizeof(s_pet_done_frames) /
+                      sizeof(s_pet_done_frames[0]);
+        color = lv_color_hex(0x86efac);
+        break;
+    case VIBE_CARD_AIR_MOUSE_BUSY:
+        detail = "BUSY";
+        color = lv_color_hex(0xfca5a5);
+        break;
+    case VIBE_CARD_AIR_MOUSE_UNAVAILABLE:
+        detail = "IMU UNAVAILABLE";
+        color = lv_color_hex(0xfca5a5);
+        (void)vibe_audio_play_sound(VIBE_STICK_SOUND_ERROR);
+        break;
+    case VIBE_CARD_AIR_MOUSE_FAILED:
+        detail = "IMU FAILED";
+        color = lv_color_hex(0xfca5a5);
+        (void)vibe_audio_play_sound(VIBE_STICK_SOUND_ERROR);
+        break;
+    }
+    show_mode_switch_visual(title, detail, frames, frame_count, color);
 }
 
 static void card_keyboard_event(const vibe_key_event_t *event, void *context)
@@ -7566,6 +7830,10 @@ static void card_keyboard_event(const vibe_key_event_t *event, void *context)
         return;
     }
 
+    if (vibe_cardputer_air_mouse_handle_key(event)) {
+        return;
+    }
+
     if (s_card_setup_active || s_card_local_consumed[row][col]) {
         const bool edit_active = s_card_setup_active;
         if (event->pressed) {
@@ -7574,8 +7842,8 @@ static void card_keyboard_event(const vibe_key_event_t *event, void *context)
         if (edit_active) {
             card_setup_edit(event);
         }
-        if (event->key == VIBE_KEY_FN && !event->pressed) {
-            card_fn_release();
+        if (event->key == VIBE_KEY_OPT && !event->pressed) {
+            card_opt_release();
         }
         if (!event->pressed) {
             s_card_local_consumed[row][col] = false;
@@ -7587,17 +7855,31 @@ static void card_keyboard_event(const vibe_key_event_t *event, void *context)
     if (event->key == VIBE_KEY_FN) {
         if (event->pressed) {
             register_activity();
-            card_fn_press();
-        } else {
-            card_fn_release();
         }
         return;
     }
 
-    if (event->pressed && atomic_load(&s_card_fn_down)) {
-        if (!card_fn_mark_chord()) {
+    if (event->key == VIBE_KEY_OPT) {
+        if (event->pressed) {
+            register_activity();
+            card_opt_press();
+        } else {
+            if (atomic_load(&s_card_opt_chord)) {
+                s_card_host_modifiers = event->hid_modifiers;
+                card_keyboard_queue_current_report();
+            }
+            card_opt_release();
+        }
+        return;
+    }
+
+    if (event->pressed && atomic_load(&s_card_opt_down)) {
+        if (!card_opt_mark_chord()) {
+            s_card_local_consumed[row][col] = true;
             return;
         }
+    }
+    if (event->pressed && event->fn) {
         if (row == 2 && col == 3) { // Official Fn+S has no HID value.
             s_card_local_consumed[row][col] = true;
             card_keyboard_release_host_state();
@@ -7754,7 +8036,11 @@ static uint32_t state_poll_interval_ms(int64_t now_ms)
 
 static uint32_t app_task_wait_ms(void)
 {
-    if (s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK ||
+    if (
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        vibe_cardputer_air_mouse_enabled() ||
+#endif
+        s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK ||
         (s_display_power_state == DISPLAY_POWER_ACTIVE &&
          s_current_backlight != LCD_BACKLIGHT_DEFAULT) ||
         (s_display_power_state == DISPLAY_POWER_DIMMED &&
@@ -7820,6 +8106,11 @@ static void app_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(700));
             show_recording_overlay(NULL, NULL, false);
         }
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        if (vibe_cardputer_air_mouse_enabled()) {
+            vibe_cardputer_air_mouse_poll(now_ms);
+        } else
+        #endif
         if (!settings_active() && vibe_motion_available() &&
             s_recording_trigger_mode == RECORDING_TRIGGER_LIFT_TO_TALK) {
             vibe_motion_event_t motion_event = vibe_motion_poll(now_ms);
@@ -7976,6 +8267,25 @@ static void app_task(void *arg)
             show_recording_overlay(NULL, NULL, false);
             break;
         }
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        case VIBE_STICK_EVENT_CARD_OPT_TAP:
+            card_dispatch_input_route(s_card_input_profile.opt_tap,
+                                      "cardputer.opt.tap", "trigger");
+            break;
+        case VIBE_STICK_EVENT_CARD_OPT_DOUBLE:
+            card_dispatch_input_route(s_card_input_profile.opt_double,
+                                      "cardputer.opt.double", "trigger");
+            break;
+        case VIBE_STICK_EVENT_CARD_OPT_HOLD_START:
+            card_dispatch_input_route(s_card_opt_active_hold_route,
+                                      "cardputer.opt.hold", "press");
+            break;
+        case VIBE_STICK_EVENT_CARD_OPT_HOLD_STOP:
+            card_dispatch_input_route(s_card_opt_active_hold_route,
+                                      "cardputer.opt.hold", "release");
+            s_card_opt_active_hold_route = VIBE_CARD_ROUTE_NONE;
+            break;
+#endif
         case VIBE_STICK_EVENT_OTA_CHECK:
             start_ota_check_task();
             break;
@@ -8172,11 +8482,39 @@ void app_main(void)
     s_card_keyboard_report_queue = xQueueCreate(
         CARD_KEYBOARD_REPORT_QUEUE_LENGTH, sizeof(card_keyboard_report_t));
     ESP_ERROR_CHECK(s_card_keyboard_report_queue ? ESP_OK : ESP_ERR_NO_MEM);
-    ESP_ERROR_CHECK(card_fn_gesture_init());
+    ESP_ERROR_CHECK(card_opt_gesture_init());
     BaseType_t keyboard_report_ok = xTaskCreatePinnedToCore(
         card_keyboard_report_task, "keyboard_report", 6144, NULL, 3, NULL,
         VIBE_STICK_NETWORK_CORE);
     ESP_ERROR_CHECK(keyboard_report_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    const vibe_card_air_mouse_config_t air_mouse_config = {
+        .pointer = {
+            .path = VIBE_STICK_DEVICE_POINTER_REPORT_PATH,
+            .timeout_ms = CARD_POINTER_REPORT_TIMEOUT_MS,
+            .heartbeat_ms = CARD_POINTER_HEARTBEAT_MS,
+            .post = card_pointer_post,
+            .online = card_pointer_online,
+        },
+        .busy = card_air_mouse_busy,
+        .keep_motion_active = card_air_mouse_keep_motion_active,
+        .release_keyboard = card_air_mouse_release_keyboard,
+        .activity = card_air_mouse_activity,
+        .status = card_air_mouse_status,
+    };
+    ESP_ERROR_CHECK(vibe_cardputer_air_mouse_init(&air_mouse_config));
+    vibe_card_input_profile_default(&s_card_input_profile);
+    esp_err_t input_profile_err =
+        vibe_card_input_profile_load(&s_card_input_profile);
+    if (input_profile_err != ESP_OK &&
+        input_profile_err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "Cardputer input profile load skipped: %s",
+                 esp_err_to_name(input_profile_err));
+        vibe_card_input_profile_default(&s_card_input_profile);
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        vibe_cardputer_air_mouse_apply_settings(
+            &s_card_input_profile.air_mouse)
+            ? ESP_OK : ESP_ERR_INVALID_ARG);
     ESP_ERROR_CHECK(vibe_keyboard_init(card_keyboard_event, NULL));
 #endif
     capture_deep_sleep_front_button_intent();

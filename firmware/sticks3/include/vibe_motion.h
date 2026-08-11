@@ -16,8 +16,14 @@ typedef struct {
     float gyro_bias[3];
 } vibe_motion_calibration_t;
 
+typedef struct {
+    float accel_g[3];
+    float gyro_dps[3];
+} vibe_motion_sample_t;
+
 esp_err_t vibe_motion_init(void);
 bool vibe_motion_available(void);
+esp_err_t vibe_motion_read_raw_sample(vibe_motion_sample_t *sample);
 esp_err_t vibe_motion_suspend(void);
 esp_err_t vibe_motion_resume(void);
 bool vibe_motion_suspended(void);
