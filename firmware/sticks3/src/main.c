@@ -4154,12 +4154,16 @@ static bool bridge_parse_discovered_health(const char *response, const char *hos
         return false;
     }
     cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
+#if !defined(VIBE_BOARD_CARDPUTER_ADV)
     cJSON *bridge_name = cJSON_GetObjectItemCaseSensitive(root, "bridge_name");
+#endif
     cJSON *bridge_id = cJSON_GetObjectItemCaseSensitive(root, "bridge_id");
     cJSON *bridge_label = cJSON_GetObjectItemCaseSensitive(root, "bridge_label");
-    bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok) &&
-                   cJSON_IsString(bridge_name) &&
-                   vibe_bridge_health_name_supported(bridge_name->valuestring);
+    bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok);
+#if !defined(VIBE_BOARD_CARDPUTER_ADV)
+    healthy = healthy && cJSON_IsString(bridge_name) &&
+              vibe_bridge_health_name_supported(bridge_name->valuestring);
+#endif
     if (!healthy) {
         cJSON_Delete(root);
         return false;
