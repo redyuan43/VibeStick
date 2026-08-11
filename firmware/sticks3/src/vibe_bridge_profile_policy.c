@@ -120,14 +120,14 @@ int vibe_bridge_discovered_profile_find(
     size_t count,
     const bridge_discovered_profile_t *profile)
 {
-    if (!profiles || !profile || profile->id[0] == '\0') {
+    if (!profiles || !profile || profile->host[0] == '\0' ||
+        profile->port <= 0) {
         return -1;
     }
     for (size_t index = 0; index < count; index++) {
         const bridge_discovered_profile_t *stored = &profiles[index];
-        if ((stored->id[0] != '\0' && strcmp(stored->id, profile->id) == 0) ||
-            (strcmp(stored->host, profile->host) == 0 &&
-             stored->port == profile->port)) {
+        if (strcmp(stored->host, profile->host) == 0 &&
+            stored->port == profile->port) {
             return (int)index;
         }
     }

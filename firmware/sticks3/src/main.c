@@ -195,7 +195,6 @@
 #define BRIDGE_PROFILE_STORE_KEY "profiles"
 #define BRIDGE_PROFILE_STORE_MAGIC 0x56424250u
 #define BRIDGE_PROFILE_STORE_VERSION 1
-#define CARD_SETUP_MANUAL_BRIDGE_ID "cardputer-manual"
 #define BRIDGE_DISCOVERY_CONNECT_TIMEOUT_MS 250
 #define BRIDGE_DISCOVERY_SOCKET_BATCH_SIZE 6
 #define BRIDGE_DISCOVERY_HEALTH_TIMEOUT_MS 900
@@ -802,6 +801,7 @@ static void bridge_target_copy(bridge_target_t *target);
 static bool bridge_target_profile_snapshot(const bridge_target_t *target,
                                            bridge_profile_snapshot_t *snapshot);
 static bool bridge_profiles_merge_scan_results(const char *scan_ssid);
+static esp_err_t bridge_profiles_save_nvs_for_ssid(const char *ssid);
 static bool front_button_is_pressed(void);
 static void poll_front_button_fallback(int64_t now_ms);
 static void update_power_saving(int64_t now_ms);
@@ -3760,16 +3760,62 @@ static esp_err_t bridge_profiles_load_nvs(const char *current_ssid)
         return ESP_ERR_INVALID_VERSION;
     }
 
-    uint16_t restored_count = store->count;
     bridge_profiles_lock();
     memcpy(s_discovered_bridge_profiles, store->profiles,
            store->count * sizeof(store->profiles[0]));
     s_discovered_bridge_profile_count = store->count;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    bool normalized_changed = false;
+    size_t normalized_count = 0;
+    for (size_t index = 0; index < s_discovered_bridge_profile_count; index++) {
+        bridge_discovered_profile_t profile =
+            s_discovered_bridge_profiles[index];
+        if (profile.host[0] == '\0' || profile.port <= 0) {
+            normalized_changed = true;
+            continue;
+        }
+        char previous_id[sizeof(profile.id)];
+        char previous_label[sizeof(profile.label)];
+        strlcpy(previous_id, profile.id, sizeof(previous_id));
+        strlcpy(previous_label, profile.label, sizeof(previous_label));
+        vibe_bridge_fallback_id(profile.host, profile.id, sizeof(profile.id));
+        strlcpy(profile.label, profile.host, sizeof(profile.label));
+        normalized_changed |= strcmp(previous_id, profile.id) != 0 ||
+                              strcmp(previous_label, profile.label) != 0;
+        int existing = vibe_bridge_discovered_profile_find(
+            s_discovered_bridge_profiles, normalized_count, &profile);
+        if (existing >= 0) {
+            s_discovered_bridge_profiles[(size_t)existing] = profile;
+            normalized_changed = true;
+        } else {
+            s_discovered_bridge_profiles[normalized_count++] = profile;
+        }
+    }
+    if (normalized_count < VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT) {
+        memset(&s_discovered_bridge_profiles[normalized_count], 0,
+               (VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT - normalized_count) *
+                   sizeof(s_discovered_bridge_profiles[0]));
+    }
+    s_discovered_bridge_profile_count = normalized_count;
+#endif
+    uint16_t restored_count =
+        (uint16_t)s_discovered_bridge_profile_count;
     bridge_profile_views_rebuild();
     bridge_profiles_unlock();
     free(store);
     ESP_LOGI(TAG, "bridge profiles restored ssid=%s count=%u",
              current_ssid, (unsigned int)restored_count);
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    if (normalized_changed) {
+        err = bridge_profiles_save_nvs_for_ssid(current_ssid);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "bridge profile IP migration save failed: %s",
+                     esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "bridge profile NVS migrated to IP identity");
+        }
+    }
+#endif
     return ESP_OK;
 }
 
@@ -3839,6 +3885,22 @@ static int bridge_profile_index_by_id(const char *id)
         bridge_profile_snapshot_t profile;
         if (bridge_profile_snapshot_at(index, &profile) &&
             strcmp(profile.id, id) == 0) {
+            return (int)index;
+        }
+    }
+    return -1;
+}
+
+static int bridge_profile_index_by_endpoint(const char *host, int port)
+{
+    if (!host || host[0] == '\0' || port <= 0) {
+        return -1;
+    }
+    size_t count = bridge_profile_count();
+    for (size_t index = 0; index < count; index++) {
+        bridge_profile_snapshot_t profile;
+        if (bridge_profile_snapshot_at(index, &profile) &&
+            strcmp(profile.host, host) == 0 && profile.port == port) {
             return (int)index;
         }
     }
@@ -3927,25 +3989,29 @@ static esp_err_t bridge_target_load_nvs(void)
     ESP_RETURN_ON_ERROR(err, TAG, "open bridge target NVS");
 
     char ssid[WIFI_PROFILE_SSID_LEN] = {0};
-    char profile_id[BRIDGE_TARGET_PROFILE_LEN] = {0};
+    char host[BRIDGE_TARGET_HOST_LEN] = {0};
     size_t ssid_len = sizeof(ssid);
-    size_t profile_id_len = sizeof(profile_id);
+    size_t host_len = sizeof(host);
+    int32_t port = 0;
     err = nvs_get_str(handle, BRIDGE_TARGET_SSID_KEY, ssid, &ssid_len);
     if (err == ESP_OK) {
-        err = nvs_get_str(handle, BRIDGE_TARGET_PROFILE_KEY, profile_id, &profile_id_len);
+        err = nvs_get_str(handle, BRIDGE_TARGET_HOST_KEY, host, &host_len);
+    }
+    if (err == ESP_OK) {
+        err = nvs_get_i32(handle, BRIDGE_TARGET_PORT_KEY, &port);
     }
     nvs_close(handle);
     if (err != ESP_OK || strcmp(ssid, current_ssid) != 0) {
         return ESP_ERR_NOT_FOUND;
     }
 
-    int profile_index = bridge_profile_index_by_id(profile_id);
+    int profile_index = bridge_profile_index_by_endpoint(host, (int)port);
     if (profile_index < 0 ||
         !bridge_target_set_profile((size_t)profile_index, "nvs", false)) {
         return ESP_ERR_NOT_FOUND;
     }
-    ESP_LOGI(TAG, "bridge profile restored ssid=%s id=%s",
-             current_ssid, profile_id);
+    ESP_LOGI(TAG, "bridge endpoint restored ssid=%s host=%s port=%ld",
+             current_ssid, host, (long)port);
     return ESP_OK;
 }
 
@@ -3962,7 +4028,10 @@ static esp_err_t bridge_target_save_nvs(void)
     ESP_RETURN_ON_ERROR(err, TAG, "open bridge target NVS for write");
     err = nvs_set_str(handle, BRIDGE_TARGET_SSID_KEY, target.ssid);
     if (err == ESP_OK) {
-        err = nvs_set_str(handle, BRIDGE_TARGET_PROFILE_KEY, target.profile_id);
+        err = nvs_erase_key(handle, BRIDGE_TARGET_PROFILE_KEY);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;
+        }
     }
     if (err == ESP_OK) {
         err = nvs_set_str(handle, BRIDGE_TARGET_HOST_KEY, target.host);
@@ -4105,8 +4174,6 @@ static bool bridge_parse_discovered_health(const char *response, const char *hos
     }
     cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
     cJSON *bridge_name = cJSON_GetObjectItemCaseSensitive(root, "bridge_name");
-    cJSON *bridge_id = cJSON_GetObjectItemCaseSensitive(root, "bridge_id");
-    cJSON *bridge_label = cJSON_GetObjectItemCaseSensitive(root, "bridge_label");
     bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok) &&
                    cJSON_IsString(bridge_name) &&
                    vibe_bridge_health_name_supported(bridge_name->valuestring);
@@ -4120,19 +4187,8 @@ static bool bridge_parse_discovered_health(const char *response, const char *hos
     profile->port = port;
     strlcpy(profile->token, token ? token : "", sizeof(profile->token));
 
-    bool generic_id = vibe_bridge_identity_is_generic(
-        cJSON_IsString(bridge_id) ? bridge_id->valuestring : NULL);
-    if (generic_id) {
-        vibe_bridge_fallback_id(host, profile->id, sizeof(profile->id));
-    } else {
-        strlcpy(profile->id, bridge_id->valuestring, sizeof(profile->id));
-    }
-
-    bool generic_label = vibe_bridge_identity_is_generic(
-        cJSON_IsString(bridge_label) ? bridge_label->valuestring : NULL);
-    strlcpy(profile->label,
-            generic_label ? host : bridge_label->valuestring,
-            sizeof(profile->label));
+    vibe_bridge_fallback_id(host, profile->id, sizeof(profile->id));
+    strlcpy(profile->label, host, sizeof(profile->label));
     cJSON_Delete(root);
     return true;
 }
@@ -4197,10 +4253,6 @@ static bool bridge_probe_profile(const bridge_profile_config_t *profile, int tim
     cJSON *bridge_name = cJSON_GetObjectItemCaseSensitive(root, "bridge_name");
     cJSON *bridge_id = cJSON_GetObjectItemCaseSensitive(root, "bridge_id");
     bool generic_profile_id = strncmp(profile->id, "lan-", 4) == 0;
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    generic_profile_id = generic_profile_id ||
-                         strcmp(profile->id, CARD_SETUP_MANUAL_BRIDGE_ID) == 0;
-#endif
     bool healthy = cJSON_IsBool(ok) && cJSON_IsTrue(ok) &&
                    cJSON_IsString(bridge_name) &&
                    vibe_bridge_health_name_supported(bridge_name->valuestring) &&
@@ -4514,7 +4566,9 @@ static void bridge_ensure_target(void)
     if (current_ssid[0] != '\0' &&
         strcmp(s_bridge_profiles_loaded_ssid, current_ssid) != 0) {
         (void)bridge_profiles_load_nvs(current_ssid);
-        (void)bridge_target_load_nvs();
+        if (bridge_target_load_nvs() == ESP_OK) {
+            (void)bridge_target_save_nvs();
+        }
         strlcpy(s_bridge_profiles_loaded_ssid, current_ssid,
                 sizeof(s_bridge_profiles_loaded_ssid));
     }
@@ -7117,11 +7171,11 @@ static void card_setup_enter(void)
 static esp_err_t card_setup_store_manual_bridge(const char *ssid, int port)
 {
     bridge_discovered_profile_t manual = {0};
-    strlcpy(manual.id, CARD_SETUP_MANUAL_BRIDGE_ID, sizeof(manual.id));
-    strlcpy(manual.label, "Cardputer Bridge", sizeof(manual.label));
     strlcpy(manual.host, s_card_setup_draft.bridge_host, sizeof(manual.host));
     manual.port = port;
     strlcpy(manual.token, s_card_setup_draft.bridge_token, sizeof(manual.token));
+    vibe_bridge_fallback_id(manual.host, manual.id, sizeof(manual.id));
+    strlcpy(manual.label, manual.host, sizeof(manual.label));
 
     size_t manual_index = 0;
     bridge_profiles_lock();
@@ -7130,14 +7184,12 @@ static esp_err_t card_setup_store_manual_bridge(const char *ssid, int port)
                sizeof(s_discovered_bridge_profiles));
         s_discovered_bridge_profile_count = 0;
     }
-    bool found = false;
-    for (size_t i = 0; i < s_discovered_bridge_profile_count; ++i) {
-        if (strcmp(s_discovered_bridge_profiles[i].id,
-                   CARD_SETUP_MANUAL_BRIDGE_ID) == 0) {
-            manual_index = i;
-            found = true;
-            break;
-        }
+    int existing = vibe_bridge_discovered_profile_find(
+        s_discovered_bridge_profiles,
+        s_discovered_bridge_profile_count, &manual);
+    bool found = existing >= 0;
+    if (found) {
+        manual_index = (size_t)existing;
     }
     if (!found) {
         if (s_discovered_bridge_profile_count >=
