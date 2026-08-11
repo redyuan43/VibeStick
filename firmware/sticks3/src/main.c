@@ -3877,6 +3877,24 @@ static int bridge_profile_index_by_id(const char *id)
     return -1;
 }
 
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static int bridge_profile_index_by_endpoint(const char *host, int port)
+{
+    if (!host || host[0] == '\0' || port <= 0) {
+        return -1;
+    }
+    size_t count = bridge_profile_count();
+    for (size_t index = 0; index < count; index++) {
+        bridge_profile_snapshot_t profile;
+        if (bridge_profile_snapshot_at(index, &profile) &&
+            strcmp(profile.host, host) == 0 && profile.port == port) {
+            return (int)index;
+        }
+    }
+    return -1;
+}
+#endif
+
 static bool bridge_target_set_profile(size_t profile_index, const char *source, bool available)
 {
     bridge_profile_snapshot_t profile;
@@ -4473,6 +4491,20 @@ static void bridge_discovery_task(void *arg)
     size_t count = bridge_discover_subnet_profiles();
     if (count > 0) {
         (void)bridge_profiles_merge_scan_results(scan_ssid);
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        const int default_index = bridge_profile_index_by_endpoint(
+            VIBE_STICK_DEFAULT_BRIDGE_HOST, VIBE_STICK_DEFAULT_BRIDGE_PORT);
+        if (default_index >= 0 &&
+            bridge_target_set_profile((size_t)default_index,
+                                      "scan-default", false)) {
+            (void)bridge_target_save_nvs();
+            ESP_LOGI(TAG,
+                     "Cardputer scan selected default bridge host=%s port=%d",
+                     VIBE_STICK_DEFAULT_BRIDGE_HOST,
+                     VIBE_STICK_DEFAULT_BRIDGE_PORT);
+            (void)queue_event(VIBE_STICK_EVENT_POLL_STATE);
+        }
+#endif
         render_state();
         if (!atomic_load(&s_bridge_selection_active)) {
             char summary[24];
