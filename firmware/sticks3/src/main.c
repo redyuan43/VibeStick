@@ -103,7 +103,11 @@
 #define OTA_PERIODIC_CHECK_MS 300000
 #define OTA_BATTERY_CHECK_MS 1800000
 #define HTTP_CLIENT_BUFFER_SIZE 2048
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+#define BRIDGE_HEALTH_RESPONSE_BYTES 1024
+#else
 #define BRIDGE_HEALTH_RESPONSE_BYTES 512
+#endif
 #define TTS_AUDIO_MAX_BYTES (1024 * 1024)
 #define FIRMWARE_BUILD_ID __DATE__ " " __TIME__
 #define VIBE_STICK_APP_CORE 0
@@ -3263,7 +3267,7 @@ static void create_ui(void)
 
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
     s_card_home_hint = make_label(screen,
-                                  "OPT TALK\nFN+M AIR MOUSE\nFN+S CONNECTION",
+                                  "OPT TALK\nFN+M AIR MOUSE\nGO 2X SCAN",
                                   FONT_UI,
                                   lv_color_hex(0x8a9099), 120,
                                   LV_TEXT_ALIGN_CENTER);
