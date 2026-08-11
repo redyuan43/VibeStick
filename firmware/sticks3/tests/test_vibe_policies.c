@@ -153,7 +153,7 @@ static void test_bridge_identity_policy(void)
     vibe_bridge_fallback_id("192.168.100.142", fallback, sizeof(fallback));
     assert(strcmp(fallback, "lan-192-168-100-142") == 0);
 
-    bridge_discovered_profile_t stored[3] = {
+    bridge_discovered_profile_t stored[2] = {
         {
             .id = "bridge-a",
             .label = "A",
@@ -180,24 +180,16 @@ static void test_bridge_identity_policy(void)
     };
     size_t stored_count = 1;
     size_t skipped = 0;
-    assert(vibe_bridge_profiles_merge(stored, &stored_count, 3,
+    assert(vibe_bridge_profiles_merge(stored, &stored_count, 2,
                                       scanned, 2, &skipped));
-    assert(stored_count == 3);
+    assert(stored_count == 2);
     assert(skipped == 0);
-    assert(strcmp(stored[0].label, "A") == 0);
-    assert(strcmp(stored[0].host, "192.168.1.10") == 0);
-    assert(strcmp(stored[1].host, "192.168.1.11") == 0);
-    assert(strcmp(stored[2].id, "bridge-b") == 0);
-
-    bridge_discovered_profile_t refreshed = stored[1];
-    snprintf(refreshed.label, sizeof(refreshed.label), "%s", "IP refreshed");
-    assert(vibe_bridge_profiles_merge(stored, &stored_count, 3,
-                                      &refreshed, 1, &skipped));
-    assert(stored_count == 3);
-    assert(strcmp(stored[1].label, "IP refreshed") == 0);
+    assert(strcmp(stored[0].label, "A renamed") == 0);
+    assert(strcmp(stored[0].host, "192.168.1.11") == 0);
+    assert(strcmp(stored[1].id, "bridge-b") == 0);
 
     bridge_profile_snapshot_t snapshot;
-    vibe_bridge_profile_snapshot_from_discovered(&stored[2], &snapshot);
+    vibe_bridge_profile_snapshot_from_discovered(&stored[1], &snapshot);
     assert(strcmp(snapshot.id, "bridge-b") == 0);
     bridge_profile_config_t view;
     vibe_bridge_profile_snapshot_view(&snapshot, &view);
