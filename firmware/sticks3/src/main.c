@@ -240,13 +240,15 @@ static const vibe_wifi_profile_t k_configured_wifi_profiles[] = VIBE_STICK_WIFI_
 #endif
 
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
+#define VIBE_STICK_DEFAULT_BRIDGE_ID "lan-192-168-100-142"
 #define VIBE_STICK_DEFAULT_BRIDGE_HOST "192.168.100.142"
 #define VIBE_STICK_DEFAULT_BRIDGE_PORT 8765
 static const bridge_profile_config_t k_configured_bridge_profiles[] = {
-    {VIBE_STICK_BRIDGE_ID, VIBE_STICK_BRIDGE_LABEL,
+    {VIBE_STICK_DEFAULT_BRIDGE_ID, VIBE_STICK_BRIDGE_LABEL,
      VIBE_STICK_DEFAULT_BRIDGE_HOST, VIBE_STICK_DEFAULT_BRIDGE_PORT, ""},
 };
 #else
+#define VIBE_STICK_DEFAULT_BRIDGE_ID VIBE_STICK_BRIDGE_ID
 #define VIBE_STICK_DEFAULT_BRIDGE_HOST VIBE_STICK_BRIDGE_HOST
 #define VIBE_STICK_DEFAULT_BRIDGE_PORT VIBE_STICK_BRIDGE_PORT
 static const bridge_profile_config_t k_configured_bridge_profiles[] =
@@ -487,7 +489,7 @@ static bridge_target_t s_bridge_target = {
     .host = VIBE_STICK_DEFAULT_BRIDGE_HOST,
     .port = VIBE_STICK_DEFAULT_BRIDGE_PORT,
     .profile_index = 0,
-    .profile_id = VIBE_STICK_BRIDGE_ID,
+    .profile_id = VIBE_STICK_DEFAULT_BRIDGE_ID,
     .source = "boot",
     .ssid = "",
     .failure_count = 0,

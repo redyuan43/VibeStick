@@ -3,7 +3,7 @@
 #define VIBE_STICK_DEVICE_NAME "VibeStick"
 #define FIRMWARE_NAME "vibestick"
 #define VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.65"
-#define VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.34"
+#define VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.35"
 #define VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.39"
 #define VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.0"
 #if defined(VIBE_BOARD_STICKS3)
@@ -32,7 +32,12 @@
 #define VIBE_STICK_OTA_BIN_PATH "/ota/bin"
 #define VIBE_STICK_STATE_POLL_MS 2000
 
-#if __has_include("vibe_stick_secrets.h")
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+#define VIBE_STICK_WIFI_SSID ""
+#define VIBE_STICK_WIFI_PASSWORD ""
+#define VIBE_STICK_BRIDGE_HOST "127.0.0.1"
+#define VIBE_STICK_BRIDGE_PORT 8765
+#elif __has_include("vibe_stick_secrets.h")
 #include "vibe_stick_secrets.h"
 #else
 #define VIBE_STICK_WIFI_SSID ""
