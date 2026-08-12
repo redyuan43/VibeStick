@@ -36,10 +36,11 @@
 #define MESSAGE_NOTIFY_PATH MESSAGE_SYSTEM_DIR "/F1_New_SMS.wav"
 #define MESSAGE_MAX_COUNT 100
 #define MESSAGE_PAGE_SIZE 4
-#define MESSAGE_SYNC_RESPONSE_BYTES (24 * 1024)
+#define MESSAGE_SYNC_RESPONSE_BYTES (5 * 1024)
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
 #define MESSAGE_SYNC_INTERVAL_MS 10000
 #define MESSAGE_TASK_STACK_BYTES 8192
+#define MESSAGE_IO_BUFFER_BYTES 512
 #define MESSAGE_RESOURCE_PATH_PREFIX "/device/messages/resource?"
 #define MESSAGE_AUDIO_PATH_PREFIX "/device/messages/resource?kind=audio&id="
 
@@ -100,7 +101,7 @@ static bool file_sha256_matches(const char *path, const char *expected,
     mbedtls_sha256_context context;
     mbedtls_sha256_init(&context);
     mbedtls_sha256_starts(&context, 0);
-    uint8_t buffer[2048];
+    uint8_t buffer[MESSAGE_IO_BUFFER_BYTES];
     size_t count;
     while ((count = fread(buffer, 1, sizeof(buffer), file)) > 0) {
         mbedtls_sha256_update(&context, buffer, count);
@@ -308,7 +309,7 @@ static esp_err_t play_wav_file(const char *path)
         fclose(file);
         return ESP_ERR_INVALID_SIZE;
     }
-    uint8_t header[512];
+    uint8_t header[MESSAGE_IO_BUFFER_BYTES];
     size_t header_len = fread(header, 1, sizeof(header), file);
     size_t pcm_offset = 0;
     size_t pcm_len = 0;
@@ -319,7 +320,7 @@ static esp_err_t play_wav_file(const char *path)
         return ESP_ERR_INVALID_RESPONSE;
     }
     esp_err_t err = vibe_audio_play_stream_begin();
-    uint8_t buffer[2048];
+    uint8_t buffer[MESSAGE_IO_BUFFER_BYTES];
     size_t remaining = pcm_len;
     while (err == ESP_OK && remaining > 0) {
         size_t request = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
@@ -341,15 +342,22 @@ static void sync_once(void)
     if (!s_config.request || !s_config.download || !s_storage_ready) return;
     if (s_config.audio_busy && s_config.audio_busy()) return;
     bool received_new = false;
-    for (int page = 0; page < 6; page++) {
+    for (int page = 0; page < 25; page++) {
         char path[96];
-        snprintf(path, sizeof(path), "/device/messages/sync?after=%lu&limit=20",
+        snprintf(path, sizeof(path), "/device/messages/sync?after=%lu&limit=4",
                  (unsigned long)s_cursor);
         char *response = malloc(MESSAGE_SYNC_RESPONSE_BYTES);
-        if (!response) return;
+        if (!response) {
+            ESP_LOGW(TAG, "sync response allocation failed heap_largest=%u",
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            return;
+        }
         esp_err_t request_err = s_config.request("GET", path, NULL, response,
                                                  MESSAGE_SYNC_RESPONSE_BYTES);
         if (request_err != ESP_OK) {
+            ESP_LOGW(TAG, "sync request failed: %s stack_free=%u",
+                     esp_err_to_name(request_err),
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
             free(response);
             return;
         }
@@ -455,11 +463,12 @@ static void sync_task(void *argument)
     load_index();
     s_storage_ready = true;
     xSemaphoreGive(s_lock);
-    ESP_LOGI(TAG, "SD ready capacity=%lluMB messages=%u cursor=%lu stack_free=%u",
+    ESP_LOGI(TAG, "SD ready capacity=%lluMB messages=%u cursor=%lu stack_free=%u heap_largest=%u",
              ((unsigned long long)card->csd.capacity * card->csd.sector_size /
                                   (1024 * 1024)),
              (unsigned)s_message_count, (unsigned long)s_cursor,
-             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+             (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     vTaskDelay(pdMS_TO_TICKS(3000));
     while (true) {
         sync_once();

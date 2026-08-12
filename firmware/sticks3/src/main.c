@@ -725,6 +725,13 @@ static bool recording_network_busy(void)
            recording_finalize_active();
 }
 
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static bool card_message_busy(void)
+{
+    return recording_network_busy() || ota_in_progress();
+}
+#endif
+
 static agent_state_t s_state = {
     .time = "--:--",
     .wifi = false,
@@ -4711,7 +4718,7 @@ static esp_err_t card_message_download(const char *path,
         err = ESP_FAIL;
         goto cleanup;
     }
-    uint8_t buffer[4096];
+    uint8_t buffer[512];
     size_t total = 0;
     while (err == ESP_OK && total < (size_t)content_length) {
         size_t request = (size_t)content_length - total;
@@ -5311,23 +5318,33 @@ static void ota_check_task(void *arg)
 {
     (void)arg;
     char path[80];
-    char response[768] = {0};
-    vibe_ota_manifest_t manifest;
+    typedef struct {
+        char response[768];
+        vibe_ota_manifest_t manifest;
+    } ota_check_context_t;
+    ota_check_context_t *context = calloc(1, sizeof(*context));
     bool overlay_shown = false;
+
+    if (!context) {
+        ESP_LOGW(TAG, "OTA check skipped: no memory");
+        goto cleanup;
+    }
 
     snprintf(path, sizeof(path), "%s?board=%s", VIBE_STICK_OTA_MANIFEST_PATH, VIBE_BOARD_NAME);
     ESP_LOGD(TAG, "OTA check start path=%s", path);
-    esp_err_t err = http_request_timeout("GET", path, NULL, response, sizeof(response), 5000);
+    esp_err_t err = http_request_timeout("GET", path, NULL, context->response,
+                                         sizeof(context->response), 5000);
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "OTA manifest check failed: %s", esp_err_to_name(err));
-    } else if (!parse_ota_manifest(response, &manifest)) {
+    } else if (!parse_ota_manifest(context->response, &context->manifest)) {
         ESP_LOGD(TAG, "OTA manifest unavailable");
-    } else if (!ota_manifest_is_new(&manifest)) {
-        ESP_LOGD(TAG, "OTA no update board=%s build=%s", manifest.board, manifest.build_id);
+    } else if (!ota_manifest_is_new(&context->manifest)) {
+        ESP_LOGD(TAG, "OTA no update board=%s build=%s", context->manifest.board,
+                 context->manifest.build_id);
     } else {
         show_recording_overlay("OTA update", "", true);
         overlay_shown = true;
-        err = perform_ota_update(&manifest);
+        err = perform_ota_update(&context->manifest);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "OTA update failed: %s", esp_err_to_name(err));
             show_recording_overlay("OTA failed", "", true);
@@ -5338,6 +5355,10 @@ static void ota_check_task(void *arg)
     if (overlay_shown) {
         show_recording_overlay(NULL, NULL, false);
     }
+    ESP_LOGI(TAG, "OTA check complete stack_free=%u",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    free(context);
+cleanup:
     set_ota_in_progress(false);
     s_ota_task = NULL;
     vTaskDelete(NULL);
@@ -5358,7 +5379,13 @@ static void start_ota_check_task(void)
     vibe_cardputer_air_mouse_stop();
 #endif
     set_ota_in_progress(true);
-    BaseType_t ok = xTaskCreatePinnedToCore(ota_check_task, "ota_check", 8192, NULL, 3,
+    const uint32_t ota_stack_bytes =
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        6144;
+#else
+        8192;
+#endif
+    BaseType_t ok = xTaskCreatePinnedToCore(ota_check_task, "ota_check", ota_stack_bytes, NULL, 3,
                                             &s_ota_task, VIBE_STICK_NETWORK_CORE);
     if (ok != pdPASS) {
         set_ota_in_progress(false);
@@ -8620,7 +8647,7 @@ void app_main(void)
         .display_unlock = lvgl_unlock,
         .restore_home = render_state,
         .activity = register_activity,
-        .audio_busy = recording_network_busy,
+        .audio_busy = card_message_busy,
     };
     esp_err_t message_err = vibe_cardputer_messages_init(&message_config);
     if (message_err == ESP_OK) {
