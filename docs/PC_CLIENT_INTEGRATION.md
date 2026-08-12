@@ -277,6 +277,7 @@ Cardputer-Adv is a separate firmware target, not a MiniJoy Bluetooth variant.
 
 | Firmware release | Required CapsWriter GUI release | OTA board |
 | --- | --- | --- |
+| `cardputer-adv-v0.1.57` | `v1.0.16-agx-client` or newer | `cardputer_adv` |
 | `cardputer-adv-v0.1.26` | `v1.0.16-agx-client` or newer | `cardputer_adv` |
 
 The required GUI release provides the Cardputer Wi-Fi keyboard, pointer, and
