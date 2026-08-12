@@ -1,7 +1,7 @@
 idf_component_register(
-    SRCS "main.c" "vibe_air_mouse.c" "vibe_cardputer_air_mouse.c" "vibe_cardputer_input_profile.c" "vibe_pointer_client.c" "vibe_board.c" "vibe_audio.c" "vibe_motion.c" "vibe_input.c" "vibe_keyboard.c" "vibe_recording_upload.c" "vibe_stick_anim_assets.c" "vibe_settings.c" "vibe_ota_policy.c" "vibe_recording_policy.c" "vibe_power_policy.c" "vibe_bridge_profile_policy.c" "vibe_wifi_policy.c" "vibe_wav.c" "../../shared/sticks3_battery_curve.c" "../generated/vibe_stick_pet_assets.c"
+    SRCS "main.c" "vibe_air_mouse.c" "vibe_cardputer_air_mouse.c" "vibe_cardputer_input_profile.c" "vibe_cardputer_messages.c" "vibe_pointer_client.c" "vibe_board.c" "vibe_audio.c" "vibe_motion.c" "vibe_input.c" "vibe_keyboard.c" "vibe_recording_upload.c" "vibe_stick_anim_assets.c" "vibe_settings.c" "vibe_ota_policy.c" "vibe_recording_policy.c" "vibe_power_policy.c" "vibe_bridge_profile_policy.c" "vibe_wifi_policy.c" "vibe_wav.c" "../../shared/sticks3_battery_curve.c" "../generated/vibe_stick_pet_assets.c"
     INCLUDE_DIRS "../include" "../generated" "../../shared"
-    REQUIRES esp_wifi esp_http_client esp_event esp_netif nvs_flash json driver esp_adc esp_timer esp_lcd esp_codec_dev app_update esp_partition esp_app_format lwip
+    REQUIRES esp_wifi esp_http_client esp_event esp_netif nvs_flash json driver esp_adc esp_timer esp_lcd esp_codec_dev app_update esp_partition esp_app_format fatfs sdmmc mbedtls lwip
 )
 
 if(VIBE_BOARD STREQUAL "stickc_plus")

@@ -13,6 +13,7 @@
 #include "vibe_bridge_profile_policy.h"
 #include "vibe_cardputer_air_mouse.h"
 #include "vibe_cardputer_input_profile.h"
+#include "vibe_cardputer_messages.h"
 #include "vibe_input.h"
 #include "vibe_keyboard.h"
 #include "vibe_motion.h"
@@ -4659,6 +4660,92 @@ static esp_err_t http_request(const char *method, const char *path, const char *
     return http_request_timeout(method, path, body, response, response_len, 2500);
 }
 
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static esp_err_t card_message_request(const char *method, const char *path,
+                                      const char *body, char *response,
+                                      size_t response_len)
+{
+    return http_request_timeout(method, path, body, response,
+                                (int)response_len, 15000);
+}
+
+static esp_err_t card_message_download(const char *path,
+                                       const char *destination,
+                                       size_t maximum_size)
+{
+    static const char resource_prefix[] = "/device/messages/resource?";
+    if (!path || strncmp(path, resource_prefix, strlen(resource_prefix)) != 0 ||
+        !destination || maximum_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    bridge_target_t target;
+    ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG,
+                        "prepare message bridge target");
+    char url[320];
+    snprintf(url, sizeof(url), "http://%s:%d%s", target.host, target.port,
+             path);
+    const esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = 60000,
+        .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
+        .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    ESP_RETURN_ON_FALSE(client, ESP_ERR_NO_MEM, TAG, "message download init");
+    bridge_profile_snapshot_t profile;
+    set_common_http_headers(client,
+                            bridge_target_profile_snapshot(&target, &profile)
+                                ? profile.token
+                                : VIBE_STICK_BRIDGE_TOKEN);
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) goto cleanup;
+    int64_t content_length = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200 || content_length <= 0 ||
+        (uint64_t)content_length > maximum_size) {
+        err = ESP_ERR_INVALID_RESPONSE;
+        goto cleanup;
+    }
+    FILE *file = fopen(destination, "wb");
+    if (!file) {
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+    uint8_t buffer[4096];
+    size_t total = 0;
+    while (err == ESP_OK && total < (size_t)content_length) {
+        size_t request = (size_t)content_length - total;
+        if (request > sizeof(buffer)) request = sizeof(buffer);
+        int count = esp_http_client_read(client, (char *)buffer, (int)request);
+        if (count < 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        if (count == 0) {
+            if (esp_http_client_is_complete_data_received(client)) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (fwrite(buffer, 1, (size_t)count, file) != (size_t)count) {
+            err = ESP_FAIL;
+            break;
+        }
+        total += (size_t)count;
+    }
+    if (fclose(file) != 0 && err == ESP_OK) err = ESP_FAIL;
+    if (err == ESP_OK && total != (size_t)content_length) {
+        err = ESP_ERR_INVALID_SIZE;
+    }
+    if (err != ESP_OK) unlink(destination);
+
+cleanup:
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    bridge_target_note_result(target.profile_id, err);
+    return err;
+}
+#endif
+
 static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t body_len,
                                   char *response, int response_len)
 {
@@ -7830,6 +7917,11 @@ static void card_keyboard_event(const vibe_key_event_t *event, void *context)
         return;
     }
 
+    if (vibe_cardputer_messages_handle_key(event)) {
+        card_keyboard_release_host_state();
+        return;
+    }
+
     if (vibe_cardputer_air_mouse_handle_key(event)) {
         return;
     }
@@ -8520,6 +8612,24 @@ void app_main(void)
     capture_deep_sleep_front_button_intent();
     capture_deep_sleep_motion_intent();
     ESP_ERROR_CHECK(vibe_audio_init());
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    const vibe_cardputer_messages_config_t message_config = {
+        .request = card_message_request,
+        .download = card_message_download,
+        .display_lock = lvgl_lock,
+        .display_unlock = lvgl_unlock,
+        .restore_home = render_state,
+        .activity = register_activity,
+        .audio_busy = recording_network_busy,
+    };
+    esp_err_t message_err = vibe_cardputer_messages_init(&message_config);
+    if (message_err == ESP_OK) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_cardputer_messages_start());
+    } else {
+        ESP_LOGW(TAG, "Cardputer message center unavailable: %s",
+                 esp_err_to_name(message_err));
+    }
+#endif
     BaseType_t command_task_ok =
         xTaskCreatePinnedToCore(device_command_task, "device_commands", 8192,
                                 NULL, 3, NULL, VIBE_STICK_NETWORK_CORE);
