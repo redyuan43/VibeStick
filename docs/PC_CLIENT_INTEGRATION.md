@@ -252,6 +252,8 @@ stickc_plus.json
 stickc_plus.bin
 sticks3.json
 sticks3.bin
+cardputer_adv.json
+cardputer_adv.bin
 ```
 
 For a PC client maintained in a separate repository, either:
@@ -268,6 +270,19 @@ VIBE_STICK_OTA_DIR
 ```
 
 in that precedence order.
+
+## Cardputer-Adv Release Compatibility
+
+Cardputer-Adv is a separate firmware target, not a MiniJoy Bluetooth variant.
+
+| Firmware release | Required CapsWriter GUI release | OTA board |
+| --- | --- | --- |
+| `cardputer-adv-v0.1.26` | `v1.0.16-agx-client` or newer | `cardputer_adv` |
+
+The required GUI release provides the Cardputer Wi-Fi keyboard, pointer, and
+device-mapping bridge endpoints. Do not install a `minijoy-v*` firmware asset
+on Cardputer-Adv, and do not request the `stickc_plus_minijoy_bt` OTA channel
+from this board.
 
 ## Validation Checklist
 
