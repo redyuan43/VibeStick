@@ -104,7 +104,13 @@
 #define OTA_NO_PROGRESS_TIMEOUT_MS 20000
 #define OTA_PERIODIC_CHECK_MS 300000
 #define OTA_BATTERY_CHECK_MS 1800000
-#define HTTP_CLIENT_BUFFER_SIZE 2048
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+#define HTTP_CLIENT_RX_BUFFER_SIZE 512
+#define HTTP_CLIENT_TX_BUFFER_SIZE 512
+#else
+#define HTTP_CLIENT_RX_BUFFER_SIZE 2048
+#define HTTP_CLIENT_TX_BUFFER_SIZE 2048
+#endif
 #define BRIDGE_HEALTH_RESPONSE_BYTES 512
 #define TTS_AUDIO_MAX_BYTES (1024 * 1024)
 #define FIRMWARE_BUILD_ID __DATE__ " " __TIME__
@@ -153,7 +159,11 @@
 #define VIBE_STICK_STATE_POLL_INTERACTIVE_MS 15000
 #define VIBE_STICK_APP_IDLE_WAIT_MS 1000
 #define VIBE_STICK_APP_MOTION_WAIT_MS 20
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+#define VIBE_STICK_WIFI_IDLE_PS WIFI_PS_NONE
+#else
 #define VIBE_STICK_WIFI_IDLE_PS WIFI_PS_MIN_MODEM
+#endif
 #define VIBE_STICK_WIFI_RECONNECT_MAX_MS 30000
 #define VIBE_STICK_ANIM_PREVIEW 0
 #ifndef VIBE_STICK_SERIAL_DEBUG_ENABLED
@@ -1697,6 +1707,21 @@ static void register_activity(void)
         set_backlight(LCD_BACKLIGHT_DEFAULT);
     }
 }
+
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static void card_message_activity(void)
+{
+    s_last_activity_ms = esp_timer_get_time() / 1000;
+    s_next_deep_sleep_attempt_ms = 0;
+    s_motion_false_wake_sleep_deadline_ms = 0;
+    request_wifi_reconnect_now();
+    if (s_display_power_state != DISPLAY_POWER_ACTIVE ||
+        s_current_backlight != LCD_BACKLIGHT_DEFAULT) {
+        s_display_power_state = DISPLAY_POWER_ACTIVE;
+        set_backlight(LCD_BACKLIGHT_DEFAULT);
+    }
+}
+#endif
 
 static void update_power_saving(int64_t now_ms)
 {
@@ -3564,6 +3589,7 @@ static void current_wifi_ssid(char *ssid, size_t ssid_len)
     }
 }
 
+#if !defined(VIBE_BOARD_CARDPUTER_ADV)
 static void current_wifi_bssid(char *bssid, size_t bssid_len)
 {
     if (!bssid || bssid_len == 0) {
@@ -3577,6 +3603,7 @@ static void current_wifi_bssid(char *bssid, size_t bssid_len)
                  ap.bssid[3], ap.bssid[4], ap.bssid[5]);
     }
 }
+#endif
 
 static void device_id(char *id, size_t id_len)
 {
@@ -3919,7 +3946,13 @@ static void bridge_target_note_result(const char *expected_profile_id,
         s_bridge_target.available = true;
     } else {
         s_bridge_target.failure_count++;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        if (s_bridge_target.failure_count >= 3) {
+            s_bridge_target.available = false;
+        }
+#else
         s_bridge_target.available = false;
+#endif
     }
     if (s_bridge_target_lock) {
         xSemaphoreGive(s_bridge_target_lock);
@@ -4010,6 +4043,17 @@ static esp_err_t bridge_target_save_nvs(void)
 
 static void set_common_http_headers(esp_http_client_handle_t client, const char *token)
 {
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    char id[18] = {0};
+    device_id(id, sizeof(id));
+    esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Version",
+                               FIRMWARE_VERSION);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Board", VIBE_BOARD_NAME);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Device-Id", id);
+    if (token && token[0] != '\0') {
+        esp_http_client_set_header(client, "X-Vibe-Stick-Token", token);
+    }
+#else
     esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Name", FIRMWARE_NAME);
     esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Version", FIRMWARE_VERSION);
     esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Transport", TRANSPORT);
@@ -4029,9 +4073,6 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
     char pmic_irq[24] = {0};
     char pmic_timer[24] = {0};
     char pmic_gpio_wake[16] = {0};
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    char input_profile_revision[12] = {0};
-#endif
     device_id(id, sizeof(id));
     current_wifi_ssid(ssid, sizeof(ssid));
     current_wifi_bssid(bssid, sizeof(bssid));
@@ -4054,10 +4095,6 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
     snprintf(pmic_gpio_wake, sizeof(pmic_gpio_wake), "%02x/%02x",
              s_boot_power_status.gpio_wake_enable,
              s_boot_power_status.gpio_wake_config);
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    snprintf(input_profile_revision, sizeof(input_profile_revision), "%lu",
-             (unsigned long)s_card_input_profile.revision);
-#endif
     esp_http_client_set_header(client, "X-Vibe-Stick-Device-Id", id);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Ssid", ssid);
     esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Bssid", bssid);
@@ -4070,10 +4107,6 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
                                reset_reason_label(s_boot_reset_reason));
     esp_http_client_set_header(client, "X-Vibe-Stick-Reset-Reason-Code", reset_code);
     esp_http_client_set_header(client, "X-Vibe-Stick-Boot-Count", boot_count);
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    esp_http_client_set_header(client, "X-Vibe-Stick-Input-Profile-Revision",
-                               input_profile_revision);
-#endif
     if (s_boot_power_status.available) {
         esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Wake", pmic_wake);
         esp_http_client_set_header(client, "X-Vibe-Stick-Pmic-Irq", pmic_irq);
@@ -4084,6 +4117,7 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
     if (token && token[0] != '\0') {
         esp_http_client_set_header(client, "X-Vibe-Stick-Token", token);
     }
+#endif
 }
 
 static esp_err_t http_request_target(const char *method, const char *host, int port,
@@ -4104,8 +4138,8 @@ static esp_err_t http_request_target(const char *method, const char *host, int p
     esp_http_client_config_t config = {
         .url = url,
         .timeout_ms = timeout_ms,
-        .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
-        .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
+        .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
+        .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
         .event_handler = http_event_handler,
         .user_data = &capture,
     };
@@ -4681,6 +4715,9 @@ static esp_err_t card_message_request(const char *method, const char *path,
                                       const char *body, char *response,
                                       size_t response_len)
 {
+    if (!wifi_connected()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     return http_request_timeout(method, path, body, response,
                                 (int)response_len, 15000);
 }
@@ -4703,8 +4740,8 @@ static esp_err_t card_message_download(const char *path,
     const esp_http_client_config_t config = {
         .url = url,
         .timeout_ms = 60000,
-        .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
-        .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
+        .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
+        .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
     };
     xSemaphoreTake(s_http_client_lock, portMAX_DELAY);
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -4786,8 +4823,8 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     esp_http_client_config_t config = {
         .url = url,
         .timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS,
-        .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
-        .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
+        .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
+        .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
         .event_handler = http_event_handler,
         .user_data = &capture,
     };
@@ -4859,8 +4896,8 @@ static esp_err_t play_latest_tts_audio(void)
     const esp_http_client_config_t config = {
         .url = url,
         .timeout_ms = 30000,
-        .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
-        .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
+        .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
+        .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "tts http init");
@@ -5001,8 +5038,8 @@ static esp_err_t download_tts_audio(uint8_t **audio, size_t *audio_len)
     esp_http_client_config_t config = {
         .url = url,
         .timeout_ms = 30000,
-        .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
-        .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
+        .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
+        .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "tts http init");
@@ -5200,8 +5237,8 @@ static esp_err_t perform_ota_update(const vibe_ota_manifest_t *manifest)
     esp_http_client_config_t config = {
         .url = url,
         .timeout_ms = 30000,
-        .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
-        .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
+        .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
+        .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
         .keep_alive_enable = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -6571,9 +6608,7 @@ static void device_command_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(DEVICE_COMMAND_RETRY_DELAY_MS));
         }
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
-        else {
-            vTaskDelay(pdMS_TO_TICKS(DEVICE_COMMAND_RETRY_DELAY_MS));
-        }
+        vTaskDelay(pdMS_TO_TICKS(DEVICE_COMMAND_RETRY_DELAY_MS));
 #endif
     }
 }
@@ -7969,7 +8004,6 @@ static void card_keyboard_event(const vibe_key_event_t *event, void *context)
     if (row >= 4 || col >= 14) {
         return;
     }
-
     if (vibe_cardputer_messages_handle_key(event)) {
         card_keyboard_release_host_state();
         return;
@@ -7998,9 +8032,6 @@ static void card_keyboard_event(const vibe_key_event_t *event, void *context)
     }
 
     if (event->key == VIBE_KEY_FN) {
-        if (event->pressed) {
-            register_activity();
-        }
         return;
     }
 
@@ -8042,6 +8073,7 @@ static void card_keyboard_event(const vibe_key_event_t *event, void *context)
     }
     card_keyboard_queue_current_report();
 }
+
 #endif
 
 static void capture_deep_sleep_front_button_intent(void)
@@ -8678,7 +8710,7 @@ void app_main(void)
         .display_lock = lvgl_lock,
         .display_unlock = lvgl_unlock,
         .restore_home = render_state,
-        .activity = register_activity,
+        .activity = card_message_activity,
         .audio_busy = card_message_busy,
     };
     esp_err_t message_err = vibe_cardputer_messages_init(&message_config);
