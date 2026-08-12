@@ -6528,6 +6528,12 @@ static void process_device_command(const char *response)
 static void device_command_task(void *arg)
 {
     (void)arg;
+    const int poll_timeout_ms =
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        0;
+#else
+        DEVICE_COMMAND_POLL_TIMEOUT_MS;
+#endif
     while (true) {
         if (!wifi_connected() || ota_in_progress()) {
             vTaskDelay(pdMS_TO_TICKS(DEVICE_COMMAND_RETRY_DELAY_MS));
@@ -6537,11 +6543,11 @@ static void device_command_task(void *arg)
         snprintf(path, sizeof(path), "%s?cursor=%lu&timeout_ms=%d",
                  VIBE_STICK_DEVICE_COMMAND_POLL_PATH,
                  (unsigned long)s_device_command_cursor,
-                 DEVICE_COMMAND_POLL_TIMEOUT_MS);
+                 poll_timeout_ms);
         char response[1024] = {0};
         esp_err_t err = http_request_timeout(
             "GET", path, NULL, response, sizeof(response),
-            DEVICE_COMMAND_POLL_TIMEOUT_MS + 5000);
+            poll_timeout_ms + 5000);
         if (err == ESP_OK && response[0] != '\0') {
             process_device_command(response);
         } else if (err != ESP_OK) {
@@ -6549,6 +6555,11 @@ static void device_command_task(void *arg)
                      esp_err_to_name(err));
             vTaskDelay(pdMS_TO_TICKS(DEVICE_COMMAND_RETRY_DELAY_MS));
         }
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        else {
+            vTaskDelay(pdMS_TO_TICKS(DEVICE_COMMAND_RETRY_DELAY_MS));
+        }
+#endif
     }
 }
 

@@ -36,7 +36,7 @@
 #define MESSAGE_NOTIFY_PATH MESSAGE_SYSTEM_DIR "/F1_New_SMS.wav"
 #define MESSAGE_MAX_COUNT 100
 #define MESSAGE_PAGE_SIZE 4
-#define MESSAGE_SYNC_RESPONSE_BYTES (5 * 1024)
+#define MESSAGE_SYNC_RESPONSE_BYTES (2 * 1024)
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
 #define MESSAGE_SYNC_INTERVAL_MS 10000
 #define MESSAGE_TASK_STACK_BYTES 8192
@@ -342,9 +342,9 @@ static void sync_once(void)
     if (!s_config.request || !s_config.download || !s_storage_ready) return;
     if (s_config.audio_busy && s_config.audio_busy()) return;
     bool received_new = false;
-    for (int page = 0; page < 25; page++) {
+    for (int page = 0; page < MESSAGE_MAX_COUNT; page++) {
         char path[96];
-        snprintf(path, sizeof(path), "/device/messages/sync?after=%lu&limit=4",
+        snprintf(path, sizeof(path), "/device/messages/sync?after=%lu&limit=1",
                  (unsigned long)s_cursor);
         char *response = malloc(MESSAGE_SYNC_RESPONSE_BYTES);
         if (!response) {
