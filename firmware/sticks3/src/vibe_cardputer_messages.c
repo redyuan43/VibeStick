@@ -38,6 +38,7 @@
 #define MESSAGE_SYNC_RESPONSE_BYTES (24 * 1024)
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
 #define MESSAGE_SYNC_INTERVAL_MS 10000
+#define MESSAGE_TASK_STACK_BYTES 12288
 #define MESSAGE_RESOURCE_PATH_PREFIX "/device/messages/resource?"
 #define MESSAGE_AUDIO_PATH_PREFIX "/device/messages/resource?kind=audio&id="
 
@@ -409,6 +410,51 @@ static void sync_once(void)
 static void sync_task(void *argument)
 {
     (void)argument;
+    spi_bus_config_t bus = {
+        .mosi_io_num = VIBE_BOARD_PIN_SD_MOSI,
+        .miso_io_num = VIBE_BOARD_PIN_SD_MISO,
+        .sclk_io_num = VIBE_BOARD_PIN_SD_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    esp_err_t err = spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SD SPI bus init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI2_HOST;
+    sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot.gpio_cs = VIBE_BOARD_PIN_SD_CS;
+    slot.host_id = SPI2_HOST;
+    esp_vfs_fat_sdmmc_mount_config_t mount = {
+        .format_if_mount_failed = false,
+        .max_files = 8,
+        .allocation_unit_size = 16 * 1024,
+    };
+    sdmmc_card_t *card = NULL;
+    err = esp_vfs_fat_sdspi_mount(MESSAGE_MOUNT_POINT, &host, &slot,
+                                  &mount, &card);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SD mount failed: %s", esp_err_to_name(err));
+        spi_bus_free(SPI2_HOST);
+        vTaskDelete(NULL);
+        return;
+    }
+    mkdir_if_missing(MESSAGE_ROOT);
+    mkdir_if_missing(MESSAGE_AUDIO_DIR);
+    mkdir_if_missing(MESSAGE_SYSTEM_DIR);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    load_index();
+    s_storage_ready = true;
+    xSemaphoreGive(s_lock);
+    ESP_LOGI(TAG, "SD ready capacity=%lluMB messages=%u cursor=%lu stack_free=%u",
+             (unsigned long long)(card->csd.capacity * card->csd.sector_size /
+                                  (1024 * 1024)),
+             (unsigned)s_message_count, (unsigned long)s_cursor,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     vTaskDelay(pdMS_TO_TICKS(3000));
     while (true) {
         sync_once();
@@ -565,57 +611,21 @@ esp_err_t vibe_cardputer_messages_init(
     s_config = *config;
     s_lock = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_lock, ESP_ERR_NO_MEM, TAG, "message lock");
-    spi_bus_config_t bus = {
-        .mosi_io_num = VIBE_BOARD_PIN_SD_MOSI,
-        .miso_io_num = VIBE_BOARD_PIN_SD_MISO,
-        .sclk_io_num = VIBE_BOARD_PIN_SD_SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4096,
-    };
-    ESP_RETURN_ON_ERROR(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO),
-                        TAG, "SD SPI bus");
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = SPI2_HOST;
-    sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot.gpio_cs = VIBE_BOARD_PIN_SD_CS;
-    slot.host_id = SPI2_HOST;
-    esp_vfs_fat_sdmmc_mount_config_t mount = {
-        .format_if_mount_failed = false,
-        .max_files = 8,
-        .allocation_unit_size = 16 * 1024,
-    };
-    sdmmc_card_t *card = NULL;
-    esp_err_t err = esp_vfs_fat_sdspi_mount(MESSAGE_MOUNT_POINT, &host, &slot,
-                                             &mount, &card);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "SD mount failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    mkdir_if_missing(MESSAGE_ROOT);
-    mkdir_if_missing(MESSAGE_AUDIO_DIR);
-    mkdir_if_missing(MESSAGE_SYSTEM_DIR);
-    load_index();
-    s_storage_ready = true;
-    ESP_LOGI(TAG, "SD ready capacity=%lluMB messages=%u cursor=%lu",
-             (unsigned long long)(card->csd.capacity * card->csd.sector_size /
-                                  (1024 * 1024)),
-             (unsigned)s_message_count, (unsigned long)s_cursor);
     return ESP_OK;
 }
 
 esp_err_t vibe_cardputer_messages_start(void)
 {
-    if (!s_storage_ready) return ESP_ERR_INVALID_STATE;
     BaseType_t result = xTaskCreatePinnedToCore(sync_task, "card_messages",
-                                                8192, NULL, 2, NULL, 0);
+                                                MESSAGE_TASK_STACK_BYTES, NULL,
+                                                2, NULL, 0);
     return result == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
 {
     if (!event) return false;
-    if (!s_active && event->pressed && event->fn && event->row == 3 &&
+    if (!s_active && s_storage_ready && event->pressed && event->fn && event->row == 3 &&
         event->column == 8) {
         if (s_config.activity) s_config.activity();
         open_messages();
