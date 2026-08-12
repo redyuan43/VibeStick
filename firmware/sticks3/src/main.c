@@ -4485,15 +4485,8 @@ static void bridge_discovery_task(void *arg)
     size_t count = bridge_discover_subnet_profiles();
     if (count > 0) {
         (void)bridge_profiles_merge_scan_results(scan_ssid);
-        if (atomic_load(&s_bridge_selection_active) &&
-            bridge_target_needs_selection() &&
-            bridge_target_set_profile(0, "scan", true)) {
-            (void)bridge_target_save_nvs();
-        }
         render_state();
-        if (atomic_load(&s_bridge_selection_active)) {
-            refresh_bridge_selection_visual();
-        } else {
+        if (!atomic_load(&s_bridge_selection_active)) {
             char summary[24];
             snprintf(summary, sizeof(summary), "%u BRIDGES",
                      (unsigned int)count);
