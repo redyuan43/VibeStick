@@ -465,6 +465,7 @@ static atomic_bool s_deep_sleep_committed;
 static SemaphoreHandle_t s_bridge_target_lock;
 static SemaphoreHandle_t s_bridge_profiles_lock;
 static SemaphoreHandle_t s_bridge_probe_lock;
+static SemaphoreHandle_t s_http_client_lock;
 static bridge_discovered_profile_t
     s_discovered_bridge_profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
 static bridge_profile_config_t
@@ -4087,6 +4088,7 @@ static esp_err_t http_request_target(const char *method, const char *host, int p
                                      const char *token, const char *path, const char *body,
                                      char *response, int response_len, int timeout_ms)
 {
+    xSemaphoreTake(s_http_client_lock, portMAX_DELAY);
     char url[160];
     snprintf(url, sizeof(url), "http://%s:%d%s", host, port, path);
     http_response_capture_t capture = {
@@ -4106,7 +4108,11 @@ static esp_err_t http_request_target(const char *method, const char *host, int p
         .user_data = &capture,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "http init");
+    if (!client) {
+        xSemaphoreGive(s_http_client_lock);
+        ESP_LOGE(TAG, "http init");
+        return ESP_ERR_NO_MEM;
+    }
     esp_http_client_set_method(client, strcmp(method, "POST") == 0 ? HTTP_METHOD_POST : HTTP_METHOD_GET);
     set_common_http_headers(client, token);
     if (body) {
@@ -4124,6 +4130,7 @@ static esp_err_t http_request_target(const char *method, const char *host, int p
         ESP_LOGW(TAG, "http %s %s status=%d empty response", method, path, status_code);
     }
     esp_http_client_cleanup(client);
+    xSemaphoreGive(s_http_client_lock);
     return err;
 }
 
@@ -4697,8 +4704,13 @@ static esp_err_t card_message_download(const char *path,
         .buffer_size = HTTP_CLIENT_BUFFER_SIZE,
         .buffer_size_tx = HTTP_CLIENT_BUFFER_SIZE,
     };
+    xSemaphoreTake(s_http_client_lock, portMAX_DELAY);
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    ESP_RETURN_ON_FALSE(client, ESP_ERR_NO_MEM, TAG, "message download init");
+    if (!client) {
+        xSemaphoreGive(s_http_client_lock);
+        ESP_LOGE(TAG, "message download init");
+        return ESP_ERR_NO_MEM;
+    }
     bridge_profile_snapshot_t profile;
     set_common_http_headers(client,
                             bridge_target_profile_snapshot(&target, &profile)
@@ -4748,6 +4760,7 @@ static esp_err_t card_message_download(const char *path,
 cleanup:
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    xSemaphoreGive(s_http_client_lock);
     bridge_target_note_result(target.profile_id, err);
     return err;
 }
@@ -8572,6 +8585,12 @@ void app_main(void)
     s_bridge_target_lock = xSemaphoreCreateMutex();
     s_bridge_profiles_lock = xSemaphoreCreateMutex();
     s_bridge_probe_lock = xSemaphoreCreateMutex();
+    s_http_client_lock = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_lvgl_lock && s_bridge_target_lock &&
+                            s_bridge_profiles_lock && s_bridge_probe_lock &&
+                            s_http_client_lock
+                        ? ESP_OK
+                        : ESP_ERR_NO_MEM);
 #if VIBE_STICK_SERIAL_DEBUG_ENABLED
     xTaskCreate(serial_debug_task, "serial_debug", 6144, NULL, 2, NULL);
 #endif
