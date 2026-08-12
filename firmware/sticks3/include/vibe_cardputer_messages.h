@@ -23,6 +23,7 @@ typedef struct {
     vibe_cardputer_message_download_fn download;
     void (*display_lock)(void);
     void (*display_unlock)(void);
+    esp_err_t (*set_landscape)(bool landscape);
     void (*restore_home)(void);
     void (*activity)(void);
     bool (*audio_busy)(void);
@@ -34,3 +35,4 @@ esp_err_t vibe_cardputer_messages_start(void);
 bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event);
 bool vibe_cardputer_messages_active(void);
 bool vibe_cardputer_messages_storage_ready(void);
+void vibe_cardputer_messages_release_display_resources(void);

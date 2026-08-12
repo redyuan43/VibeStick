@@ -587,6 +587,26 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     assert "vibe_recording_upload_log_diagnostics" in source
 
 
+def test_cardputer_recording_reuses_http_client_and_reports_profile_revision() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    card_headers = source.split(
+        "static void set_common_http_headers", 1
+    )[1].split("#else", 1)[0]
+    post_binary = source.split("static esp_err_t http_post_binary", 1)[1]
+    post_binary = post_binary.split("typedef struct {", 1)[0]
+
+    assert '"X-Vibe-Stick-Firmware-Name"' in card_headers
+    assert '"X-Vibe-Stick-Firmware-Transport"' in card_headers
+    assert '"X-Vibe-Stick-Firmware-Build-Date"' in card_headers
+    assert '"X-Vibe-Stick-Input-Profile-Revision"' in card_headers
+    assert ".keep_alive_enable = true" in post_binary
+    assert '"Connection", "keep-alive"' in post_binary
+    assert "esp_http_client_set_url(s_recording_http_client, url)" in post_binary
+    assert "esp_http_client_set_user_data(client, NULL)" in post_binary
+    assert "s_recording_http_client = NULL" in source
+    assert "recording_http_client_cleanup();" in source
+
+
 def test_remote_audio_commands_reuse_sessions_and_ack_after_upload() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     config = (

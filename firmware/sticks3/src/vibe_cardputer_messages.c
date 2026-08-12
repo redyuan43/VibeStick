@@ -14,6 +14,8 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_partition.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -35,23 +37,41 @@
 #define MESSAGE_INDEX_PATH MESSAGE_ROOT "/messages.jsonl"
 #define MESSAGE_INDEX_TMP MESSAGE_ROOT "/messages.jsonl.tmp"
 #define MESSAGE_NOTIFY_PATH MESSAGE_SYSTEM_DIR "/F1_New_SMS.wav"
-#define MESSAGE_MAX_COUNT 12
+#define MESSAGE_FONT_PATH MESSAGE_SYSTEM_DIR "/DroidSansFallback.ttf"
+#define MESSAGE_MAX_COUNT 4
 #define MESSAGE_PAGE_SIZE 4
 #define MESSAGE_SYNC_RESPONSE_BYTES (2 * 1024)
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
 #define MESSAGE_SYNC_INTERVAL_MS 10000
 #define MESSAGE_TASK_STACK_BYTES 8192
-#define MESSAGE_CONTROL_TASK_STACK_BYTES 6144
 #define MESSAGE_ACTION_QUEUE_LENGTH 12
 #define MESSAGE_IO_BUFFER_BYTES 512
 #define MESSAGE_RESOURCE_PATH_PREFIX "/device/messages/resource?"
 #define MESSAGE_AUDIO_PATH_PREFIX "/device/messages/resource?kind=audio&id="
+#define MESSAGE_FONT_PARTITION_LABEL "anim"
+#define MESSAGE_FONT_MAGIC 0x56464e54u
+#define MESSAGE_FONT_FORMAT_VERSION 1u
+#define MESSAGE_FONT_DATA_OFFSET 0x1000u
+#define MESSAGE_FONT_CACHE_GLYPHS 8
+#define MESSAGE_INDEX_SCHEMA_VERSION 2
+#define MESSAGE_DETAIL_START_DELAY_MS 800
+#define MESSAGE_DETAIL_SCROLL_PERIOD_MS 100
+#define MESSAGE_DETAIL_MANUAL_PAUSE_MS 1500
+#define MESSAGE_DETAIL_MANUAL_STEP 24
+
+typedef struct {
+    uint32_t magic;
+    uint32_t format_version;
+    uint32_t font_size;
+    uint8_t sha256[32];
+} message_font_header_t;
 
 typedef struct {
     uint32_t cursor;
     bool read;
     char title[64];
     char summary[160];
+    char spoken_text[513];
     char audio_id[32];
     char audio_sha256[65];
     size_t audio_size;
@@ -78,6 +98,8 @@ static QueueHandle_t s_action_queue;
 static atomic_bool s_storage_ready;
 static atomic_bool s_active;
 static atomic_bool s_play_queued;
+static atomic_bool s_detail_active;
+static atomic_bool s_play_cancel;
 static size_t s_selected;
 static lv_obj_t *s_layer;
 static lv_obj_t *s_header;
@@ -85,14 +107,26 @@ static lv_obj_t *s_tiles[MESSAGE_PAGE_SIZE];
 static lv_obj_t *s_unread_dots[MESSAGE_PAGE_SIZE];
 static lv_obj_t *s_labels[MESSAGE_PAGE_SIZE];
 static lv_timer_t *s_blink_timer;
+static lv_obj_t *s_detail_view;
+static lv_obj_t *s_detail_label;
+static lv_timer_t *s_detail_scroll_timer;
+static int64_t s_detail_scroll_start_ms;
+static int64_t s_detail_manual_until_ms;
 static bool s_blink_on;
 static bool s_system_resources_ready;
+static bool s_font_resource_ready;
 static size_t s_rendered_count;
 static uint32_t s_rendered_cursor;
+static lv_font_t *s_chinese_font;
+static const void *s_font_mapping;
+static esp_partition_mmap_handle_t s_font_mapping_handle;
 
 static void blink_timer(lv_timer_t *timer);
+static void detail_scroll_timer(lv_timer_t *timer);
+static int64_t message_now_ms(void);
 static void prepare_messages(void);
-static void control_task(void *argument);
+static void render_messages(void);
+static void handle_action(message_action_t action);
 
 static bool enqueue_action(message_action_t action)
 {
@@ -168,14 +202,43 @@ static void copy_json_string(cJSON *object, const char *key, char *output,
     }
 }
 
+static void clear_legacy_message_cache(void)
+{
+    DIR *directory = opendir(MESSAGE_AUDIO_DIR);
+    if (directory) {
+        struct dirent *entry;
+        while ((entry = readdir(directory)) != NULL) {
+            if (entry->d_name[0] == '.') continue;
+            char path[320];
+            snprintf(path, sizeof(path), MESSAGE_AUDIO_DIR "/%s",
+                     entry->d_name);
+            unlink(path);
+        }
+        closedir(directory);
+    }
+    unlink(MESSAGE_INDEX_PATH);
+    s_message_count = 0;
+    s_cursor = 0;
+    ESP_LOGI(TAG, "legacy message cache cleared for schema v%d",
+             MESSAGE_INDEX_SCHEMA_VERSION);
+}
+
 static void load_index(void)
 {
     FILE *file = fopen(MESSAGE_INDEX_PATH, "rb");
     if (!file) return;
-    char line[1024];
+    bool legacy_schema = false;
+    char line[2048];
     while (s_message_count < MESSAGE_MAX_COUNT && fgets(line, sizeof(line), file)) {
         cJSON *item = cJSON_Parse(line);
         if (!item) continue;
+        cJSON *schema = cJSON_GetObjectItemCaseSensitive(item, "schema_version");
+        if (!cJSON_IsNumber(schema) ||
+            schema->valueint != MESSAGE_INDEX_SCHEMA_VERSION) {
+            legacy_schema = true;
+            cJSON_Delete(item);
+            break;
+        }
         stored_message_t *message = &s_messages[s_message_count];
         memset(message, 0, sizeof(*message));
         cJSON *cursor = cJSON_GetObjectItemCaseSensitive(item, "cursor");
@@ -187,6 +250,8 @@ static void load_index(void)
             message->audio_size = cJSON_IsNumber(size) ? (size_t)size->valuedouble : 0;
             copy_json_string(item, "title", message->title, sizeof(message->title));
             copy_json_string(item, "summary", message->summary, sizeof(message->summary));
+            copy_json_string(item, "spoken_text", message->spoken_text,
+                             sizeof(message->spoken_text));
             copy_json_string(item, "audio_id", message->audio_id, sizeof(message->audio_id));
             copy_json_string(item, "audio_sha256", message->audio_sha256,
                              sizeof(message->audio_sha256));
@@ -196,6 +261,7 @@ static void load_index(void)
         cJSON_Delete(item);
     }
     fclose(file);
+    if (legacy_schema) clear_legacy_message_cache();
 }
 
 static esp_err_t save_index(void)
@@ -205,10 +271,13 @@ static esp_err_t save_index(void)
     for (size_t index = 0; index < s_message_count; index++) {
         const stored_message_t *message = &s_messages[index];
         cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "schema_version",
+                               MESSAGE_INDEX_SCHEMA_VERSION);
         cJSON_AddNumberToObject(item, "cursor", message->cursor);
         cJSON_AddBoolToObject(item, "read", message->read);
         cJSON_AddStringToObject(item, "title", message->title);
         cJSON_AddStringToObject(item, "summary", message->summary);
+        cJSON_AddStringToObject(item, "spoken_text", message->spoken_text);
         cJSON_AddStringToObject(item, "audio_id", message->audio_id);
         cJSON_AddStringToObject(item, "audio_sha256", message->audio_sha256);
         cJSON_AddNumberToObject(item, "audio_size", (double)message->audio_size);
@@ -300,6 +369,180 @@ static esp_err_t ensure_resource(cJSON *resource, const char *destination)
     return ESP_OK;
 }
 
+static bool hex_digest(const char *text, uint8_t digest[32])
+{
+    if (!text || strlen(text) != 64) return false;
+    for (size_t index = 0; index < 32; index++) {
+        unsigned value = 0;
+        if (sscanf(&text[index * 2], "%2x", &value) != 1) return false;
+        digest[index] = (uint8_t)value;
+    }
+    return true;
+}
+
+static const esp_partition_t *font_partition(void)
+{
+    return esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                    (esp_partition_subtype_t)0x40,
+                                    MESSAGE_FONT_PARTITION_LABEL);
+}
+
+static void release_cached_font(void)
+{
+    display_lock();
+    if (s_layer) {
+        lv_obj_set_style_text_font(s_header, LV_FONT_DEFAULT, 0);
+        for (size_t index = 0; index < MESSAGE_PAGE_SIZE; index++) {
+            lv_obj_set_style_text_font(s_labels[index], LV_FONT_DEFAULT, 0);
+        }
+        if (s_detail_label) {
+            lv_obj_set_style_text_font(s_detail_label, LV_FONT_DEFAULT, 0);
+        }
+    }
+    if (s_chinese_font) {
+        lv_tiny_ttf_destroy(s_chinese_font);
+        s_chinese_font = NULL;
+    }
+    if (s_font_mapping_handle) {
+        esp_partition_munmap(s_font_mapping_handle);
+        s_font_mapping_handle = 0;
+        s_font_mapping = NULL;
+    }
+    display_unlock();
+}
+
+static esp_err_t load_cached_font(void)
+{
+    if (s_chinese_font) return ESP_OK;
+    const esp_partition_t *partition = font_partition();
+    ESP_RETURN_ON_FALSE(partition, ESP_ERR_NOT_FOUND, TAG,
+                        "font partition missing");
+    message_font_header_t header;
+    ESP_RETURN_ON_ERROR(esp_partition_read(partition, 0, &header,
+                                           sizeof(header)),
+                        TAG, "read font header");
+    ESP_RETURN_ON_FALSE(
+        header.magic == MESSAGE_FONT_MAGIC &&
+            header.format_version == MESSAGE_FONT_FORMAT_VERSION &&
+            header.font_size > 0 &&
+            header.font_size <= partition->size - MESSAGE_FONT_DATA_OFFSET,
+        ESP_ERR_NOT_FOUND, TAG, "cached font invalid");
+    ESP_RETURN_ON_ERROR(
+        esp_partition_mmap(partition, MESSAGE_FONT_DATA_OFFSET,
+                           header.font_size, ESP_PARTITION_MMAP_DATA,
+                           &s_font_mapping, &s_font_mapping_handle),
+        TAG, "map cached font");
+    display_lock();
+    s_chinese_font = lv_tiny_ttf_create_data_ex(
+        s_font_mapping, header.font_size, 14, LV_FONT_KERNING_NORMAL,
+        MESSAGE_FONT_CACHE_GLYPHS);
+    if (s_chinese_font) {
+        /* DroidSansFallback covers CJK but intentionally omits most ASCII. */
+        s_chinese_font->fallback = &lv_font_montserrat_14;
+        if (s_layer) {
+            lv_obj_set_style_text_font(s_header, s_chinese_font, 0);
+            for (size_t index = 0; index < MESSAGE_PAGE_SIZE; index++) {
+                lv_obj_set_style_text_font(s_labels[index], s_chinese_font, 0);
+            }
+            if (s_detail_label) {
+                lv_obj_set_style_text_font(s_detail_label, s_chinese_font, 0);
+            }
+        }
+    }
+    display_unlock();
+    if (!s_chinese_font) {
+        esp_partition_munmap(s_font_mapping_handle);
+        s_font_mapping_handle = 0;
+        s_font_mapping = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "cached Chinese font loaded size=%lu",
+             (unsigned long)header.font_size);
+    return ESP_OK;
+}
+
+static esp_err_t install_cached_font(const char *path, const char *sha_text,
+                                     size_t font_size)
+{
+    const esp_partition_t *partition = font_partition();
+    ESP_RETURN_ON_FALSE(partition, ESP_ERR_NOT_FOUND, TAG,
+                        "font partition missing");
+    ESP_RETURN_ON_FALSE(font_size > 0 &&
+                            font_size <= partition->size -
+                                             MESSAGE_FONT_DATA_OFFSET,
+                        ESP_ERR_INVALID_SIZE, TAG, "font too large");
+    uint8_t expected_sha[32];
+    ESP_RETURN_ON_FALSE(hex_digest(sha_text, expected_sha),
+                        ESP_ERR_INVALID_ARG, TAG, "invalid font hash");
+
+    message_font_header_t current;
+    if (esp_partition_read(partition, 0, &current, sizeof(current)) == ESP_OK &&
+        current.magic == MESSAGE_FONT_MAGIC &&
+        current.format_version == MESSAGE_FONT_FORMAT_VERSION &&
+        current.font_size == font_size &&
+        memcmp(current.sha256, expected_sha, sizeof(expected_sha)) == 0) {
+        return ESP_OK;
+    }
+
+    release_cached_font();
+    FILE *file = fopen(path, "rb");
+    ESP_RETURN_ON_FALSE(file, ESP_ERR_NOT_FOUND, TAG, "open downloaded font");
+    size_t erase_size = MESSAGE_FONT_DATA_OFFSET + font_size;
+    erase_size = (erase_size + 0xfff) & ~((size_t)0xfff);
+    esp_err_t err = esp_partition_erase_range(partition, 0, erase_size);
+    uint8_t *buffer = NULL;
+    if (err == ESP_OK) {
+        buffer = malloc(4096);
+        if (!buffer) err = ESP_ERR_NO_MEM;
+    }
+    size_t written = 0;
+    while (err == ESP_OK && written < font_size) {
+        size_t request = font_size - written;
+        if (request > 4096) request = 4096;
+        size_t count = fread(buffer, 1, request, file);
+        if (count != request) {
+            err = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        err = esp_partition_write(partition,
+                                  MESSAGE_FONT_DATA_OFFSET + written,
+                                  buffer, count);
+        written += count;
+        vTaskDelay(1);
+    }
+    free(buffer);
+    fclose(file);
+    ESP_RETURN_ON_ERROR(err, TAG, "write font partition");
+
+    const void *verify_mapping = NULL;
+    esp_partition_mmap_handle_t verify_handle = 0;
+    ESP_RETURN_ON_ERROR(
+        esp_partition_mmap(partition, MESSAGE_FONT_DATA_OFFSET, font_size,
+                           ESP_PARTITION_MMAP_DATA, &verify_mapping,
+                           &verify_handle),
+        TAG, "map font for verification");
+    uint8_t actual_sha[32];
+    int sha_result = mbedtls_sha256(verify_mapping, font_size, actual_sha, 0);
+    esp_partition_munmap(verify_handle);
+    ESP_RETURN_ON_FALSE(sha_result == 0 &&
+                            memcmp(actual_sha, expected_sha,
+                                   sizeof(actual_sha)) == 0,
+                        ESP_ERR_INVALID_CRC, TAG, "font flash hash mismatch");
+
+    message_font_header_t header = {
+        .magic = MESSAGE_FONT_MAGIC,
+        .format_version = MESSAGE_FONT_FORMAT_VERSION,
+        .font_size = font_size,
+    };
+    memcpy(header.sha256, expected_sha, sizeof(expected_sha));
+    ESP_RETURN_ON_ERROR(esp_partition_write(partition, 0, &header,
+                                            sizeof(header)),
+                        TAG, "commit font header");
+    ESP_LOGI(TAG, "Chinese font installed size=%lu",
+             (unsigned long)font_size);
+    return ESP_OK;
+}
+
 static esp_err_t download_message_audio(cJSON *item, stored_message_t *message)
 {
     char url[192] = {0};
@@ -364,6 +607,10 @@ static esp_err_t play_wav_file(const char *path)
     uint8_t buffer[MESSAGE_IO_BUFFER_BYTES];
     size_t remaining = pcm_len;
     while (err == ESP_OK && remaining > 0) {
+        if (atomic_load(&s_play_cancel)) {
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
         size_t request = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
         size_t count = fread(buffer, 1, request, file);
         if (count == 0) {
@@ -414,14 +661,43 @@ static void sync_once(void)
             return;
         }
         cJSON *resources = cJSON_GetObjectItemCaseSensitive(root, "resources");
-        if (cJSON_IsObject(resources) && !s_system_resources_ready) {
-            esp_err_t notification_err = ensure_resource(
-                cJSON_GetObjectItemCaseSensitive(resources, "notification"),
-                MESSAGE_NOTIFY_PATH);
-            s_system_resources_ready = notification_err == ESP_OK;
+        if (cJSON_IsObject(resources)) {
             if (!s_system_resources_ready) {
-                ESP_LOGW(TAG, "notification resource unavailable result=%s",
-                         esp_err_to_name(notification_err));
+                esp_err_t notification_err = ensure_resource(
+                    cJSON_GetObjectItemCaseSensitive(resources, "notification"),
+                    MESSAGE_NOTIFY_PATH);
+                s_system_resources_ready = notification_err == ESP_OK;
+                if (!s_system_resources_ready) {
+                    ESP_LOGW(TAG,
+                             "notification resource unavailable result=%s",
+                             esp_err_to_name(notification_err));
+                }
+            }
+            if (!s_font_resource_ready &&
+                (!s_config.audio_busy || !s_config.audio_busy())) {
+                cJSON *font = cJSON_GetObjectItemCaseSensitive(resources,
+                                                               "font");
+                char font_sha[65] = {0};
+                copy_json_string(font, "sha256", font_sha,
+                                 sizeof(font_sha));
+                cJSON *font_size_value = cJSON_GetObjectItemCaseSensitive(
+                    font, "size");
+                size_t font_size = cJSON_IsNumber(font_size_value)
+                                       ? (size_t)font_size_value->valuedouble
+                                       : 0;
+                esp_err_t font_err = ensure_resource(font, MESSAGE_FONT_PATH);
+                if (font_err == ESP_OK) {
+                    font_err = install_cached_font(MESSAGE_FONT_PATH, font_sha,
+                                                   font_size);
+                }
+                s_font_resource_ready = font_err == ESP_OK;
+                if (!s_font_resource_ready) {
+                    ESP_LOGW(TAG, "font resource unavailable result=%s",
+                             esp_err_to_name(font_err));
+                } else {
+                    s_rendered_count = SIZE_MAX;
+                    s_rendered_cursor = UINT32_MAX;
+                }
             }
         }
         cJSON *items = cJSON_GetObjectItemCaseSensitive(root, "messages");
@@ -439,6 +715,12 @@ static void sync_once(void)
             stored_message_t message = {.cursor = cursor, .read = false};
             copy_json_string(item, "title", message.title, sizeof(message.title));
             copy_json_string(item, "summary", message.summary, sizeof(message.summary));
+            copy_json_string(item, "spoken_text", message.spoken_text,
+                             sizeof(message.spoken_text));
+            if (!message.spoken_text[0]) {
+                strlcpy(message.spoken_text, message.summary,
+                        sizeof(message.spoken_text));
+            }
             esp_err_t audio_err = download_message_audio(item, &message);
             if (audio_err != ESP_OK) {
                 ESP_LOGW(TAG, "message audio unavailable cursor=%lu result=%s",
@@ -540,15 +822,6 @@ static void sync_task(void *argument)
     mkdir_if_missing(MESSAGE_ROOT);
     mkdir_if_missing(MESSAGE_AUDIO_DIR);
     mkdir_if_missing(MESSAGE_SYSTEM_DIR);
-    BaseType_t control_result = xTaskCreatePinnedToCore(
-        control_task, "card_message_ui", MESSAGE_CONTROL_TASK_STACK_BYTES,
-        NULL, 3, NULL, 0);
-    if (control_result != pdPASS) {
-        ESP_LOGE(TAG, "message control task allocation failed heap_largest=%u",
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        vTaskDelete(NULL);
-        return;
-    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     load_index();
     size_t unread_count = 0;
@@ -565,28 +838,39 @@ static void sync_task(void *argument)
              (unsigned)uxTaskGetStackHighWaterMark(NULL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     if (s_message_count > 0) (void)enqueue_action(MESSAGE_ACTION_PREPARE);
-    vTaskDelay(pdMS_TO_TICKS(15000));
+    int64_t next_sync_ms = message_now_ms() + 15000;
     while (true) {
-        if (!atomic_load(&s_active)) sync_once();
-        vTaskDelay(pdMS_TO_TICKS(MESSAGE_SYNC_INTERVAL_MS));
+        int64_t now_ms = message_now_ms();
+        int64_t wait_ms = next_sync_ms > now_ms ? next_sync_ms - now_ms : 0;
+        message_action_t action;
+        if (xQueueReceive(s_action_queue, &action,
+                          pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
+            handle_action(action);
+        }
+        now_ms = message_now_ms();
+        if (now_ms >= next_sync_ms) {
+            if (!atomic_load(&s_active)) sync_once();
+            next_sync_ms = message_now_ms() + MESSAGE_SYNC_INTERVAL_MS;
+        }
     }
 }
 
 static const lv_font_t *message_font(void)
 {
-    return &lv_font_simsun_14_cjk;
+    return s_chinese_font ? s_chinese_font : LV_FONT_DEFAULT;
 }
 
 static void ensure_message_layer(void)
 {
     if (s_layer) return;
     s_layer = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(s_layer, 240, 135);
+    lv_obj_set_size(s_layer, LV_PCT(100), LV_PCT(100));
     lv_obj_align(s_layer, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(s_layer, lv_color_hex(0x070b10), 0);
     lv_obj_set_style_border_width(s_layer, 0, 0);
     lv_obj_set_style_pad_all(s_layer, 0, 0);
     s_header = lv_label_create(s_layer);
+    lv_obj_set_style_text_font(s_header, message_font(), 0);
     lv_obj_set_style_text_color(s_header, lv_color_hex(0xe5e7eb), 0);
     lv_obj_align(s_header, LV_ALIGN_TOP_LEFT, 10, 8);
     for (size_t index = 0; index < MESSAGE_PAGE_SIZE; index++) {
@@ -609,11 +893,86 @@ static void ensure_message_layer(void)
         lv_obj_set_style_text_color(s_labels[index], lv_color_hex(0xf3f4f6), 0);
     }
     s_blink_timer = lv_timer_create(blink_timer, 500, NULL);
+
+    s_detail_view = lv_obj_create(s_layer);
+    lv_obj_set_size(s_detail_view, LV_PCT(100), LV_PCT(100));
+    lv_obj_align(s_detail_view, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_detail_view, lv_color_hex(0x070b10), 0);
+    lv_obj_set_style_border_width(s_detail_view, 0, 0);
+    lv_obj_set_style_pad_all(s_detail_view, 10, 0);
+    lv_obj_set_scroll_dir(s_detail_view, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_detail_view, LV_SCROLLBAR_MODE_OFF);
+    s_detail_label = lv_label_create(s_detail_view);
+    lv_obj_set_width(s_detail_label, 220);
+    lv_label_set_long_mode(s_detail_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(s_detail_label, message_font(), 0);
+    lv_obj_set_style_text_color(s_detail_label, lv_color_hex(0xf3f4f6), 0);
+    lv_obj_align(s_detail_label, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_flag(s_detail_view, LV_OBJ_FLAG_HIDDEN);
+    s_detail_scroll_timer = lv_timer_create(
+        detail_scroll_timer, MESSAGE_DETAIL_SCROLL_PERIOD_MS, NULL);
+}
+
+static int64_t message_now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static void detail_scroll_timer(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!atomic_load(&s_detail_active) || !s_detail_view) return;
+    int64_t now = message_now_ms();
+    if (now < s_detail_scroll_start_ms || now < s_detail_manual_until_ms ||
+        lv_obj_get_scroll_bottom(s_detail_view) <= 0) {
+        return;
+    }
+    lv_obj_scroll_to_y(s_detail_view,
+                       lv_obj_get_scroll_y(s_detail_view) + 1,
+                       LV_ANIM_OFF);
+}
+
+static void show_detail_view(const char *text)
+{
+    lv_obj_add_flag(s_header, LV_OBJ_FLAG_HIDDEN);
+    for (size_t tile = 0; tile < MESSAGE_PAGE_SIZE; tile++) {
+        lv_obj_add_flag(s_tiles[tile], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_set_style_text_font(s_detail_label, message_font(), 0);
+    lv_label_set_text(s_detail_label, text && text[0] ? text : "消息内容为空");
+    lv_obj_clear_flag(s_detail_view, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_update_layout(s_detail_view);
+    lv_obj_scroll_to_y(s_detail_view, 0, LV_ANIM_OFF);
+    s_detail_scroll_start_ms = message_now_ms() + MESSAGE_DETAIL_START_DELAY_MS;
+    s_detail_manual_until_ms = 0;
+    atomic_store(&s_detail_active, true);
+}
+
+static void hide_detail_view(void)
+{
+    atomic_store(&s_detail_active, false);
+    if (s_detail_view) lv_obj_add_flag(s_detail_view, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_header, LV_OBJ_FLAG_HIDDEN);
+    render_messages();
+}
+
+static void scroll_detail_manually(int delta)
+{
+    display_lock();
+    if (s_detail_view) {
+        int32_t target = lv_obj_get_scroll_y(s_detail_view) + delta;
+        if (target < 0) target = 0;
+        lv_obj_scroll_to_y(s_detail_view, target, LV_ANIM_OFF);
+        s_detail_manual_until_ms =
+            message_now_ms() + MESSAGE_DETAIL_MANUAL_PAUSE_MS;
+    }
+    display_unlock();
 }
 
 static void render_messages(void)
 {
     if (!s_layer) return;
+    lv_obj_set_size(s_layer, LV_PCT(100), LV_PCT(100));
     xSemaphoreTake(s_lock, portMAX_DELAY);
     const size_t count = s_message_count;
     if (count > 0 && s_selected >= count) s_selected = count - 1;
@@ -624,10 +983,20 @@ static void render_messages(void)
                                          : MESSAGE_PAGE_SIZE)
                                   : 0;
     char header[48];
-    snprintf(header, sizeof(header), "消息 %u  %u/%u",
-             (unsigned)count,
-             count ? (unsigned)(page_start / MESSAGE_PAGE_SIZE + 1) : 0,
-             (unsigned)((count + MESSAGE_PAGE_SIZE - 1) / MESSAGE_PAGE_SIZE));
+    if (s_chinese_font) {
+        snprintf(header, sizeof(header), "消息 %u  %u/%u",
+                 (unsigned)count,
+                 count ? (unsigned)(page_start / MESSAGE_PAGE_SIZE + 1) : 0,
+                 (unsigned)((count + MESSAGE_PAGE_SIZE - 1) /
+                            MESSAGE_PAGE_SIZE));
+    } else {
+        snprintf(header, sizeof(header), "MESSAGES %u  %u/%u",
+                 (unsigned)count,
+                 count ? (unsigned)(page_start / MESSAGE_PAGE_SIZE + 1) : 0,
+                 (unsigned)((count + MESSAGE_PAGE_SIZE - 1) /
+                            MESSAGE_PAGE_SIZE));
+    }
+    lv_obj_set_style_text_font(s_header, message_font(), 0);
     lv_label_set_text(s_header, header);
     const lv_font_t *font = message_font();
     for (size_t tile = 0; tile < MESSAGE_PAGE_SIZE; tile++) {
@@ -648,9 +1017,13 @@ static void render_messages(void)
                 title_len--;
             }
         }
-        memcpy(title, message->title, title_len);
-        title[title_len] = '\0';
-        if (title_truncated) strlcat(title, "…", sizeof(title));
+        if (s_chinese_font) {
+            memcpy(title, message->title, title_len);
+            title[title_len] = '\0';
+            if (title_truncated) strlcat(title, "...", sizeof(title));
+        } else {
+            strlcpy(title, "FONT SYNCING", sizeof(title));
+        }
         if (message->read) {
             lv_obj_add_flag(s_unread_dots[tile], LV_OBJ_FLAG_HIDDEN);
         } else {
@@ -694,7 +1067,17 @@ static void blink_timer(lv_timer_t *timer)
 
 static void open_messages(void)
 {
+    esp_err_t font_err = load_cached_font();
+    if (font_err != ESP_OK) {
+        ESP_LOGW(TAG, "message font load skipped: %s",
+                 esp_err_to_name(font_err));
+    }
     display_lock();
+    if (s_config.set_landscape && s_config.set_landscape(true) != ESP_OK) {
+        display_unlock();
+        atomic_store(&s_active, false);
+        return;
+    }
     ensure_message_layer();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (s_message_count > 0) s_selected = s_message_count - 1;
@@ -714,24 +1097,45 @@ static void open_messages(void)
 
 static void prepare_messages(void)
 {
-    display_lock();
-    ensure_message_layer();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (s_message_count > 0) s_selected = s_message_count - 1;
     xSemaphoreGive(s_lock);
-    render_messages();
-    lv_obj_add_flag(s_layer, LV_OBJ_FLAG_HIDDEN);
-    display_unlock();
+    s_rendered_count = SIZE_MAX;
+    s_rendered_cursor = UINT32_MAX;
     ESP_LOGI(TAG, "message center prepared count=%u cursor=%lu",
-             (unsigned)s_rendered_count, (unsigned long)s_rendered_cursor);
+             (unsigned)s_message_count, (unsigned long)s_cursor);
 }
 
 static void close_messages(void)
 {
     atomic_store(&s_active, false);
+    atomic_store(&s_detail_active, false);
     display_lock();
-    if (s_layer) lv_obj_add_flag(s_layer, LV_OBJ_FLAG_HIDDEN);
+    if (s_blink_timer) {
+        lv_timer_delete(s_blink_timer);
+        s_blink_timer = NULL;
+    }
+    if (s_detail_scroll_timer) {
+        lv_timer_delete(s_detail_scroll_timer);
+        s_detail_scroll_timer = NULL;
+    }
+    if (s_layer) {
+        lv_obj_delete(s_layer);
+        s_layer = NULL;
+        s_header = NULL;
+        s_detail_view = NULL;
+        s_detail_label = NULL;
+        memset(s_tiles, 0, sizeof(s_tiles));
+        memset(s_unread_dots, 0, sizeof(s_unread_dots));
+        memset(s_labels, 0, sizeof(s_labels));
+    }
+    if (s_config.set_landscape) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(s_config.set_landscape(false));
+    }
     display_unlock();
+    release_cached_font();
+    s_rendered_count = SIZE_MAX;
+    s_rendered_cursor = UINT32_MAX;
     if (s_config.restore_home) s_config.restore_home();
 }
 
@@ -747,15 +1151,27 @@ static void play_selected(void)
         return;
     }
     char path[160];
+    char spoken_text[sizeof(s_messages[0].spoken_text)];
     uint32_t cursor = s_messages[s_selected].cursor;
     audio_path(s_messages[s_selected].audio_id, path, sizeof(path));
+    strlcpy(spoken_text, s_messages[s_selected].spoken_text,
+            sizeof(spoken_text));
+    if (!spoken_text[0]) {
+        strlcpy(spoken_text, s_messages[s_selected].summary,
+                sizeof(spoken_text));
+    }
     xSemaphoreGive(s_lock);
+    atomic_store(&s_play_cancel, false);
+    display_lock();
+    show_detail_view(spoken_text);
+    display_unlock();
     ESP_LOGI(TAG, "message playback start cursor=%lu",
              (unsigned long)cursor);
     esp_err_t err = play_wav_file(path);
+    bool cancelled = atomic_load(&s_play_cancel);
     ESP_LOGI(TAG, "message playback cursor=%lu result=%s",
              (unsigned long)cursor, esp_err_to_name(err));
-    if (err == ESP_OK) {
+    if (err == ESP_OK && !cancelled) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         esp_err_t save_err = ESP_ERR_NOT_FOUND;
         if (s_selected < s_message_count &&
@@ -770,10 +1186,11 @@ static void play_selected(void)
             ESP_LOGW(TAG, "message read state save failed cursor=%lu result=%s",
                      (unsigned long)cursor, esp_err_to_name(save_err));
         }
-        display_lock();
-        render_messages();
-        display_unlock();
     }
+    display_lock();
+    hide_detail_view();
+    display_unlock();
+    atomic_store(&s_play_cancel, false);
 }
 
 static void move_selection(message_action_t action)
@@ -826,46 +1243,39 @@ static void move_selection(message_action_t action)
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
 }
 
-static void control_task(void *argument)
+static void handle_action(message_action_t action)
 {
-    (void)argument;
-    while (true) {
-        message_action_t action;
-        if (xQueueReceive(s_action_queue, &action, portMAX_DELAY) != pdTRUE) {
-            continue;
+    if (action != MESSAGE_ACTION_PREPARE && s_config.activity) {
+        s_config.activity();
+    }
+    switch (action) {
+    case MESSAGE_ACTION_PREPARE:
+        if (atomic_load(&s_active)) {
+            display_lock();
+            render_messages();
+            display_unlock();
+        } else {
+            prepare_messages();
         }
-        if (action != MESSAGE_ACTION_PREPARE && s_config.activity) {
-            s_config.activity();
-        }
-        switch (action) {
-        case MESSAGE_ACTION_PREPARE:
-            if (atomic_load(&s_active)) {
-                display_lock();
-                render_messages();
-                display_unlock();
-            } else {
-                prepare_messages();
-            }
-            break;
-        case MESSAGE_ACTION_OPEN:
-            open_messages();
-            break;
-        case MESSAGE_ACTION_CLOSE:
-            close_messages();
-            break;
-        case MESSAGE_ACTION_LEFT:
-        case MESSAGE_ACTION_RIGHT:
-        case MESSAGE_ACTION_UP:
-        case MESSAGE_ACTION_DOWN:
-            move_selection(action);
-            break;
-        case MESSAGE_ACTION_PLAY:
-            ESP_LOGI(TAG, "message play action stack_free=%u",
-                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
-            play_selected();
-            atomic_store(&s_play_queued, false);
-            break;
-        }
+        break;
+    case MESSAGE_ACTION_OPEN:
+        open_messages();
+        break;
+    case MESSAGE_ACTION_CLOSE:
+        close_messages();
+        break;
+    case MESSAGE_ACTION_LEFT:
+    case MESSAGE_ACTION_RIGHT:
+    case MESSAGE_ACTION_UP:
+    case MESSAGE_ACTION_DOWN:
+        move_selection(action);
+        break;
+    case MESSAGE_ACTION_PLAY:
+        ESP_LOGI(TAG, "message play action stack_free=%u",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        play_selected();
+        atomic_store(&s_play_queued, false);
+        break;
     }
 }
 
@@ -910,6 +1320,17 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
         return true;
     }
     if (!atomic_load(&s_active)) return false;
+    if (atomic_load(&s_detail_active)) {
+        if (!event->pressed) return true;
+        if (event->key == VIBE_KEY_ESCAPE) {
+            atomic_store(&s_play_cancel, true);
+        } else if (event->key == VIBE_KEY_UP) {
+            scroll_detail_manually(-MESSAGE_DETAIL_MANUAL_STEP);
+        } else if (event->key == VIBE_KEY_DOWN) {
+            scroll_detail_manually(MESSAGE_DETAIL_MANUAL_STEP);
+        }
+        return true;
+    }
     if (!event->pressed) return true;
     message_action_t action;
     if (event->key == VIBE_KEY_ESCAPE) {
@@ -953,6 +1374,13 @@ bool vibe_cardputer_messages_storage_ready(void)
     return atomic_load(&s_storage_ready);
 }
 
+void vibe_cardputer_messages_release_display_resources(void)
+{
+    if (atomic_load(&s_active) || s_layer || s_chinese_font) {
+        close_messages();
+    }
+}
+
 #else
 
 esp_err_t vibe_cardputer_messages_init(
@@ -969,5 +1397,6 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
 }
 bool vibe_cardputer_messages_active(void) { return false; }
 bool vibe_cardputer_messages_storage_ready(void) { return false; }
+void vibe_cardputer_messages_release_display_resources(void) {}
 
 #endif

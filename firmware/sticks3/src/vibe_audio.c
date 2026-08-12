@@ -93,6 +93,7 @@ typedef struct {
 static const char *TAG = "vibe_audio";
 
 static atomic_bool s_running;
+static atomic_uchar s_output_volume = VIBE_STICK_SOUND_OUTPUT_VOLUME;
 static bool s_initialized;
 static SemaphoreHandle_t s_audio_mutex;
 static QueueHandle_t s_audio_queue;
@@ -112,6 +113,24 @@ static const audio_codec_ctrl_if_t *s_ctrl_if;
 static const audio_codec_data_if_t *s_data_if;
 static const audio_codec_gpio_if_t *s_gpio_if;
 static const audio_codec_if_t *s_codec_if;
+static int s_applied_output_volume = -1;
+#endif
+
+#if VIBE_BOARD_HAS_ES8311
+static esp_err_t apply_output_volume(void)
+{
+    ESP_RETURN_ON_FALSE(s_codec, ESP_ERR_INVALID_STATE, TAG, "codec missing");
+    uint8_t volume = atomic_load(&s_output_volume);
+    if (s_applied_output_volume == volume) return ESP_OK;
+    ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_vol(s_codec, volume) ==
+                            ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "speaker volume");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_mute(s_codec, volume == 0) ==
+                            ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "speaker mute");
+    s_applied_output_volume = volume;
+    return ESP_OK;
+}
 #endif
 
 #if VIBE_BOARD_HAS_ES8311
@@ -277,10 +296,8 @@ static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mo
                             ESP_FAIL, TAG, "mic gain");
     }
     if (dev_type & ESP_CODEC_DEV_TYPE_OUT) {
-        ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_vol(s_codec, VIBE_STICK_SOUND_OUTPUT_VOLUME) == ESP_CODEC_DEV_OK,
-                            ESP_FAIL, TAG, "speaker volume");
-        ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_mute(s_codec, false) == ESP_CODEC_DEV_OK,
-                            ESP_FAIL, TAG, "speaker unmute");
+        s_applied_output_volume = -1;
+        ESP_RETURN_ON_ERROR(apply_output_volume(), TAG, "apply speaker volume");
     }
     return ESP_OK;
 }
@@ -318,6 +335,7 @@ static void deinit_codec(void)
         esp_codec_dev_close(s_codec);
         esp_codec_dev_delete(s_codec);
         s_codec = NULL;
+        s_applied_output_volume = -1;
         s_tx_enabled = false;
         s_rx_enabled = false;
     }
@@ -914,11 +932,27 @@ esp_err_t vibe_audio_play_stream_write(const uint8_t *pcm, size_t len)
 #else
     ESP_RETURN_ON_FALSE(s_streaming && s_codec != NULL,
                         ESP_ERR_INVALID_STATE, TAG, "stream not open");
+#if VIBE_BOARD_HAS_ES8311
+    ESP_RETURN_ON_ERROR(apply_output_volume(), TAG, "update stream volume");
+#endif
     return esp_codec_dev_write(s_codec, (void *)pcm, (int)len) ==
                    ESP_CODEC_DEV_OK
                ? ESP_OK
                : ESP_FAIL;
 #endif
+}
+
+esp_err_t vibe_audio_set_output_volume(uint8_t percent)
+{
+    ESP_RETURN_ON_FALSE(percent <= 100, ESP_ERR_INVALID_ARG, TAG,
+                        "invalid output volume");
+    atomic_store(&s_output_volume, percent);
+    return ESP_OK;
+}
+
+uint8_t vibe_audio_get_output_volume(void)
+{
+    return atomic_load(&s_output_volume);
 }
 
 esp_err_t vibe_audio_play_stream_end(void)
