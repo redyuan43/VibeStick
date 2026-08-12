@@ -11,6 +11,7 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -38,7 +39,7 @@
 #define MESSAGE_SYNC_RESPONSE_BYTES (24 * 1024)
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
 #define MESSAGE_SYNC_INTERVAL_MS 10000
-#define MESSAGE_TASK_STACK_BYTES 12288
+#define MESSAGE_TASK_STACK_BYTES 8192
 #define MESSAGE_RESOURCE_PATH_PREFIX "/device/messages/resource?"
 #define MESSAGE_AUDIO_PATH_PREFIX "/device/messages/resource?kind=audio&id="
 
@@ -431,10 +432,14 @@ static void sync_task(void *argument)
     slot.host_id = SPI2_HOST;
     esp_vfs_fat_sdmmc_mount_config_t mount = {
         .format_if_mount_failed = false,
-        .max_files = 8,
+        .max_files = 4,
         .allocation_unit_size = 16 * 1024,
     };
     sdmmc_card_t *card = NULL;
+    ESP_LOGI(TAG, "mounting SD heap_free=%u heap_largest=%u stack_free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     err = esp_vfs_fat_sdspi_mount(MESSAGE_MOUNT_POINT, &host, &slot,
                                   &mount, &card);
     if (err != ESP_OK) {
@@ -451,7 +456,7 @@ static void sync_task(void *argument)
     s_storage_ready = true;
     xSemaphoreGive(s_lock);
     ESP_LOGI(TAG, "SD ready capacity=%lluMB messages=%u cursor=%lu stack_free=%u",
-             (unsigned long long)(card->csd.capacity * card->csd.sector_size /
+             ((unsigned long long)card->csd.capacity * card->csd.sector_size /
                                   (1024 * 1024)),
              (unsigned)s_message_count, (unsigned long)s_cursor,
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
