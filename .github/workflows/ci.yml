@@ -17,11 +17,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install pytest
+
       - name: Compile Python sources
         run: python3 -m compileall -q bridge/src tests
 
       - name: Run unit tests
-        run: PYTHONPATH=bridge/src python3 -m unittest discover -s tests
+        run: PYTHONPATH=bridge/src python3 -m pytest -q tests
 
       - name: Run firmware host tests
         run: |
@@ -46,7 +52,9 @@ jobs:
 
       - name: Build isolated telemetry firmware
         shell: bash
-        run: scripts/battery-firmware.sh build "${{ matrix.board }}"
+        run: |
+          source "$IDF_PATH/export.sh"
+          scripts/battery-firmware.sh build "${{ matrix.board }}"
 
       - name: Upload firmware image
         uses: actions/upload-artifact@v4
@@ -59,7 +67,7 @@ jobs:
     container: espressif/idf:v5.5.1
     strategy:
       matrix:
-        board: [sticks3, stickc_plus]
+        board: [sticks3, stickc_plus, cardputer_adv]
 
     steps:
       - name: Check out repository
@@ -67,4 +75,6 @@ jobs:
 
       - name: Build VibeStick firmware
         shell: bash
-        run: scripts/firmware.sh "${{ matrix.board }}" build
+        run: |
+          source "$IDF_PATH/export.sh"
+          scripts/firmware.sh "${{ matrix.board }}" build
