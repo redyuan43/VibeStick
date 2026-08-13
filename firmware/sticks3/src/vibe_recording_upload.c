@@ -21,6 +21,7 @@ static vibe_recording_upload_stats_t s_stats;
 static atomic_bool s_active;
 static atomic_bool s_failed;
 static SemaphoreHandle_t s_completion;
+static uint8_t *s_buffer;
 
 static void set_failed(void)
 {
@@ -36,13 +37,8 @@ static void finish_upload_task(void)
 static void upload_task(void *arg)
 {
     (void)arg;
-    uint8_t *buffer = heap_caps_malloc(s_config.buffer_bytes, MALLOC_CAP_8BIT);
-    if (!buffer) {
-        ESP_LOGW(TAG, "recording upload buffer allocation failed");
-        set_failed();
-        finish_upload_task();
-        return;
-    }
+    uint8_t *buffer = s_buffer;
+    bool first_batch = true;
 
     while (vibe_audio_is_recording() || vibe_audio_pending_chunks() > 0) {
         vibe_recording_upload_stats_note_pending(
@@ -62,6 +58,12 @@ static void upload_task(void *arg)
             vibe_recording_upload_stats_note_read(&s_stats, false);
             set_failed();
             continue;
+        }
+
+        if (first_batch) {
+            ESP_LOGI(TAG, "recording first PCM batch ready bytes=%u",
+                     (unsigned)audio_len);
+            first_batch = false;
         }
 
         int64_t post_start_ms = esp_timer_get_time() / 1000;
@@ -87,6 +89,7 @@ static void upload_task(void *arg)
     }
 
     heap_caps_free(buffer);
+    s_buffer = NULL;
     ESP_LOGI(TAG,
              "recording upload task done posts=%u bytes=%u failures=%u failed=%d",
              (unsigned)s_stats.upload_posts,
@@ -114,12 +117,22 @@ bool vibe_recording_upload_start(const vibe_recording_upload_config_t *config,
     s_config = *config;
     vibe_recording_upload_stats_reset(&s_stats, start_rssi, unknown_rssi);
     atomic_store(&s_failed, false);
+    s_buffer = heap_caps_malloc(config->buffer_bytes, MALLOC_CAP_8BIT);
+    if (!s_buffer) {
+        ESP_LOGW(TAG, "recording upload buffer allocation failed");
+        atomic_store(&s_active, false);
+        vSemaphoreDelete(s_completion);
+        s_completion = NULL;
+        return false;
+    }
     BaseType_t ok = xTaskCreatePinnedToCore(
         upload_task, "recording_upload", config->task_stack_bytes, NULL,
         config->task_priority, NULL, config->task_core);
     if (ok != pdPASS) {
         set_failed();
         atomic_store(&s_active, false);
+        heap_caps_free(s_buffer);
+        s_buffer = NULL;
         vSemaphoreDelete(s_completion);
         s_completion = NULL;
         ESP_LOGW(TAG, "task create failed");

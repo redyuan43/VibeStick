@@ -425,6 +425,45 @@ def test_concurrent_bridge_switch_ignores_stale_network_results() -> None:
     assert "bridge_target_note_result(target.profile_id, err);" in request
 
 
+def test_cardputer_recording_blocks_background_http_before_lock_acquisition() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    request_target = source.split("static esp_err_t http_request_target", 1)[1]
+    request_target = request_target.split("static bool bridge_parse_discovered_health", 1)[0]
+    request = source.split("static esp_err_t http_request_timeout", 1)[1]
+    request = request.split("static esp_err_t http_request(", 1)[0]
+    policy = source.split("static bool card_http_request_allowed_while_recording", 1)[1]
+    policy = policy.split("static esp_err_t http_request_target", 1)[0]
+    prepare = source.split("static esp_err_t bridge_prepare_active_target", 1)[1]
+    prepare = prepare.split("static esp_err_t http_request_timeout", 1)[0]
+
+    assert request_target.index("card_recording_exclusive_active()") < request_target.index(
+        "xSemaphoreTake(s_http_client_lock"
+    )
+    assert "!card_http_request_allowed_while_recording(path)" in request_target
+    assert "return ESP_ERR_INVALID_STATE;" in request_target
+    assert "VIBE_STICK_RECORDING_START_PATH" in policy
+    assert "VIBE_STICK_RECORDING_STOP_PATH" in policy
+    assert "VIBE_STICK_DEVICE_COMMAND_ACK_PATH" not in policy
+    assert "probe_unavailable_target && card_recording_exclusive_active()" in prepare
+    assert "probe_unavailable_target = false;" in prepare
+    assert "if (err != ESP_ERR_INVALID_STATE)" in request
+    assert "bridge_target_note_result(target.profile_id, err);" in request
+
+
+def test_cardputer_opt_priority_also_pauses_state_and_command_polling() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    command_task = source.split("static void device_command_task", 1)[1]
+    command_task = command_task.split("static void handle_recording_toggle", 1)[0]
+    app_task = source.split("static void app_task", 1)[1]
+    app_task = app_task.split("#if VIBE_STICK_SERIAL_DEBUG_ENABLED", 1)[0]
+
+    assert "card_recording_exclusive_active())" in command_task
+    assert "const bool network_busy =" in app_task
+    assert "card_recording_exclusive_active();" in app_task
+    assert "if (wifi_connected() && !network_busy)" in app_task
+    assert "card_recording_exclusive_end_if_idle" in source
+
+
 def test_background_scan_uses_atomic_recording_lifecycle_flags() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
@@ -576,6 +615,7 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     assert '\\"total_chunks\\":%lu' in source
     assert '\\"total_bytes\\":%lu' in source
     assert "recording stopped automatically after audio upload failure" in source
+    assert "vibe_recording_upload_active() &&" in source
     assert "s_recording_chunk_id++" in source
     assert "RECORDING_UPLOAD_HTTP_TIMEOUT_MS 5000" in source
     assert ".timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS" in source
@@ -587,8 +627,9 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     assert "vibe_recording_upload_log_diagnostics" in source
 
 
-def test_cardputer_recording_reuses_http_client_and_reports_profile_revision() -> None:
+def test_cardputer_recording_uses_proven_per_batch_http_model() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
     card_headers = source.split(
         "static void set_common_http_headers", 1
     )[1].split("#else", 1)[0]
@@ -599,12 +640,36 @@ def test_cardputer_recording_reuses_http_client_and_reports_profile_revision() -
     assert '"X-Vibe-Stick-Firmware-Transport"' in card_headers
     assert '"X-Vibe-Stick-Firmware-Build-Date"' in card_headers
     assert '"X-Vibe-Stick-Input-Profile-Revision"' in card_headers
-    assert ".keep_alive_enable = true" in post_binary
-    assert '"Connection", "keep-alive"' in post_binary
-    assert "esp_http_client_set_url(s_recording_http_client, url)" in post_binary
-    assert "esp_http_client_set_user_data(client, NULL)" in post_binary
-    assert "s_recording_http_client = NULL" in source
-    assert "recording_http_client_cleanup();" in source
+    assert '"Connection", "close"' in card_headers
+    assert "#define RECORDING_UPLOAD_BATCH_CHUNKS 2" in source
+    assert "#define RECORDING_UPLOAD_BUFFER_BYTES 4096" in source
+    assert "#define RECORDING_UPLOAD_BATCH_CHUNKS 4" in source
+    assert "#define RECORDING_UPLOAD_BUFFER_BYTES 8192" in source
+    assert ".keep_alive_enable = true" not in post_binary
+    assert "static esp_http_client_handle_t s_recording_http_client;" in source
+    assert "recording_http_client_prepare" in source
+    assert "esp_http_client_init(&config)" in post_binary
+    assert "esp_http_client_cleanup(client)" in post_binary
+    assert "xSemaphoreTake(s_http_client_lock, portMAX_DELAY);" in post_binary
+    assert "xSemaphoreGive(s_http_client_lock);" in post_binary
+    assert "esp_http_client_set_post_field(client, (const char *)body, body_len)" in post_binary
+    assert "esp_http_client_perform(client)" in post_binary
+    assert "esp_http_client_open(client, body_len)" in post_binary
+    assert "esp_http_client_write(" in post_binary
+    assert "RECORDING_UPLOAD_WRITE_BYTES" not in source
+    assert "#define HTTP_CLIENT_RX_BUFFER_SIZE 2048" in source
+    assert "#define HTTP_CLIENT_TX_BUFFER_SIZE 2048" in source
+    assert "static uint8_t *s_buffer;" in upload_source
+    assert "uint8_t *buffer = s_buffer;" in upload_source
+    assert upload_source.index("s_buffer = heap_caps_malloc") < upload_source.index(
+        "xTaskCreatePinnedToCore("
+    )
+    assert "heap_caps_free(s_buffer);" in upload_source
+    assert "recording upload buffer allocation failed" in upload_source
+    upload_config = source.split("static bool start_recording_upload_task", 1)[1]
+    upload_config = upload_config.split("static bool handle_recording_start_internal", 1)[0]
+    assert ".task_core = VIBE_STICK_APP_CORE" in upload_config
+    assert ".task_core = VIBE_STICK_NETWORK_CORE" in upload_config
 
 
 def test_cardputer_message_teardown_and_sync_are_serialized() -> None:
@@ -620,34 +685,55 @@ def test_cardputer_message_teardown_and_sync_are_serialized() -> None:
     assert "MESSAGE_ACTION_RELEASE" in release
     assert "xSemaphoreTake(s_release_done" in release
     assert 'message_sync_task, "card_msg_sync"' in messages
+    assert "ulTaskNotifyTake(pdTRUE, portMAX_DELAY)" in messages
+    assert "xTaskNotifyGive(s_sync_task_handle)" in messages
+    assert "MESSAGE_SYNC_INTERVAL_MS" not in messages
     assert "xQueueReceive(s_action_queue, &action, portMAX_DELAY)" in messages
     assert "vibe_cardputer_messages_pause_sync(uint32_t timeout_ms)" in messages
     assert "atomic_load(&s_sync_in_progress)" in messages
     assert "sync_interrupted()" in messages
+    assert '"message sync yielding to recording"' in messages
+    recording_start = source.split(
+        "static bool handle_recording_start_internal", 1
+    )[1].split("static bool handle_recording_start(", 1)[0]
+    assert "vibe_cardputer_messages_pause_sync(1000)" in recording_start
+    assert "vibe_cardputer_messages_release_display_resources" not in recording_start
+    assert "card_recording_exclusive_end" in recording_start
+    card_message_download = source.split("static esp_err_t card_message_download", 1)[1]
+    card_message_download = card_message_download.split("static esp_err_t http_post_binary", 1)[0]
+    assert "card_recording_exclusive_active()" in card_message_download
+    assert ".timeout_ms = 750" in card_message_download
+    assert "err = ESP_ERR_INVALID_STATE;" in card_message_download
+    card_message_request = source.split("static esp_err_t card_message_request", 1)[1]
+    card_message_request = card_message_request.split(
+        "static esp_err_t card_message_download", 1
+    )[0]
+    assert "(int)response_len, 750" in card_message_request
     assert '"X-Vibe-Stick-Device-Ip"' in source
     assert '"X-Vibe-Stick-Wifi-Ssid"' in source
     assert '"X-Vibe-Stick-Wifi-Bssid"' in source
     assert '"X-Vibe-Stick-Wifi-Rssi"' in source
 
+    sync = messages.split("static void sync_once_inner(void)", 1)[1].split(
+        "static void sync_once(void)", 1
+    )[0]
+    playback = messages.split("static void play_selected(void)", 1)[1].split(
+        "static void move_selection", 1
+    )[0]
+    assert "parse_message_audio_metadata(item, &message)" in sync
+    assert "download_message_audio(item, &message)" not in sync
+    assert "download_message_audio(&message)" in playback
+
     finalize_failure = source.split(
         "xTaskCreatePinnedToCore(recording_finalize_task", 1
     )[1].split("if (ok != pdPASS)", 1)[1]
     finalize_failure = finalize_failure.split("static void post_device_command_ack", 1)[0]
-    assert "finish_recording_stop(event_name);" in finalize_failure
-
-    recording_start = source.split(
-        "static bool handle_recording_start_internal", 1
-    )[1].split("static bool handle_recording_start", 1)[0]
-    assert recording_start.index("vibe_cardputer_messages_pause_sync(5000)") < (
-        recording_start.index("set_recording_session_active(true)")
-    )
-    assert "vibe_cardputer_messages_resume_sync();" in recording_start
-
-    recording_finish = source.split(
-        "static void finish_recording_stop", 1
-    )[1].split("static void recording_finalize_task", 1)[0]
-    assert "vibe_cardputer_messages_resume_sync();" in recording_finish
-
+    assert "finish_recording_stop(event_name);" not in finalize_failure
+    assert 'show_recording_overlay("SEND FAILED", "RETRY", true)' in finalize_failure
+    recording_stop = source.split("static void handle_recording_stop", 1)[1]
+    recording_stop = recording_stop.split("xTaskCreatePinnedToCore(recording_finalize_task", 1)[0]
+    assert "ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_audio_stop());" in recording_stop
+    assert "vibe_recording_upload_wait();" in recording_stop
 
 def test_remote_audio_commands_reuse_sessions_and_ack_after_upload() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
@@ -659,6 +745,12 @@ def test_remote_audio_commands_reuse_sessions_and_ack_after_upload() -> None:
     assert 'VIBE_STICK_DEVICE_COMMAND_ACK_PATH "/device/commands/ack"' in config
     assert "handle_recording_start_internal(" in source
     assert '"remote_command_start", "REMOTE", session_id_text, false' in source
+    start_command = source.split('if (strcmp(type_text, "recording_start") == 0)', 1)[1]
+    start_command = start_command.split('if (strcmp(type_text, "recording_stop") == 0)', 1)[0]
+    assert start_command.index('"accepted"') < start_command.index(
+        'handle_recording_start_internal('
+    )
+    assert 'started ? "started"' not in start_command
     assert 'finish_recording_stop("remote_command_stop")' in source
     stop_command = source.split('if (strcmp(type_text, "recording_stop") == 0)', 1)[1]
     stop_command = stop_command.split('post_device_command_ack(command_id_text, "ignored"', 1)[0]

@@ -93,6 +93,8 @@
 #define BATTERY_LOW_THRESHOLD_PERCENT 20
 #define BATTERY_HIGH_THRESHOLD_PERCENT 50
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
+/* Cardputer's 5760-byte TCP send window cannot carry a 7680-byte PCM batch
+ * plus HTTP headers in one transport write. Keep each upload below it. */
 #define RECORDING_UPLOAD_BATCH_CHUNKS 2
 #define RECORDING_UPLOAD_BUFFER_BYTES 4096
 #else
@@ -110,13 +112,8 @@
 #define OTA_NO_PROGRESS_TIMEOUT_MS 20000
 #define OTA_PERIODIC_CHECK_MS 300000
 #define OTA_BATTERY_CHECK_MS 1800000
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-#define HTTP_CLIENT_RX_BUFFER_SIZE 512
-#define HTTP_CLIENT_TX_BUFFER_SIZE 1024
-#else
 #define HTTP_CLIENT_RX_BUFFER_SIZE 2048
 #define HTTP_CLIENT_TX_BUFFER_SIZE 2048
-#endif
 #define BRIDGE_HEALTH_RESPONSE_BYTES 512
 #define TTS_AUDIO_MAX_BYTES (1024 * 1024)
 #define FIRMWARE_BUILD_ID __DATE__ " " __TIME__
@@ -680,6 +677,7 @@ static esp_timer_handle_t s_card_opt_long_timer;
 static esp_timer_handle_t s_card_opt_confirm_timer;
 static esp_timer_handle_t s_card_opt_click_timer;
 static atomic_bool s_card_opt_down;
+static atomic_bool s_card_opt_prepare_active;
 static atomic_bool s_card_opt_chord;
 static atomic_bool s_card_opt_button_committed;
 static atomic_int s_card_opt_pending_clicks;
@@ -753,9 +751,28 @@ static bool recording_network_busy(void)
 }
 
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
+static bool card_recording_exclusive_active(void)
+{
+    return recording_network_busy() || atomic_load(&s_card_opt_prepare_active);
+}
+
+static void card_recording_exclusive_end(void)
+{
+    atomic_store(&s_card_opt_prepare_active, false);
+    vibe_cardputer_messages_resume_sync();
+}
+
+/* A non-recording Opt mapping must not leave the device in priority mode. */
+static void card_recording_exclusive_end_if_idle(void)
+{
+    if (!recording_network_busy()) {
+        card_recording_exclusive_end();
+    }
+}
+
 static bool card_message_busy(void)
 {
-    return recording_network_busy() || ota_in_progress();
+    return card_recording_exclusive_active() || ota_in_progress();
 }
 #endif
 
@@ -1725,15 +1742,9 @@ static void register_activity(void)
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
 static void card_message_activity(void)
 {
-    s_last_activity_ms = esp_timer_get_time() / 1000;
-    s_next_deep_sleep_attempt_ms = 0;
-    s_motion_false_wake_sleep_deadline_ms = 0;
-    request_wifi_reconnect_now();
-    if (s_display_power_state != DISPLAY_POWER_ACTIVE ||
-        s_current_backlight != LCD_BACKLIGHT_DEFAULT) {
-        s_display_power_state = DISPLAY_POWER_ACTIVE;
-        set_backlight(LCD_BACKLIGHT_DEFAULT);
-    }
+    /* Use the normal wake path: it resumes LVGL rendering as well as the
+     * backlight, which is required after the message page auto-sleeps. */
+    register_activity();
 }
 
 static esp_err_t card_message_set_landscape(bool landscape)
@@ -4095,6 +4106,7 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
     snprintf(rssi, sizeof(rssi), "%d", current_wifi_rssi());
     snprintf(input_profile_revision, sizeof(input_profile_revision), "%lu",
              (unsigned long)s_card_input_profile.revision);
+    /* Cardputer has a small TCP socket pool and frequent UI/message polling. */
     esp_http_client_set_header(client, "Connection", "close");
     esp_http_client_set_header(client, "X-Vibe-Stick-Firmware-Name",
                                FIRMWARE_NAME);
@@ -4182,10 +4194,25 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
 #endif
 }
 
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static bool card_http_request_allowed_while_recording(const char *path)
+{
+    return path &&
+           (strcmp(path, VIBE_STICK_RECORDING_START_PATH) == 0 ||
+            strcmp(path, VIBE_STICK_RECORDING_STOP_PATH) == 0);
+}
+#endif
+
 static esp_err_t http_request_target(const char *method, const char *host, int port,
                                      const char *token, const char *path, const char *body,
                                      char *response, int response_len, int timeout_ms)
 {
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    if (card_recording_exclusive_active() && !card_http_request_allowed_while_recording(path)) {
+        ESP_LOGD(TAG, "http deferred while recording path=%s", path ? path : "");
+        return ESP_ERR_INVALID_STATE;
+    }
+#endif
     xSemaphoreTake(s_http_client_lock, portMAX_DELAY);
     char url[160];
     snprintf(url, sizeof(url), "http://%s:%d%s", host, port, path);
@@ -4724,7 +4751,13 @@ static esp_err_t bridge_prepare_active_target(bridge_target_t *target)
         return ESP_ERR_NOT_FOUND;
     }
     vibe_bridge_profile_snapshot_view(&profile, &profile_view);
-    if (!current.available) {
+    bool probe_unavailable_target = !current.available;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    if (probe_unavailable_target && card_recording_exclusive_active()) {
+        probe_unavailable_target = false;
+    }
+#endif
+    if (probe_unavailable_target) {
         if (!bridge_probe_profile(&profile_view, 1200)) {
             bridge_target_note_result(current.profile_id, ESP_FAIL);
             return ESP_ERR_NOT_FOUND;
@@ -4762,7 +4795,9 @@ static esp_err_t http_request_timeout(const char *method, const char *path, cons
                             : VIBE_STICK_BRIDGE_TOKEN;
     esp_err_t err = http_request_target(method, target.host, target.port, token, path, body,
                                         response, response_len, timeout_ms);
-    bridge_target_note_result(target.profile_id, err);
+    if (err != ESP_ERR_INVALID_STATE) {
+        bridge_target_note_result(target.profile_id, err);
+    }
     return err;
 }
 
@@ -4780,8 +4815,10 @@ static esp_err_t card_message_request(const char *method, const char *path,
     if (!wifi_connected()) {
         return ESP_ERR_INVALID_STATE;
     }
+    /* Message polling is best-effort.  It must never hold Cardputer's
+     * no-PSRAM networking path long enough to starve live PCM uploads. */
     return http_request_timeout(method, path, body, response,
-                                (int)response_len, 15000);
+                                (int)response_len, 750);
 }
 
 static esp_err_t card_message_download(const char *path,
@@ -4793,6 +4830,7 @@ static esp_err_t card_message_download(const char *path,
         !destination || maximum_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (card_recording_exclusive_active()) return ESP_ERR_INVALID_STATE;
     bridge_target_t target;
     ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG,
                         "prepare message bridge target");
@@ -4801,11 +4839,17 @@ static esp_err_t card_message_download(const char *path,
              path);
     const esp_http_client_config_t config = {
         .url = url,
-        .timeout_ms = 60000,
+        /* This runs only inside Fn+N. It still yields immediately if Opt
+         * starts, and incomplete files are retried on the next Fn+N entry. */
+        .timeout_ms = 750,
         .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
         .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
     };
     xSemaphoreTake(s_http_client_lock, portMAX_DELAY);
+    if (card_recording_exclusive_active()) {
+        xSemaphoreGive(s_http_client_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         xSemaphoreGive(s_http_client_lock);
@@ -4817,6 +4861,9 @@ static esp_err_t card_message_download(const char *path,
                             bridge_target_profile_snapshot(&target, &profile)
                                 ? profile.token
                                 : VIBE_STICK_BRIDGE_TOKEN);
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    esp_http_client_set_header(client, "Connection", "keep-alive");
+#endif
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) goto cleanup;
     int64_t content_length = esp_http_client_fetch_headers(client);
@@ -4834,6 +4881,10 @@ static esp_err_t card_message_download(const char *path,
     uint8_t buffer[512];
     size_t total = 0;
     while (err == ESP_OK && total < (size_t)content_length) {
+        if (card_recording_exclusive_active()) {
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
         size_t request = (size_t)content_length - total;
         if (request > sizeof(buffer)) request = sizeof(buffer);
         int count = esp_http_client_read(client, (char *)buffer, (int)request);
@@ -4867,97 +4918,28 @@ cleanup:
 }
 #endif
 
-static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t body_len,
-                                  char *response, int response_len)
-{
-    char url[256];
-    bridge_target_t target;
-    ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG, "prepare bridge target");
-    snprintf(url, sizeof(url), "http://%s:%d%s", target.host, target.port, path);
-    http_response_capture_t capture = {
-        .data = response,
-        .capacity = response_len,
-        .used = 0,
-    };
-    if (response && response_len > 0) {
-        response[0] = '\0';
-    }
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
-    /* Cardputer-Adv has no PSRAM. Reuse one keep-alive connection for the
-     * recording session instead of allocating a TCP client for every chunk. */
-    xSemaphoreTake(s_http_client_lock, portMAX_DELAY);
-    if (!s_recording_http_client) {
-        const esp_http_client_config_t config = {
-            .url = url,
-            .timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS,
-            .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
-            .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
-            .event_handler = http_event_handler,
-            .keep_alive_enable = true,
-        };
-        s_recording_http_client = esp_http_client_init(&config);
-    } else {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            esp_http_client_set_url(s_recording_http_client, url));
-    }
-    esp_http_client_handle_t client = s_recording_http_client;
-    if (!client) {
-        xSemaphoreGive(s_http_client_lock);
-        ESP_LOGE(TAG, "http init");
-        return ESP_ERR_NO_MEM;
-    }
-#else
+static bool recording_http_client_prepare(void)
+{
+    bridge_target_t target;
+    if (bridge_prepare_active_target(&target) != ESP_OK) return false;
+    char url[160];
+    snprintf(url, sizeof(url), "http://%s:%d%s", target.host, target.port,
+             VIBE_STICK_STATE_PATH);
     const esp_http_client_config_t config = {
         .url = url,
-        .timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS,
+        .timeout_ms = 1000,
         .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
         .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
-        .event_handler = http_event_handler,
-        .user_data = &capture,
+        .keep_alive_enable = true,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "http init");
-#endif
-    esp_http_client_set_method(client, HTTP_METHOD_POST);
-    bridge_profile_snapshot_t profile;
-    set_common_http_headers(client,
-                            bridge_target_profile_snapshot(&target, &profile)
-                                ? profile.token
-                                : VIBE_STICK_BRIDGE_TOKEN);
-    esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
-    esp_http_client_set_header(client, "X-Vibe-Stick-Sample-Rate", "16000");
-    esp_http_client_set_header(client, "X-Vibe-Stick-Channels", "1");
-    esp_http_client_set_header(client, "X-Vibe-Stick-Bits-Per-Sample", "16");
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    esp_http_client_set_header(client, "Connection", "keep-alive");
-    esp_http_client_set_user_data(client, &capture);
-#endif
-    esp_http_client_set_post_field(client, (const char *)body, body_len);
-    esp_err_t err = esp_http_client_perform(client);
-    int status_code = esp_http_client_get_status_code(client);
-    if (err == ESP_OK && (status_code < 200 || status_code >= 300)) {
-        ESP_LOGW(TAG, "http POST %s returned status=%d", path, status_code);
-        err = ESP_FAIL;
-    }
-    if (err == ESP_OK && response && response_len > 0 && capture.used == 0) {
-        ESP_LOGW(TAG, "http POST %s status=%d empty response", path, status_code);
-    }
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    esp_http_client_set_user_data(client, NULL);
-    esp_http_client_set_post_field(client, "", 0);
-    if (err != ESP_OK) {
-        esp_http_client_cleanup(client);
-        s_recording_http_client = NULL;
-    }
+    xSemaphoreTake(s_http_client_lock, portMAX_DELAY);
+    if (s_recording_http_client) esp_http_client_cleanup(s_recording_http_client);
+    s_recording_http_client = esp_http_client_init(&config);
     xSemaphoreGive(s_http_client_lock);
-#else
-    esp_http_client_cleanup(client);
-#endif
-    bridge_target_note_result(target.profile_id, err);
-    return err;
+    return s_recording_http_client != NULL;
 }
 
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
 static void recording_http_client_cleanup(void)
 {
     xSemaphoreTake(s_http_client_lock, portMAX_DELAY);
@@ -4968,6 +4950,128 @@ static void recording_http_client_cleanup(void)
     xSemaphoreGive(s_http_client_lock);
 }
 #endif
+
+static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t body_len,
+                                  char *response, int response_len)
+{
+    char url[256];
+    bridge_target_t target;
+    ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG, "prepare bridge target");
+    snprintf(url, sizeof(url), "http://%s:%d%s", target.host, target.port, path);
+#if !defined(VIBE_BOARD_CARDPUTER_ADV)
+    http_response_capture_t capture = {
+        .data = response,
+        .capacity = response_len,
+        .used = 0,
+    };
+    if (response && response_len > 0) {
+        response[0] = '\0';
+    }
+#endif
+    const int64_t lock_wait_started_ms = esp_timer_get_time() / 1000;
+    xSemaphoreTake(s_http_client_lock, portMAX_DELAY);
+    if (s_recording_chunk_id == 0) {
+        ESP_LOGI(TAG, "recording first PCM lock wait=%lldms",
+                 (long long)(esp_timer_get_time() / 1000 - lock_wait_started_ms));
+    }
+#if !defined(VIBE_BOARD_CARDPUTER_ADV)
+    const esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS,
+        .buffer_size = HTTP_CLIENT_RX_BUFFER_SIZE,
+        .buffer_size_tx = HTTP_CLIENT_TX_BUFFER_SIZE,
+        .event_handler = http_event_handler,
+        .user_data = &capture,
+    };
+#endif
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    /* This client is allocated before I2S begins and retained until the
+     * recording ends. Per-batch allocation exhausts Cardputer's internal
+     * heap before the second PCM upload. */
+    esp_http_client_handle_t client = s_recording_http_client;
+    if (!client || esp_http_client_set_url(client, url) != ESP_OK) {
+        xSemaphoreGive(s_http_client_lock);
+        ESP_LOGE(TAG, "recording HTTP client unavailable");
+        return ESP_ERR_INVALID_STATE;
+    }
+#else
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        xSemaphoreGive(s_http_client_lock);
+        ESP_LOGE(TAG, "http init");
+        return ESP_ERR_NO_MEM;
+    }
+#endif
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    bridge_profile_snapshot_t profile;
+    set_common_http_headers(client,
+                            bridge_target_profile_snapshot(&target, &profile)
+                                ? profile.token
+                                : VIBE_STICK_BRIDGE_TOKEN);
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    esp_http_client_set_header(client, "Connection", "keep-alive");
+#endif
+    esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+    esp_http_client_set_header(client, "X-Vibe-Stick-Sample-Rate", "16000");
+    esp_http_client_set_header(client, "X-Vibe-Stick-Channels", "1");
+    esp_http_client_set_header(client, "X-Vibe-Stick-Bits-Per-Sample", "16");
+    const int64_t perform_started_ms = esp_timer_get_time() / 1000;
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    /* The bridge receives Cardputer PCM promptly, but this board can stall
+     * while waiting for the small HTTP response.  A completed TCP write is
+     * sufficient for this append-only, checksummed audio protocol. */
+    esp_err_t err = esp_http_client_open(client, body_len);
+    size_t written = 0;
+    while (err == ESP_OK && written < body_len) {
+        int count = esp_http_client_write(client, (const char *)body + written,
+                                          (int)(body_len - written));
+        if (count <= 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        written += (size_t)count;
+    }
+    if (err == ESP_OK && written != body_len) err = ESP_FAIL;
+    if (err == ESP_OK) {
+        /* Drain the small response so lwIP can release this TCP connection
+         * before the next 120ms PCM batch arrives. The write itself remains
+         * the delivery criterion for Cardputer audio. */
+        int64_t response_len = esp_http_client_fetch_headers(client);
+        uint8_t drain[256];
+        while (response_len > 0) {
+            int count = esp_http_client_read(client, (char *)drain,
+                                             response_len > (int64_t)sizeof(drain)
+                                                 ? sizeof(drain) : (int)response_len);
+            if (count <= 0) break;
+            response_len -= count;
+        }
+    }
+#else
+    esp_http_client_set_post_field(client, (const char *)body, body_len);
+    esp_err_t err = esp_http_client_perform(client);
+#endif
+    if (s_recording_chunk_id == 0) {
+        ESP_LOGI(TAG, "recording first PCM HTTP duration=%lldms result=%s",
+                 (long long)(esp_timer_get_time() / 1000 - perform_started_ms),
+                 esp_err_to_name(err));
+    }
+#if !defined(VIBE_BOARD_CARDPUTER_ADV)
+    int status_code = esp_http_client_get_status_code(client);
+    if (err == ESP_OK && (status_code < 200 || status_code >= 300)) {
+        ESP_LOGW(TAG, "http POST %s returned status=%d", path, status_code);
+        err = ESP_FAIL;
+    }
+    if (err == ESP_OK && response && response_len > 0 && capture.used == 0) {
+        ESP_LOGW(TAG, "http POST %s status=%d empty response", path, status_code);
+    }
+#endif
+#if !defined(VIBE_BOARD_CARDPUTER_ADV)
+    esp_http_client_cleanup(client);
+#endif
+    xSemaphoreGive(s_http_client_lock);
+    bridge_target_note_result(target.profile_id, err);
+    return err;
+}
 
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
 typedef struct {
@@ -6212,9 +6316,21 @@ static bool start_recording_upload_task(void)
         .buffer_bytes = RECORDING_UPLOAD_BUFFER_BYTES,
         .batch_chunks = RECORDING_UPLOAD_BATCH_CHUNKS,
         .read_timeout_ms = 250,
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        /* Recording upload does one bounded HTTP write; 4 KiB leaves a
+         * contiguous block available while the SD/message workers unwind. */
+        .task_stack_bytes = 5120,
+#else
         .task_stack_bytes = 6144,
+#endif
         .task_priority = 4,
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        /* Cardputer keeps I2S and LVGL on core 1.  Uploading on core 0 avoids
+         * delaying HTTP writes after a completed TCP handshake. */
+        .task_core = VIBE_STICK_APP_CORE,
+#else
         .task_core = VIBE_STICK_NETWORK_CORE,
+#endif
         .post_chunk = upload_recording_chunk,
         .context = NULL,
     };
@@ -6239,17 +6355,6 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         ESP_LOGI(TAG, "recording start ignored while already recording");
         return false;
     }
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    if (!vibe_cardputer_messages_pause_sync(5000)) {
-        ESP_LOGW(TAG, "recording start deferred: message sync busy");
-        show_recording_overlay("PLEASE RETRY", "MESSAGE SYNC BUSY", true);
-        vTaskDelay(pdMS_TO_TICKS(700));
-        show_recording_overlay(NULL, NULL, false);
-        return false;
-    }
-    vibe_cardputer_messages_release_display_resources();
-    recording_http_client_cleanup();
-#endif
     if (provided_session_id && provided_session_id[0] != '\0') {
         strlcpy(s_recording_session_id, provided_session_id,
                 sizeof(s_recording_session_id));
@@ -6259,9 +6364,6 @@ static bool handle_recording_start_internal(const char *event_name, const char *
     }
     if (s_recording_session_id[0] == '\0') {
         ESP_LOGW(TAG, "recording start failed: no session id");
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-        vibe_cardputer_messages_resume_sync();
-#endif
         return false;
     }
     s_recording_chunk_id = 0;
@@ -6270,6 +6372,18 @@ static bool handle_recording_start_internal(const char *event_name, const char *
     s_recording_local_capture = true;
     s_recording_bridge_stop_required = notify_bridge;
     set_recording_session_active(true);
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    /* The session flag blocks new background HTTP before they take the shared
+     * lock; waiting here drains the one sync request that may already exist. */
+    if (!vibe_cardputer_messages_pause_sync(1000)) {
+        s_recording_session_id[0] = '\0';
+        set_recording_session_active(false);
+        show_recording_overlay("PLEASE RETRY", "SYNC BUSY", true);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        show_recording_overlay(NULL, NULL, false);
+        return false;
+    }
+#endif
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_NONE));
     show_recording_overlay("CONNECTING", "", true);
@@ -6327,7 +6441,7 @@ static bool handle_recording_start_internal(const char *event_name, const char *
             ESP_ERROR_CHECK_WITHOUT_ABORT(
                 esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
-            vibe_cardputer_messages_resume_sync();
+            card_recording_exclusive_end();
 #endif
             return false;
         }
@@ -6342,7 +6456,14 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         show_recording_overlay("REMOTE MIC", hint, true);
         return true;
     }
-
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    if (!recording_http_client_prepare()) {
+        s_recording_session_id[0] = '\0';
+        set_recording_session_active(false);
+        card_recording_exclusive_end();
+        return false;
+    }
+#endif
     esp_err_t audio_err = vibe_audio_start();
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "hardware recording start failed: %s", esp_err_to_name(audio_err));
@@ -6353,16 +6474,14 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         set_recording_session_active(false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
-        vibe_cardputer_messages_resume_sync();
+        recording_http_client_cleanup();
+        card_recording_exclusive_end();
 #endif
         return false;
     }
     if (!start_recording_upload_task()) {
         (void)vibe_audio_stop();
         vibe_audio_clear();
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-        recording_http_client_cleanup();
-#endif
         show_recording_overlay("SEND FAILED", "", true);
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
@@ -6370,7 +6489,8 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         set_recording_session_active(false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
-        vibe_cardputer_messages_resume_sync();
+        recording_http_client_cleanup();
+        card_recording_exclusive_end();
 #endif
         return false;
     }
@@ -6393,9 +6513,6 @@ static void finish_recording_stop(const char *event_name)
                      esp_err_to_name(audio_err));
         }
         vibe_recording_upload_wait();
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-        recording_http_client_cleanup();
-#endif
         upload_failed = vibe_recording_upload_failed();
         vibe_recording_upload_log_diagnostics(VIBE_BOARD_NAME,
                                               current_wifi_rssi());
@@ -6418,7 +6535,8 @@ static void finish_recording_stop(const char *event_name)
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
-        vibe_cardputer_messages_resume_sync();
+        recording_http_client_cleanup();
+        card_recording_exclusive_end();
 #endif
         return;
     }
@@ -6491,7 +6609,8 @@ static void finish_recording_stop(const char *event_name)
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
-    vibe_cardputer_messages_resume_sync();
+    recording_http_client_cleanup();
+    card_recording_exclusive_end();
 #endif
 }
 
@@ -6521,14 +6640,12 @@ static void handle_recording_stop(const char *event_name)
         vibe_audio_clear();
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
         recording_http_client_cleanup();
+        card_recording_exclusive_end();
 #endif
         clear_ptt_followup_enter_window();
         poll_state();
         show_recording_overlay(NULL, NULL, false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-        vibe_cardputer_messages_resume_sync();
-#endif
         return;
     }
 
@@ -6543,22 +6660,36 @@ static void handle_recording_stop(const char *event_name)
     strlcpy(s_recording_finalize_event_name, event_name, sizeof(s_recording_finalize_event_name));
     set_recording_finalize_active(true);
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
-    /* Cardputer-Adv has no PSRAM. Release the capture and upload task stacks
-     * before allocating the unchanged main-branch finalize task. */
+    /* Cardputer shares internal SRAM with its message UI. Release the audio
+     * capture and upload task before allocating the finalize task. */
     if (s_recording_local_capture) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_audio_stop());
         vibe_recording_upload_wait();
-        recording_http_client_cleanup();
     }
 #endif
     BaseType_t ok = xTaskCreatePinnedToCore(recording_finalize_task, "recording_finalize", 8192,
                                             NULL, 4, &s_recording_finalize_task,
                                             VIBE_STICK_NETWORK_CORE);
     if (ok != pdPASS) {
-        ESP_LOGW(TAG, "recording finalize task create failed; running inline");
+        ESP_LOGE(TAG, "recording finalize task create failed after audio release");
         set_recording_finalize_active(false);
         s_recording_finalize_task = NULL;
-        finish_recording_stop(event_name);
+        s_recording_session_id[0] = '\0';
+        s_recording_local_capture = false;
+        s_recording_bridge_stop_required = false;
+        s_recording_upload_abort_requested = false;
+        s_tap_recording_active = false;
+        s_motion_recording_active = false;
+        set_recording_session_active(false);
+        vibe_audio_clear();
+        show_recording_overlay("SEND FAILED", "RETRY", true);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        show_recording_overlay(NULL, NULL, false);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        recording_http_client_cleanup();
+        card_recording_exclusive_end();
+#endif
     }
 }
 
@@ -6717,12 +6848,15 @@ static void process_device_command(const char *response)
     cJSON_Delete(root);
 
     if (strcmp(type_text, "recording_start") == 0) {
+        /* The Cardputer has only enough HTTP/TCP capacity for the preconnected
+         * audio client. Confirm command delivery before recording owns it. */
+        post_device_command_ack(command_id_text, "accepted", session_id_text, "");
         bool started = handle_recording_start_internal(
             "remote_command_start", "REMOTE", session_id_text, false);
-        post_device_command_ack(command_id_text,
-                                started ? "started" : "failed",
-                                session_id_text,
-                                started ? "" : "recording start failed");
+        if (!started) {
+            post_device_command_ack(command_id_text, "failed", session_id_text,
+                                    "recording start failed");
+        }
         return;
     }
     if (strcmp(type_text, "recording_stop") == 0) {
@@ -6755,7 +6889,11 @@ static void device_command_task(void *arg)
 #endif
     while (true) {
         if (!wifi_connected() || ota_in_progress() ||
+ #if defined(VIBE_BOARD_CARDPUTER_ADV)
+            card_recording_exclusive_active()) {
+ #else
             recording_network_busy()) {
+ #endif
             vTaskDelay(pdMS_TO_TICKS(DEVICE_COMMAND_RETRY_DELAY_MS));
             continue;
         }
@@ -7969,6 +8107,11 @@ static void card_opt_press(void)
         return;
     }
     ESP_LOGI(TAG, "Cardputer Opt pressed");
+    atomic_store(&s_card_opt_prepare_active, true);
+    vibe_cardputer_air_mouse_stop();
+    if (!vibe_cardputer_messages_pause_sync(1000)) {
+        ESP_LOGW(TAG, "Cardputer Opt priority wait timed out");
+    }
     atomic_store(&s_card_opt_chord, false);
     atomic_store(&s_card_opt_button_committed, false);
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(
@@ -7987,6 +8130,7 @@ static bool card_opt_mark_chord(void)
     }
     atomic_store(&s_card_opt_chord, true);
     card_opt_cancel_hold_timers();
+    card_recording_exclusive_end();
     return true;
 }
 
@@ -7999,6 +8143,7 @@ static void card_opt_release(void)
     card_opt_cancel_hold_timers();
     if (atomic_exchange(&s_card_opt_chord, false)) {
         atomic_store(&s_card_opt_button_committed, false);
+        card_recording_exclusive_end();
         return;
     }
     if (atomic_exchange(&s_card_opt_button_committed, false)) {
@@ -8422,6 +8567,7 @@ static void app_task(void *arg)
         poll_front_button_fallback(now_ms);
         if (s_recording_local_capture &&
             atomic_load(&s_recording_session_active) &&
+            vibe_recording_upload_active() &&
             vibe_recording_upload_failed() &&
             !recording_finalize_active() &&
             !s_recording_upload_abort_requested) {
@@ -8429,7 +8575,12 @@ static void app_task(void *arg)
             ESP_LOGW(TAG, "recording stopped automatically after audio upload failure");
             handle_recording_stop("audio_upload_failed");
         }
-        const bool network_busy = recording_network_busy();
+        const bool network_busy =
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+            card_recording_exclusive_active();
+#else
+            recording_network_busy();
+#endif
         if (s_display_power_state == DISPLAY_POWER_ACTIVE &&
             wifi_connected() && !network_busy &&
             now_ms - last_poll >= state_poll_interval_ms(now_ms)) {
@@ -8544,7 +8695,7 @@ static void app_task(void *arg)
         }
         switch (event.type) {
         case VIBE_STICK_EVENT_POLL_STATE:
-            if (wifi_connected() && !recording_network_busy()) {
+            if (wifi_connected() && !network_busy) {
                 poll_state();
             }
             break;
@@ -8624,10 +8775,12 @@ static void app_task(void *arg)
         case VIBE_STICK_EVENT_CARD_OPT_TAP:
             card_dispatch_input_route(s_card_input_profile.opt_tap,
                                       "cardputer.opt.tap", "trigger");
+            card_recording_exclusive_end_if_idle();
             break;
         case VIBE_STICK_EVENT_CARD_OPT_DOUBLE:
             card_dispatch_input_route(s_card_input_profile.opt_double,
                                       "cardputer.opt.double", "trigger");
+            card_recording_exclusive_end_if_idle();
             break;
         case VIBE_STICK_EVENT_CARD_OPT_HOLD_START:
             card_dispatch_input_route(s_card_opt_active_hold_route,
@@ -8637,6 +8790,7 @@ static void app_task(void *arg)
             card_dispatch_input_route(s_card_opt_active_hold_route,
                                       "cardputer.opt.hold", "release");
             s_card_opt_active_hold_route = VIBE_CARD_ROUTE_NONE;
+            card_recording_exclusive_end_if_idle();
             break;
 #endif
         case VIBE_STICK_EVENT_OTA_CHECK:
