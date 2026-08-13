@@ -44,6 +44,7 @@
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
 #define MESSAGE_SYNC_INTERVAL_MS 10000
 #define MESSAGE_TASK_STACK_BYTES 8192
+#define MESSAGE_ACTION_TASK_STACK_BYTES 4096
 #define MESSAGE_ACTION_QUEUE_LENGTH 12
 #define MESSAGE_IO_BUFFER_BYTES 512
 #define MESSAGE_RESOURCE_PATH_PREFIX "/device/messages/resource?"
@@ -86,6 +87,7 @@ typedef enum {
     MESSAGE_ACTION_UP,
     MESSAGE_ACTION_DOWN,
     MESSAGE_ACTION_PLAY,
+    MESSAGE_ACTION_RELEASE,
 } message_action_t;
 
 static const char *TAG = "card_messages";
@@ -95,6 +97,7 @@ static size_t s_message_count;
 static uint32_t s_cursor;
 static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_action_queue;
+static SemaphoreHandle_t s_release_done;
 static atomic_bool s_storage_ready;
 static atomic_bool s_active;
 static atomic_bool s_play_queued;
@@ -127,6 +130,17 @@ static int64_t message_now_ms(void);
 static void prepare_messages(void);
 static void render_messages(void);
 static void handle_action(message_action_t action);
+static void sync_once(void);
+
+static void message_sync_task(void *argument)
+{
+    (void)argument;
+    vTaskDelay(pdMS_TO_TICKS(15000));
+    while (true) {
+        if (!atomic_load(&s_active)) sync_once();
+        vTaskDelay(pdMS_TO_TICKS(MESSAGE_SYNC_INTERVAL_MS));
+    }
+}
 
 static bool enqueue_action(message_action_t action)
 {
@@ -838,19 +852,16 @@ static void sync_task(void *argument)
              (unsigned)uxTaskGetStackHighWaterMark(NULL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     if (s_message_count > 0) (void)enqueue_action(MESSAGE_ACTION_PREPARE);
-    int64_t next_sync_ms = message_now_ms() + 15000;
+    BaseType_t sync_result = xTaskCreatePinnedToCore(
+        message_sync_task, "card_msg_sync", MESSAGE_TASK_STACK_BYTES,
+        NULL, 1, NULL, 0);
+    if (sync_result != pdPASS) {
+        ESP_LOGW(TAG, "message sync task create failed");
+    }
     while (true) {
-        int64_t now_ms = message_now_ms();
-        int64_t wait_ms = next_sync_ms > now_ms ? next_sync_ms - now_ms : 0;
         message_action_t action;
-        if (xQueueReceive(s_action_queue, &action,
-                          pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
+        if (xQueueReceive(s_action_queue, &action, portMAX_DELAY) == pdTRUE) {
             handle_action(action);
-        }
-        now_ms = message_now_ms();
-        if (now_ms >= next_sync_ms) {
-            if (!atomic_load(&s_active)) sync_once();
-            next_sync_ms = message_now_ms() + MESSAGE_SYNC_INTERVAL_MS;
         }
     }
 }
@@ -1276,6 +1287,11 @@ static void handle_action(message_action_t action)
         play_selected();
         atomic_store(&s_play_queued, false);
         break;
+    case MESSAGE_ACTION_RELEASE:
+        close_messages();
+        atomic_store(&s_play_cancel, false);
+        if (s_release_done) xSemaphoreGive(s_release_done);
+        break;
     }
 }
 
@@ -1291,6 +1307,9 @@ esp_err_t vibe_cardputer_messages_init(
                                   sizeof(message_action_t));
     ESP_RETURN_ON_FALSE(s_action_queue, ESP_ERR_NO_MEM, TAG,
                         "message action queue");
+    s_release_done = xSemaphoreCreateBinary();
+    ESP_RETURN_ON_FALSE(s_release_done, ESP_ERR_NO_MEM, TAG,
+                        "message release semaphore");
     atomic_store(&s_storage_ready, false);
     atomic_store(&s_active, false);
     atomic_store(&s_play_queued, false);
@@ -1300,7 +1319,8 @@ esp_err_t vibe_cardputer_messages_init(
 esp_err_t vibe_cardputer_messages_start(void)
 {
     BaseType_t sync_result = xTaskCreatePinnedToCore(
-        sync_task, "card_messages", MESSAGE_TASK_STACK_BYTES, NULL, 2, NULL, 0);
+        sync_task, "card_messages", MESSAGE_ACTION_TASK_STACK_BYTES,
+        NULL, 2, NULL, 0);
     return sync_result == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -1376,8 +1396,17 @@ bool vibe_cardputer_messages_storage_ready(void)
 
 void vibe_cardputer_messages_release_display_resources(void)
 {
-    if (atomic_load(&s_active) || s_layer || s_chinese_font) {
-        close_messages();
+    if (!atomic_load(&s_active) && !s_layer && !s_chinese_font) return;
+    atomic_store(&s_play_cancel, true);
+    atomic_store(&s_active, false);
+    while (xSemaphoreTake(s_release_done, 0) == pdTRUE) {}
+    const message_action_t action = MESSAGE_ACTION_RELEASE;
+    if (xQueueSend(s_action_queue, &action, pdMS_TO_TICKS(250)) != pdTRUE) {
+        ESP_LOGE(TAG, "message release action queue full");
+        return;
+    }
+    if (xSemaphoreTake(s_release_done, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "message release timed out");
     }
 }
 

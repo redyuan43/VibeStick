@@ -607,6 +607,32 @@ def test_cardputer_recording_reuses_http_client_and_reports_profile_revision() -
     assert "recording_http_client_cleanup();" in source
 
 
+def test_cardputer_message_teardown_and_sync_are_serialized() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    messages = (
+        ROOT / "firmware" / "sticks3" / "src" / "vibe_cardputer_messages.c"
+    ).read_text(encoding="utf-8")
+
+    release = messages.split(
+        "void vibe_cardputer_messages_release_display_resources(void)", 1
+    )[1].split("#else", 1)[0]
+    assert "atomic_store(&s_play_cancel, true)" in release
+    assert "MESSAGE_ACTION_RELEASE" in release
+    assert "xSemaphoreTake(s_release_done" in release
+    assert 'message_sync_task, "card_msg_sync"' in messages
+    assert "xQueueReceive(s_action_queue, &action, portMAX_DELAY)" in messages
+    assert '"X-Vibe-Stick-Device-Ip"' in source
+    assert '"X-Vibe-Stick-Wifi-Ssid"' in source
+    assert '"X-Vibe-Stick-Wifi-Bssid"' in source
+    assert '"X-Vibe-Stick-Wifi-Rssi"' in source
+
+    finalize_failure = source.split(
+        "xTaskCreatePinnedToCore(recording_finalize_task", 1
+    )[1].split("if (ok != pdPASS)", 1)[1]
+    finalize_failure = finalize_failure.split("static void post_device_command_ack", 1)[0]
+    assert "finish_recording_stop(event_name);" in finalize_failure
+
+
 def test_remote_audio_commands_reuse_sessions_and_ack_after_upload() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     config = (

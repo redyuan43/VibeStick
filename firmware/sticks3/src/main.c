@@ -3631,7 +3631,6 @@ static void current_wifi_ssid(char *ssid, size_t ssid_len)
     }
 }
 
-#if !defined(VIBE_BOARD_CARDPUTER_ADV)
 static void current_wifi_bssid(char *bssid, size_t bssid_len)
 {
     if (!bssid || bssid_len == 0) {
@@ -3645,7 +3644,6 @@ static void current_wifi_bssid(char *bssid, size_t bssid_len)
                  ap.bssid[3], ap.bssid[4], ap.bssid[5]);
     }
 }
-#endif
 
 static void device_id(char *id, size_t id_len)
 {
@@ -4088,7 +4086,13 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
     char id[18] = {0};
     char input_profile_revision[12] = {0};
+    char ssid[WIFI_PROFILE_SSID_LEN] = {0};
+    char bssid[18] = {0};
+    char rssi[8] = {0};
     device_id(id, sizeof(id));
+    current_wifi_ssid(ssid, sizeof(ssid));
+    current_wifi_bssid(bssid, sizeof(bssid));
+    snprintf(rssi, sizeof(rssi), "%d", current_wifi_rssi());
     snprintf(input_profile_revision, sizeof(input_profile_revision), "%lu",
              (unsigned long)s_card_input_profile.revision);
     esp_http_client_set_header(client, "Connection", "close");
@@ -4102,6 +4106,10 @@ static void set_common_http_headers(esp_http_client_handle_t client, const char 
                                FIRMWARE_BUILD_ID);
     esp_http_client_set_header(client, "X-Vibe-Stick-Board", VIBE_BOARD_NAME);
     esp_http_client_set_header(client, "X-Vibe-Stick-Device-Id", id);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Device-Ip", s_state.wifi_ip);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Ssid", ssid);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Bssid", bssid);
+    esp_http_client_set_header(client, "X-Vibe-Stick-Wifi-Rssi", rssi);
     esp_http_client_set_header(client, "X-Vibe-Stick-Input-Profile-Revision",
                                input_profile_revision);
     if (token && token[0] != '\0') {
@@ -6519,23 +6527,10 @@ static void handle_recording_stop(const char *event_name)
                                             NULL, 4, &s_recording_finalize_task,
                                             VIBE_STICK_NETWORK_CORE);
     if (ok != pdPASS) {
-        ESP_LOGE(TAG, "recording finalize task create failed; session aborted safely");
+        ESP_LOGW(TAG, "recording finalize task create failed; running inline");
         set_recording_finalize_active(false);
         s_recording_finalize_task = NULL;
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-        s_recording_session_id[0] = '\0';
-        s_recording_local_capture = false;
-        s_recording_bridge_stop_required = false;
-        s_recording_upload_abort_requested = false;
-        set_recording_session_active(false);
-        s_tap_recording_active = false;
-        s_motion_recording_active = false;
-        show_recording_overlay("SEND FAILED", "", true);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
-#else
         finish_recording_stop(event_name);
-#endif
     }
 }
 
