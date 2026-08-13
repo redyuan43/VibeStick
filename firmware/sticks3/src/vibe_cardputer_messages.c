@@ -102,6 +102,8 @@ static atomic_bool s_active;
 static atomic_bool s_play_queued;
 static atomic_bool s_detail_active;
 static atomic_bool s_play_cancel;
+static atomic_bool s_sync_paused;
+static atomic_bool s_sync_in_progress;
 static size_t s_selected;
 static lv_obj_t *s_layer;
 static lv_obj_t *s_header;
@@ -130,6 +132,7 @@ static void prepare_messages(void);
 static void render_messages(void);
 static void handle_action(message_action_t action);
 static void sync_once(void);
+static void sync_once_inner(void);
 
 static void message_sync_task(void *argument)
 {
@@ -638,14 +641,19 @@ static esp_err_t play_wav_file(const char *path)
     return err == ESP_OK ? end_err : err;
 }
 
-static void sync_once(void)
+static bool sync_interrupted(void)
+{
+    return atomic_load(&s_sync_paused) || atomic_load(&s_active) ||
+           (s_config.audio_busy && s_config.audio_busy());
+}
+
+static void sync_once_inner(void)
 {
     if (!s_config.request || !s_config.download ||
-        !atomic_load(&s_storage_ready) || atomic_load(&s_active)) return;
-    if (s_config.audio_busy && s_config.audio_busy()) return;
+        !atomic_load(&s_storage_ready) || sync_interrupted()) return;
     bool received_new = false;
     for (int page = 0; page < MESSAGE_MAX_COUNT; page++) {
-        if (atomic_load(&s_active)) return;
+        if (sync_interrupted()) return;
         char path[96];
         snprintf(path, sizeof(path),
                  "/device/messages/sync?after=%lu&limit=1%s",
@@ -666,10 +674,14 @@ static void sync_once(void)
             free(response);
             return;
         }
+        if (sync_interrupted()) {
+            free(response);
+            return;
+        }
         cJSON *root = cJSON_Parse(response);
         free(response);
         if (!root) return;
-        if (atomic_load(&s_active)) {
+        if (sync_interrupted()) {
             cJSON_Delete(root);
             return;
         }
@@ -685,6 +697,10 @@ static void sync_once(void)
                              "notification resource unavailable result=%s",
                              esp_err_to_name(notification_err));
                 }
+            }
+            if (sync_interrupted()) {
+                cJSON_Delete(root);
+                return;
             }
             if (!s_font_resource_ready &&
                 (!s_config.audio_busy || !s_config.audio_busy())) {
@@ -720,6 +736,10 @@ static void sync_once(void)
         uint32_t stored_cursor = 0;
         cJSON *item;
         cJSON_ArrayForEach(item, items) {
+            if (sync_interrupted()) {
+                page_failed = true;
+                break;
+            }
             cJSON *cursor_value = cJSON_GetObjectItemCaseSensitive(item, "cursor");
             uint32_t cursor = cJSON_IsNumber(cursor_value)
                                   ? (uint32_t)cursor_value->valuedouble
@@ -774,7 +794,7 @@ static void sync_once(void)
         if (page_failed) break;
         if (received == 0) break;
     }
-    if (s_cursor > 0) {
+    if (s_cursor > 0 && !sync_interrupted()) {
         char body[48];
         snprintf(body, sizeof(body), "{\"cursor\":%lu}",
                  (unsigned long)s_cursor);
@@ -790,6 +810,17 @@ static void sync_once(void)
         (!s_config.audio_busy || !s_config.audio_busy())) {
         (void)play_wav_file(MESSAGE_NOTIFY_PATH);
     }
+}
+
+static void sync_once(void)
+{
+    if (atomic_load(&s_sync_paused)) return;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_sync_in_progress, &expected, true)) {
+        return;
+    }
+    if (!atomic_load(&s_sync_paused)) sync_once_inner();
+    atomic_store(&s_sync_in_progress, false);
 }
 
 static void sync_task(void *argument)
@@ -1312,6 +1343,8 @@ esp_err_t vibe_cardputer_messages_init(
     atomic_store(&s_storage_ready, false);
     atomic_store(&s_active, false);
     atomic_store(&s_play_queued, false);
+    atomic_store(&s_sync_paused, false);
+    atomic_store(&s_sync_in_progress, false);
     return ESP_OK;
 }
 
@@ -1393,6 +1426,28 @@ bool vibe_cardputer_messages_storage_ready(void)
     return atomic_load(&s_storage_ready);
 }
 
+bool vibe_cardputer_messages_pause_sync(uint32_t timeout_ms)
+{
+    atomic_store(&s_sync_paused, true);
+    const int64_t deadline_ms = message_now_ms() + timeout_ms;
+    while (atomic_load(&s_sync_in_progress)) {
+        if (message_now_ms() >= deadline_ms) {
+            ESP_LOGW(TAG, "message sync pause timed out");
+            atomic_store(&s_sync_paused, false);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG, "message sync paused for recording");
+    return true;
+}
+
+void vibe_cardputer_messages_resume_sync(void)
+{
+    atomic_store(&s_sync_paused, false);
+    ESP_LOGI(TAG, "message sync resumed");
+}
+
 void vibe_cardputer_messages_release_display_resources(void)
 {
     if (!atomic_load(&s_active) && !s_layer && !s_chinese_font) return;
@@ -1425,6 +1480,12 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
 }
 bool vibe_cardputer_messages_active(void) { return false; }
 bool vibe_cardputer_messages_storage_ready(void) { return false; }
+bool vibe_cardputer_messages_pause_sync(uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    return true;
+}
+void vibe_cardputer_messages_resume_sync(void) {}
 void vibe_cardputer_messages_release_display_resources(void) {}
 
 #endif

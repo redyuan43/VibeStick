@@ -621,6 +621,9 @@ def test_cardputer_message_teardown_and_sync_are_serialized() -> None:
     assert "xSemaphoreTake(s_release_done" in release
     assert 'message_sync_task, "card_msg_sync"' in messages
     assert "xQueueReceive(s_action_queue, &action, portMAX_DELAY)" in messages
+    assert "vibe_cardputer_messages_pause_sync(uint32_t timeout_ms)" in messages
+    assert "atomic_load(&s_sync_in_progress)" in messages
+    assert "sync_interrupted()" in messages
     assert '"X-Vibe-Stick-Device-Ip"' in source
     assert '"X-Vibe-Stick-Wifi-Ssid"' in source
     assert '"X-Vibe-Stick-Wifi-Bssid"' in source
@@ -631,6 +634,19 @@ def test_cardputer_message_teardown_and_sync_are_serialized() -> None:
     )[1].split("if (ok != pdPASS)", 1)[1]
     finalize_failure = finalize_failure.split("static void post_device_command_ack", 1)[0]
     assert "finish_recording_stop(event_name);" in finalize_failure
+
+    recording_start = source.split(
+        "static bool handle_recording_start_internal", 1
+    )[1].split("static bool handle_recording_start", 1)[0]
+    assert recording_start.index("vibe_cardputer_messages_pause_sync(5000)") < (
+        recording_start.index("set_recording_session_active(true)")
+    )
+    assert "vibe_cardputer_messages_resume_sync();" in recording_start
+
+    recording_finish = source.split(
+        "static void finish_recording_stop", 1
+    )[1].split("static void recording_finalize_task", 1)[0]
+    assert "vibe_cardputer_messages_resume_sync();" in recording_finish
 
 
 def test_remote_audio_commands_reuse_sessions_and_ack_after_upload() -> None:

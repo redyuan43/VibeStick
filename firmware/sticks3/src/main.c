@@ -6229,10 +6229,6 @@ static bool handle_recording_start_internal(const char *event_name, const char *
     ESP_LOGI(TAG, "recording start heap_free=%u heap_largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    vibe_cardputer_messages_release_display_resources();
-    recording_http_client_cleanup();
-#endif
     register_activity();
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
     vibe_cardputer_air_mouse_stop();
@@ -6243,6 +6239,17 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         ESP_LOGI(TAG, "recording start ignored while already recording");
         return false;
     }
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    if (!vibe_cardputer_messages_pause_sync(5000)) {
+        ESP_LOGW(TAG, "recording start deferred: message sync busy");
+        show_recording_overlay("PLEASE RETRY", "MESSAGE SYNC BUSY", true);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        show_recording_overlay(NULL, NULL, false);
+        return false;
+    }
+    vibe_cardputer_messages_release_display_resources();
+    recording_http_client_cleanup();
+#endif
     if (provided_session_id && provided_session_id[0] != '\0') {
         strlcpy(s_recording_session_id, provided_session_id,
                 sizeof(s_recording_session_id));
@@ -6252,6 +6259,9 @@ static bool handle_recording_start_internal(const char *event_name, const char *
     }
     if (s_recording_session_id[0] == '\0') {
         ESP_LOGW(TAG, "recording start failed: no session id");
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        vibe_cardputer_messages_resume_sync();
+#endif
         return false;
     }
     s_recording_chunk_id = 0;
@@ -6316,6 +6326,9 @@ static bool handle_recording_start_internal(const char *event_name, const char *
             set_recording_session_active(false);
             ESP_ERROR_CHECK_WITHOUT_ABORT(
                 esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+            vibe_cardputer_messages_resume_sync();
+#endif
             return false;
         }
     }
@@ -6339,6 +6352,9 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         s_recording_session_id[0] = '\0';
         set_recording_session_active(false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        vibe_cardputer_messages_resume_sync();
+#endif
         return false;
     }
     if (!start_recording_upload_task()) {
@@ -6353,6 +6369,9 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         s_recording_session_id[0] = '\0';
         set_recording_session_active(false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        vibe_cardputer_messages_resume_sync();
+#endif
         return false;
     }
     show_recording_overlay("LISTENING", hint, true);
@@ -6398,6 +6417,9 @@ static void finish_recording_stop(const char *event_name)
         show_recording_overlay(NULL, NULL, false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        vibe_cardputer_messages_resume_sync();
+#endif
         return;
     }
 
@@ -6468,6 +6490,9 @@ static void finish_recording_stop(const char *event_name)
         show_recording_overlay(NULL, NULL, false);
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    vibe_cardputer_messages_resume_sync();
+#endif
 }
 
 static void recording_finalize_task(void *arg)
@@ -6501,6 +6526,9 @@ static void handle_recording_stop(const char *event_name)
         poll_state();
         show_recording_overlay(NULL, NULL, false);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(VIBE_STICK_WIFI_IDLE_PS));
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+        vibe_cardputer_messages_resume_sync();
+#endif
         return;
     }
 

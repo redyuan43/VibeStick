@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "vibe_keyboard.h"
@@ -35,4 +36,6 @@ esp_err_t vibe_cardputer_messages_start(void);
 bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event);
 bool vibe_cardputer_messages_active(void);
 bool vibe_cardputer_messages_storage_ready(void);
+bool vibe_cardputer_messages_pause_sync(uint32_t timeout_ms);
+void vibe_cardputer_messages_resume_sync(void);
 void vibe_cardputer_messages_release_display_resources(void);
