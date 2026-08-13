@@ -44,7 +44,6 @@
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
 #define MESSAGE_SYNC_INTERVAL_MS 10000
 #define MESSAGE_TASK_STACK_BYTES 8192
-#define MESSAGE_ACTION_TASK_STACK_BYTES 4096
 #define MESSAGE_ACTION_QUEUE_LENGTH 12
 #define MESSAGE_IO_BUFFER_BYTES 512
 #define MESSAGE_RESOURCE_PATH_PREFIX "/device/messages/resource?"
@@ -1319,7 +1318,7 @@ esp_err_t vibe_cardputer_messages_init(
 esp_err_t vibe_cardputer_messages_start(void)
 {
     BaseType_t sync_result = xTaskCreatePinnedToCore(
-        sync_task, "card_messages", MESSAGE_ACTION_TASK_STACK_BYTES,
+        sync_task, "card_messages", MESSAGE_TASK_STACK_BYTES,
         NULL, 2, NULL, 0);
     return sync_result == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
