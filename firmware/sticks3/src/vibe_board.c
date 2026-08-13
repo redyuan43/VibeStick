@@ -9,6 +9,7 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "driver/usb_serial_jtag.h"
 #endif
 #include "esp_check.h"
 #include "esp_log.h"
@@ -838,7 +839,13 @@ esp_err_t vibe_board_usb_powered(bool *usb_powered)
 {
     ESP_RETURN_ON_FALSE(usb_powered != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "null usb powered");
-    *usb_powered = false;
+    /*
+     * Cardputer-Adv exposes its battery only through the ADC divider; unlike
+     * the PMIC-backed boards it has no charge/VBUS status register.  The
+     * ESP32-S3 USB Serial/JTAG peripheral does report a USB host connection,
+     * which is the external-power path used while connected to the bridge.
+     */
+    *usb_powered = usb_serial_jtag_is_connected();
     return ESP_OK;
 }
 
