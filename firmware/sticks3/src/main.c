@@ -8319,10 +8319,11 @@ static void card_keyboard_event(const vibe_key_event_t *event, void *context)
     if (row >= 4 || col >= 14) {
         return;
     }
-    /* Opt is Cardputer's physical recording button. Keep it independent from
-     * page-level keyboard handlers, matching the front button on StickS3 and
-     * StickC Plus. Setup keeps its existing local handling below. */
-    if (!s_card_setup_active && event->key == VIBE_KEY_OPT) {
+    /* Fn+N is a dedicated message mode: it keeps synchronizing and consumes
+     * Opt so message browsing never wakes the voice pipeline. Leaving the
+     * page restores the normal Opt recording behavior. */
+    if (!s_card_setup_active && !vibe_cardputer_messages_active() &&
+        event->key == VIBE_KEY_OPT) {
         if (event->pressed) {
             register_activity();
             card_opt_press();

@@ -685,9 +685,17 @@ def test_cardputer_message_teardown_and_sync_are_serialized() -> None:
     assert "MESSAGE_ACTION_RELEASE" in release
     assert "xSemaphoreTake(s_release_done" in release
     assert 'message_sync_task, "card_msg_sync"' in messages
-    assert "ulTaskNotifyTake(pdTRUE, portMAX_DELAY)" in messages
+    assert "MESSAGE_ACTIVE_SYNC_INTERVAL_MS 10000" in messages
+    assert "MESSAGE_SYNC_RESPONSE_BYTES (4 * 1024)" in messages
+    assert "MESSAGE_SYNC_BATCH_SIZE 3" in messages
+    assert "pdMS_TO_TICKS(MESSAGE_ACTIVE_SYNC_INTERVAL_MS)" in messages
+    assert "if (atomic_load(&s_active)) sync_once();" in messages
     assert "xTaskNotifyGive(s_sync_task_handle)" in messages
     assert "MESSAGE_SYNC_INTERVAL_MS" not in messages
+    card_keyboard = source.split("static void card_keyboard_event", 1)[1].split(
+        "static void capture_deep_sleep_front_button_intent", 1
+    )[0]
+    assert "!vibe_cardputer_messages_active()" in card_keyboard
     assert "xQueueReceive(s_action_queue, &action, portMAX_DELAY)" in messages
     assert "vibe_cardputer_messages_pause_sync(uint32_t timeout_ms)" in messages
     assert "atomic_load(&s_sync_in_progress)" in messages
@@ -723,6 +731,13 @@ def test_cardputer_message_teardown_and_sync_are_serialized() -> None:
     assert "parse_message_audio_metadata(item, &message)" in sync
     assert "download_message_audio(item, &message)" not in sync
     assert "download_message_audio(&message)" in playback
+    assert playback.index("show_detail_view(spoken_text)") < playback.index(
+        "download_message_audio(&message)"
+    )
+    assert playback.index("mark_message_read(cursor)") < playback.index(
+        "download_message_audio(&message)"
+    )
+    assert "unlink(MESSAGE_INDEX_PATH) != 0 && errno != ENOENT" in messages
 
     finalize_failure = source.split(
         "xTaskCreatePinnedToCore(recording_finalize_task", 1

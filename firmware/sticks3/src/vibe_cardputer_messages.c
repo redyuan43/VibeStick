@@ -40,8 +40,10 @@
 #define MESSAGE_FONT_PATH MESSAGE_SYSTEM_DIR "/DroidSansFallback.ttf"
 #define MESSAGE_MAX_COUNT 100
 #define MESSAGE_PAGE_SIZE 4
-#define MESSAGE_SYNC_RESPONSE_BYTES (2 * 1024)
+#define MESSAGE_SYNC_RESPONSE_BYTES (4 * 1024)
+#define MESSAGE_SYNC_BATCH_SIZE 3
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
+#define MESSAGE_ACTIVE_SYNC_INTERVAL_MS 10000
 #define MESSAGE_TASK_STACK_BYTES 8192
 #define MESSAGE_ACTION_QUEUE_LENGTH 12
 #define MESSAGE_IO_BUFFER_BYTES 512
@@ -150,10 +152,14 @@ static void message_sync_task(void *argument)
 {
     (void)argument;
     while (true) {
-        /* Network work is explicitly opt-in: the home screen must have the
-         * same idle behavior as Plus 1.1. Fn+N requests a single refresh. */
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        sync_once();
+        /* The home screen never polls messages. Once Fn+N owns the display,
+         * it is a dedicated message mode and may refresh without competing
+         * with live voice capture. */
+        TickType_t timeout = atomic_load(&s_active)
+                                 ? pdMS_TO_TICKS(MESSAGE_ACTIVE_SYNC_INTERVAL_MS)
+                                 : portMAX_DELAY;
+        (void)ulTaskNotifyTake(pdTRUE, timeout);
+        if (atomic_load(&s_active)) sync_once();
     }
 }
 
@@ -382,6 +388,9 @@ static esp_err_t save_index(void)
     }
     if (source) fclose(source);
     if (fclose(target) != 0) ok = false;
+    /* FATFS rename does not replace an existing destination. Commit only
+     * after the temporary file has been completely written and closed. */
+    if (ok && unlink(MESSAGE_INDEX_PATH) != 0 && errno != ENOENT) ok = false;
     if (!ok || rename(MESSAGE_INDEX_TMP, MESSAGE_INDEX_PATH) != 0) {
         unlink(MESSAGE_INDEX_TMP);
         return ESP_FAIL;
@@ -751,12 +760,13 @@ static void sync_once_inner(void)
     bool received_new = false;
     char path[112];
     if (loading_older) {
-        snprintf(path, sizeof(path), "/device/messages/sync?before=%lu&limit=20",
-                 (unsigned long)s_oldest_cursor);
+        snprintf(path, sizeof(path), "/device/messages/sync?before=%lu&limit=%u",
+                 (unsigned long)s_oldest_cursor, MESSAGE_SYNC_BATCH_SIZE);
     } else {
-        snprintf(path, sizeof(path), "/device/messages/sync?after=%lu&limit=20%s",
+        snprintf(path, sizeof(path), "/device/messages/sync?after=%lu&limit=%u%s",
                  (unsigned long)(initial_load ? 0 : s_cursor),
-                 initial_load ? "&bootstrap=20" : "");
+                 MESSAGE_SYNC_BATCH_SIZE,
+                 initial_load ? "&bootstrap=3" : "");
     }
     char *response = malloc(MESSAGE_SYNC_RESPONSE_BYTES);
     if (!response) return;
@@ -1233,6 +1243,25 @@ static void close_messages(void)
     if (s_config.restore_home) s_config.restore_home();
 }
 
+static void mark_message_read(uint32_t cursor)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int ref_index = message_ref_index(cursor);
+    if (ref_index >= 0 && !s_message_refs[ref_index].read) {
+        s_message_refs[ref_index].read = true;
+        if (save_index() != ESP_OK) {
+            s_message_refs[ref_index].read = false;
+            ESP_LOGW(TAG, "message read state save failed cursor=%lu",
+                     (unsigned long)cursor);
+        } else {
+            s_loaded_page_start = SIZE_MAX;
+            ESP_LOGI(TAG, "message marked read cursor=%lu",
+                     (unsigned long)cursor);
+        }
+    }
+    xSemaphoreGive(s_lock);
+}
+
 static void play_selected(void)
 {
     if (s_config.audio_busy && s_config.audio_busy()) {
@@ -1258,41 +1287,32 @@ static void play_selected(void)
                 sizeof(spoken_text));
     }
     xSemaphoreGive(s_lock);
-    esp_err_t download_err = download_message_audio(&message);
-    if (download_err != ESP_OK) {
-        ESP_LOGW(TAG, "message audio download failed cursor=%lu result=%s",
-                 (unsigned long)cursor, esp_err_to_name(download_err));
-        return;
-    }
-    char path[160];
-    audio_path(message.audio_id, path, sizeof(path));
+    /* Text is already on SD: present it immediately instead of making the
+     * user wait for the optional audio file to cross Wi-Fi. */
     atomic_store(&s_play_cancel, false);
     display_lock();
     show_detail_view(spoken_text);
     display_unlock();
+    /* Opening the full message is the read action. Do not keep it unread if
+     * its optional audio download or playback later fails. */
+    mark_message_read(cursor);
+    esp_err_t download_err = download_message_audio(&message);
+    if (download_err != ESP_OK) {
+        ESP_LOGW(TAG, "message audio download failed cursor=%lu result=%s",
+                 (unsigned long)cursor, esp_err_to_name(download_err));
+        display_lock();
+        hide_detail_view();
+        display_unlock();
+        atomic_store(&s_play_cancel, false);
+        return;
+    }
+    char path[160];
+    audio_path(message.audio_id, path, sizeof(path));
     ESP_LOGI(TAG, "message playback start cursor=%lu",
              (unsigned long)cursor);
     esp_err_t err = play_wav_file(path);
-    bool cancelled = atomic_load(&s_play_cancel);
     ESP_LOGI(TAG, "message playback cursor=%lu result=%s",
              (unsigned long)cursor, esp_err_to_name(err));
-    if (err == ESP_OK && !cancelled) {
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        esp_err_t save_err = ESP_ERR_NOT_FOUND;
-        int ref_index = message_ref_index(cursor);
-        if (ref_index >= 0) {
-            bool was_read = s_message_refs[ref_index].read;
-            s_message_refs[ref_index].read = true;
-            save_err = save_index();
-            if (save_err != ESP_OK) s_message_refs[ref_index].read = was_read;
-            s_loaded_page_start = SIZE_MAX;
-        }
-        xSemaphoreGive(s_lock);
-        if (save_err != ESP_OK) {
-            ESP_LOGW(TAG, "message read state save failed cursor=%lu result=%s",
-                     (unsigned long)cursor, esp_err_to_name(save_err));
-        }
-    }
     display_lock();
     hide_detail_view();
     display_unlock();
