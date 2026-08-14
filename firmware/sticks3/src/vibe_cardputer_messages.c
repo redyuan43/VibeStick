@@ -21,6 +21,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "lvgl.h"
 #include "mbedtls/sha256.h"
 #include "sdmmc_cmd.h"
@@ -44,7 +45,7 @@
 #define MESSAGE_SYNC_BATCH_SIZE 3
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
 #define MESSAGE_ACTIVE_SYNC_INTERVAL_MS 10000
-#define MESSAGE_TASK_STACK_BYTES 8192
+#define MESSAGE_TASK_STACK_BYTES (12 * 1024)
 #define MESSAGE_ACTION_QUEUE_LENGTH 12
 #define MESSAGE_IO_BUFFER_BYTES 512
 #define MESSAGE_RESOURCE_PATH_PREFIX "/device/messages/resource?"
@@ -59,6 +60,7 @@
 #define MESSAGE_DETAIL_SCROLL_PERIOD_MS 100
 #define MESSAGE_DETAIL_MANUAL_PAUSE_MS 1500
 #define MESSAGE_DETAIL_MANUAL_STEP 24
+#define MESSAGE_DOUBLE_PRESS_WINDOW_MS 400
 
 typedef struct {
     uint32_t magic;
@@ -94,6 +96,7 @@ typedef enum {
     MESSAGE_ACTION_UP,
     MESSAGE_ACTION_DOWN,
     MESSAGE_ACTION_PLAY,
+    MESSAGE_ACTION_PLAY_UNREAD,
     MESSAGE_ACTION_RELEASE,
 } message_action_t;
 
@@ -109,16 +112,27 @@ static size_t s_loaded_page_start = SIZE_MAX;
 static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_action_queue;
 static SemaphoreHandle_t s_release_done;
+static TimerHandle_t s_enter_single_timer;
 static atomic_bool s_storage_ready;
 static atomic_bool s_active;
 static atomic_bool s_play_queued;
 static atomic_bool s_detail_active;
 static atomic_bool s_play_cancel;
+static atomic_bool s_auto_session_active;
+static atomic_bool s_auto_playing;
+static atomic_bool s_auto_play_queued;
+static atomic_bool s_auto_paused;
+static atomic_bool s_auto_start_pending;
+static atomic_bool s_enter_single_pending;
 static atomic_bool s_sync_paused;
 static atomic_bool s_sync_in_progress;
 static atomic_bool s_sync_load_older;
 static TaskHandle_t s_sync_task_handle;
 static size_t s_selected;
+static uint32_t s_auto_queue[MESSAGE_MAX_COUNT];
+static size_t s_auto_queue_count;
+static int64_t s_space_last_press_ms;
+static int64_t s_enter_last_press_ms;
 static lv_obj_t *s_layer;
 static lv_obj_t *s_header;
 static lv_obj_t *s_tiles[MESSAGE_PAGE_SIZE];
@@ -147,6 +161,10 @@ static void render_messages(void);
 static void handle_action(message_action_t action);
 static void sync_once(void);
 static void sync_once_inner(void);
+static void auto_enqueue_unread_messages(void);
+static void auto_enqueue_message(uint32_t cursor);
+static void auto_request_playback(void);
+static void request_selected_playback(void);
 
 static void message_sync_task(void *argument)
 {
@@ -171,6 +189,28 @@ static bool enqueue_action(message_action_t action)
         return false;
     }
     return true;
+}
+
+static void request_selected_playback(void)
+{
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_play_queued, &expected, true)) {
+        return;
+    }
+    if (!enqueue_action(MESSAGE_ACTION_PLAY)) {
+        atomic_store(&s_play_queued, false);
+    }
+}
+
+static void enter_single_timer_cb(TimerHandle_t timer)
+{
+    (void)timer;
+    if (!atomic_exchange(&s_enter_single_pending, false) ||
+        !atomic_load(&s_active) || atomic_load(&s_auto_paused) ||
+        atomic_load(&s_auto_playing)) {
+        return;
+    }
+    request_selected_playback();
 }
 
 static void display_lock(void)
@@ -824,6 +864,9 @@ static void sync_once_inner(void)
         esp_err_t store_err = append_message_record(&message);
         xSemaphoreGive(s_lock);
         if (store_err != ESP_OK) break;
+        if (atomic_load(&s_auto_session_active)) {
+            auto_enqueue_message(message.cursor);
+        }
         index_dirty = true;
         received_new |= !loading_older;
     }
@@ -850,9 +893,14 @@ static void sync_once_inner(void)
     }
     if (received_new) (void)enqueue_action(MESSAGE_ACTION_PREPARE);
     if (received_new && s_config.activity) s_config.activity();
-    if (received_new && access(MESSAGE_NOTIFY_PATH, R_OK) == 0 &&
+    if (received_new && !atomic_load(&s_auto_playing) &&
+        access(MESSAGE_NOTIFY_PATH, R_OK) == 0 &&
         (!s_config.audio_busy || !s_config.audio_busy())) {
         (void)play_wav_file(MESSAGE_NOTIFY_PATH);
+    }
+    if (received_new && atomic_load(&s_auto_session_active) &&
+        !atomic_load(&s_auto_paused)) {
+        auto_request_playback();
     }
 }
 
@@ -865,6 +913,11 @@ static void sync_once(void)
     }
     if (!atomic_load(&s_sync_paused)) sync_once_inner();
     atomic_store(&s_sync_in_progress, false);
+    if (atomic_exchange(&s_auto_start_pending, false) &&
+        atomic_load(&s_auto_session_active)) {
+        auto_enqueue_unread_messages();
+        auto_request_playback();
+    }
 }
 
 static void sync_task(void *argument)
@@ -1194,6 +1247,10 @@ static void open_messages(void)
     if (s_rendered_count != count || s_rendered_cursor != cursor) {
         render_messages();
     }
+    /* Cached messages are already on SD. Start their unread queue immediately
+     * instead of making playback depend on the first network refresh. */
+    auto_enqueue_unread_messages();
+    auto_request_playback();
     ESP_LOGI(TAG, "message center rendered count=%u selected=%u",
              (unsigned)count, (unsigned)selected);
     display_unlock();
@@ -1214,6 +1271,17 @@ static void close_messages(void)
 {
     atomic_store(&s_active, false);
     atomic_store(&s_detail_active, false);
+    atomic_store(&s_auto_session_active, false);
+    atomic_store(&s_auto_paused, false);
+    atomic_store(&s_auto_start_pending, false);
+    atomic_store(&s_play_cancel, true);
+    atomic_store(&s_enter_single_pending, false);
+    s_space_last_press_ms = 0;
+    s_enter_last_press_ms = 0;
+    if (s_enter_single_timer) (void)xTimerStop(s_enter_single_timer, 0);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_auto_queue_count = 0;
+    xSemaphoreGive(s_lock);
     display_lock();
     if (s_blink_timer) {
         lv_timer_delete(s_blink_timer);
@@ -1262,23 +1330,117 @@ static void mark_message_read(uint32_t cursor)
     xSemaphoreGive(s_lock);
 }
 
-static void play_selected(void)
+static bool auto_queue_contains_locked(uint32_t cursor)
+{
+    for (size_t index = 0; index < s_auto_queue_count; index++) {
+        if (s_auto_queue[index] == cursor) return true;
+    }
+    return false;
+}
+
+static void auto_enqueue_message(uint32_t cursor)
+{
+    if (!cursor) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int ref_index = message_ref_index(cursor);
+    if (ref_index >= 0 && !s_message_refs[ref_index].read &&
+        s_auto_queue_count < MESSAGE_MAX_COUNT &&
+        !auto_queue_contains_locked(cursor)) {
+        s_auto_queue[s_auto_queue_count++] = cursor;
+        ESP_LOGI(TAG, "message auto queued cursor=%lu count=%u",
+                 (unsigned long)cursor, (unsigned)s_auto_queue_count);
+    }
+    xSemaphoreGive(s_lock);
+}
+
+static void auto_enqueue_unread_messages(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t index = 0;
+         index < s_message_count && s_auto_queue_count < MESSAGE_MAX_COUNT;
+         index++) {
+        uint32_t cursor = s_message_refs[index].cursor;
+        if (!s_message_refs[index].read && !auto_queue_contains_locked(cursor)) {
+            s_auto_queue[s_auto_queue_count++] = cursor;
+        }
+    }
+    size_t count = s_auto_queue_count;
+    xSemaphoreGive(s_lock);
+    ESP_LOGI(TAG, "message auto queue prepared count=%u", (unsigned)count);
+}
+
+static bool auto_peek_message(uint32_t *cursor)
+{
+    bool found = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    while (s_auto_queue_count > 0) {
+        uint32_t candidate = s_auto_queue[0];
+        int ref_index = message_ref_index(candidate);
+        if (ref_index >= 0 && !s_message_refs[ref_index].read) {
+            *cursor = candidate;
+            found = true;
+            break;
+        }
+        memmove(s_auto_queue, &s_auto_queue[1],
+                (s_auto_queue_count - 1) * sizeof(s_auto_queue[0]));
+        s_auto_queue_count--;
+    }
+    xSemaphoreGive(s_lock);
+    return found;
+}
+
+static void auto_remove_message(uint32_t cursor)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t index = 0; index < s_auto_queue_count; index++) {
+        if (s_auto_queue[index] != cursor) continue;
+        memmove(&s_auto_queue[index], &s_auto_queue[index + 1],
+                (s_auto_queue_count - index - 1) * sizeof(s_auto_queue[0]));
+        s_auto_queue_count--;
+        break;
+    }
+    xSemaphoreGive(s_lock);
+}
+
+static bool auto_queue_has_messages(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool has_messages = s_auto_queue_count > 0;
+    xSemaphoreGive(s_lock);
+    return has_messages;
+}
+
+static void auto_request_playback(void)
+{
+    if (!atomic_load(&s_auto_session_active) ||
+        atomic_load(&s_auto_paused)) return;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_auto_play_queued, &expected, true)) {
+        return;
+    }
+    if (!enqueue_action(MESSAGE_ACTION_PLAY_UNREAD)) {
+        atomic_store(&s_auto_play_queued, false);
+    }
+}
+
+static esp_err_t play_message(uint32_t cursor, bool mark_on_open,
+                              bool mark_on_complete)
 {
     if (s_config.audio_busy && s_config.audio_busy()) {
         ESP_LOGW(TAG, "message playback skipped: audio busy");
-        return;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_selected >= s_message_count) {
+    int ref_index = message_ref_index(cursor);
+    if (ref_index < 0) {
         xSemaphoreGive(s_lock);
-        return;
+        return ESP_ERR_NOT_FOUND;
     }
     stored_message_t message;
     char spoken_text[sizeof(s_messages[0].spoken_text)];
-    uint32_t cursor = s_message_refs[s_selected].cursor;
     if (!load_message_record(cursor, &message)) {
         xSemaphoreGive(s_lock);
-        return;
+        return ESP_ERR_NOT_FOUND;
     }
     strlcpy(spoken_text, message.spoken_text,
             sizeof(spoken_text));
@@ -1293,9 +1455,7 @@ static void play_selected(void)
     display_lock();
     show_detail_view(spoken_text);
     display_unlock();
-    /* Opening the full message is the read action. Do not keep it unread if
-     * its optional audio download or playback later fails. */
-    mark_message_read(cursor);
+    if (mark_on_open) mark_message_read(cursor);
     esp_err_t download_err = download_message_audio(&message);
     if (download_err != ESP_OK) {
         ESP_LOGW(TAG, "message audio download failed cursor=%lu result=%s",
@@ -1303,8 +1463,7 @@ static void play_selected(void)
         display_lock();
         hide_detail_view();
         display_unlock();
-        atomic_store(&s_play_cancel, false);
-        return;
+        return download_err;
     }
     char path[160];
     audio_path(message.audio_id, path, sizeof(path));
@@ -1316,7 +1475,58 @@ static void play_selected(void)
     display_lock();
     hide_detail_view();
     display_unlock();
+    if (err == ESP_OK && mark_on_complete) mark_message_read(cursor);
+    return err;
+}
+
+static void play_selected(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint32_t cursor = s_selected < s_message_count
+                          ? s_message_refs[s_selected].cursor
+                          : 0;
+    xSemaphoreGive(s_lock);
+    if (!cursor) return;
     atomic_store(&s_play_cancel, false);
+    esp_err_t err = play_message(cursor, true, false);
+    ESP_LOGI(TAG, "message playback cursor=%lu result=%s",
+             (unsigned long)cursor, esp_err_to_name(err));
+    atomic_store(&s_play_cancel, false);
+}
+
+static void play_unread_messages(void)
+{
+    atomic_store(&s_auto_playing, true);
+    while (atomic_load(&s_auto_session_active) && atomic_load(&s_active) &&
+           !atomic_load(&s_auto_paused)) {
+        if (s_config.audio_busy && s_config.audio_busy()) break;
+        uint32_t cursor = 0;
+        if (!auto_peek_message(&cursor)) break;
+        atomic_store(&s_play_cancel, false);
+        ESP_LOGI(TAG, "message auto playback start cursor=%lu",
+                 (unsigned long)cursor);
+        esp_err_t err = play_message(cursor, false, true);
+        bool cancelled = atomic_load(&s_play_cancel) ||
+                         atomic_load(&s_auto_paused) ||
+                         !atomic_load(&s_active);
+        if (cancelled) {
+            ESP_LOGI(TAG, "message auto playback paused cursor=%lu",
+                     (unsigned long)cursor);
+            break;
+        }
+        auto_remove_message(cursor);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "message auto playback skipped cursor=%lu result=%s",
+                     (unsigned long)cursor, esp_err_to_name(err));
+        }
+    }
+    atomic_store(&s_auto_playing, false);
+    atomic_store(&s_play_cancel, false);
+    atomic_store(&s_auto_play_queued, false);
+    if (!atomic_load(&s_auto_paused) && auto_queue_has_messages() &&
+        (!s_config.audio_busy || !s_config.audio_busy())) {
+        auto_request_playback();
+    }
 }
 
 static void move_selection(message_action_t action)
@@ -1413,6 +1623,11 @@ static void handle_action(message_action_t action)
         play_selected();
         atomic_store(&s_play_queued, false);
         break;
+    case MESSAGE_ACTION_PLAY_UNREAD:
+        ESP_LOGI(TAG, "message auto play action stack_free=%u",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        play_unread_messages();
+        break;
     case MESSAGE_ACTION_RELEASE:
         close_messages();
         atomic_store(&s_play_cancel, false);
@@ -1439,9 +1654,19 @@ esp_err_t vibe_cardputer_messages_init(
     atomic_store(&s_storage_ready, false);
     atomic_store(&s_active, false);
     atomic_store(&s_play_queued, false);
+    atomic_store(&s_auto_session_active, false);
+    atomic_store(&s_auto_playing, false);
+    atomic_store(&s_auto_play_queued, false);
+    atomic_store(&s_auto_paused, false);
+    atomic_store(&s_auto_start_pending, false);
+    atomic_store(&s_enter_single_pending, false);
     atomic_store(&s_sync_paused, false);
     atomic_store(&s_sync_in_progress, false);
     atomic_store(&s_sync_load_older, false);
+    s_enter_single_timer = xTimerCreate("msg_enter", pdMS_TO_TICKS(
+        MESSAGE_DOUBLE_PRESS_WINDOW_MS), pdFALSE, NULL, enter_single_timer_cb);
+    ESP_RETURN_ON_FALSE(s_enter_single_timer, ESP_ERR_NO_MEM, TAG,
+                        "message enter timer");
     return ESP_OK;
 }
 
@@ -1470,8 +1695,17 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
                  storage_ready ? 1 : 0);
         if (!storage_ready) return true;
         atomic_store(&s_active, true);
+        atomic_store(&s_auto_session_active, true);
+        atomic_store(&s_auto_paused, false);
+        atomic_store(&s_auto_start_pending, true);
+        s_space_last_press_ms = 0;
+        s_enter_last_press_ms = 0;
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_auto_queue_count = 0;
+        xSemaphoreGive(s_lock);
         if (!enqueue_action(MESSAGE_ACTION_OPEN)) {
             atomic_store(&s_active, false);
+            atomic_store(&s_auto_session_active, false);
         } else if (s_sync_task_handle) {
             /* Refresh only after the user deliberately enters the message
              * center. This prevents all message HTTP traffic on the home UI. */
@@ -1480,10 +1714,45 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
         return true;
     }
     if (!atomic_load(&s_active)) return false;
+    if (event->pressed && event->character == ' ') {
+        int64_t now = message_now_ms();
+        if (now - s_space_last_press_ms <= MESSAGE_DOUBLE_PRESS_WINDOW_MS) {
+            s_space_last_press_ms = 0;
+            atomic_store(&s_auto_paused, true);
+            atomic_store(&s_play_cancel, true);
+            ESP_LOGI(TAG, "message auto playback paused by double space");
+        } else {
+            s_space_last_press_ms = now;
+        }
+        return true;
+    }
+    if (event->pressed && event->key == VIBE_KEY_ENTER) {
+        int64_t now = message_now_ms();
+        if (now - s_enter_last_press_ms <= MESSAGE_DOUBLE_PRESS_WINDOW_MS) {
+            s_enter_last_press_ms = 0;
+            atomic_store(&s_enter_single_pending, false);
+            if (s_enter_single_timer) (void)xTimerStop(s_enter_single_timer, 0);
+            atomic_store(&s_auto_paused, false);
+            atomic_store(&s_play_cancel, false);
+            auto_enqueue_unread_messages();
+            auto_request_playback();
+            ESP_LOGI(TAG, "message auto playback resumed by double enter");
+        } else {
+            s_enter_last_press_ms = now;
+            atomic_store(&s_enter_single_pending, true);
+            if (s_enter_single_timer) {
+                (void)xTimerReset(s_enter_single_timer, 0);
+            }
+        }
+        return true;
+    }
     if (atomic_load(&s_detail_active)) {
         if (!event->pressed) return true;
         if (event->key == VIBE_KEY_ESCAPE) {
             atomic_store(&s_play_cancel, true);
+            if (atomic_load(&s_auto_playing)) {
+                atomic_store(&s_auto_paused, true);
+            }
         } else if (event->key == VIBE_KEY_UP) {
             scroll_detail_manually(-MESSAGE_DETAIL_MANUAL_STEP);
         } else if (event->key == VIBE_KEY_DOWN) {
@@ -1503,15 +1772,6 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
         action = MESSAGE_ACTION_UP;
     } else if (event->key == VIBE_KEY_DOWN) {
         action = MESSAGE_ACTION_DOWN;
-    } else if (event->key == VIBE_KEY_ENTER) {
-        bool expected = false;
-        if (!atomic_compare_exchange_strong(&s_play_queued, &expected, true)) {
-            return true;
-        }
-        if (!enqueue_action(MESSAGE_ACTION_PLAY)) {
-            atomic_store(&s_play_queued, false);
-        }
-        return true;
     } else {
         return true;
     }
