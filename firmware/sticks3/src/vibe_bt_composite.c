@@ -33,6 +33,12 @@
 #define RECONNECT_ATTEMPT_TIMEOUT_MS 8000
 #define RECONNECT_BACKOFF_MAX_MS 30000
 
+/* Bluedroid does not expose Classic link-policy control through esp_gap_bt. */
+typedef uint8_t vibe_btm_status_t;
+extern vibe_btm_status_t BTM_SetLinkPolicy(uint8_t *remote_bda,
+                                           uint16_t *settings);
+extern void BTM_SetDefaultLinkPolicy(uint16_t settings);
+
 static const char *TAG = "vibe_bt_composite";
 static const char *DEVICE_NAME = "VibeStick MiniJoy";
 
@@ -175,6 +181,14 @@ static void notify_state(void)
         vibe_bt_composite_state_t state = state_snapshot();
         s_state_callback(&state, s_state_context);
     }
+}
+
+static void disable_sniff_policy(const esp_bd_addr_t address)
+{
+    uint16_t active_only = 0;
+    vibe_btm_status_t status =
+        BTM_SetLinkPolicy((uint8_t *)address, &active_only);
+    ESP_LOGI(TAG, "Classic link policy active-only status=%u", status);
 }
 
 static void set_scan_mode(bool pairing)
@@ -330,6 +344,9 @@ static void hfp_callback(esp_hf_client_cb_event_t event,
         portEXIT_CRITICAL(&s_reconnect_lock);
         ESP_LOGI(TAG, "HFP state=%d connected=%d",
                  param->conn_stat.state, hfp_connected);
+        if (hfp_connected) {
+            disable_sniff_policy(param->conn_stat.remote_bda);
+        }
         notify_state();
         break;
     }
@@ -487,6 +504,7 @@ esp_err_t vibe_bt_composite_init(vibe_bt_state_callback_t state_callback,
                         "controller enable");
     ESP_RETURN_ON_ERROR(esp_bluedroid_init(), TAG, "bluedroid init");
     ESP_RETURN_ON_ERROR(esp_bluedroid_enable(), TAG, "bluedroid enable");
+    BTM_SetDefaultLinkPolicy(0);
 
     ESP_RETURN_ON_ERROR(esp_bt_gap_register_callback(gap_callback), TAG,
                         "GAP callback");
@@ -628,6 +646,40 @@ esp_err_t vibe_bt_composite_request_reconnect(void)
              address[0], address[1], address[2], address[3],
              address[4], address[5]);
     return ESP_OK;
+}
+
+esp_err_t vibe_bt_composite_keepalive(void)
+{
+    vibe_bt_composite_state_t state = state_snapshot();
+    ESP_RETURN_ON_FALSE(state.hid_connected && state.hfp_connected,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "Bluetooth profiles disconnected");
+    if (state.audio_connected) {
+        return ESP_OK;
+    }
+
+    esp_bd_addr_t address = {0};
+    portENTER_CRITICAL(&s_reconnect_lock);
+    bool target_valid = s_reconnect_target_valid;
+    if (target_valid) {
+        memcpy(address, s_reconnect_address, sizeof(address));
+    }
+    portEXIT_CRITICAL(&s_reconnect_lock);
+    ESP_RETURN_ON_FALSE(target_valid, ESP_ERR_NOT_FOUND, TAG,
+                        "bonded host address unavailable");
+    disable_sniff_policy(address);
+
+    /*
+     * Keep the shared Classic ACL active without sending an HFP AT command.
+     * macOS can still be finalizing the previous SCO transport when capture
+     * stops; an AT+COPS query in that window can time out and tear down the
+     * complete HID/HFP connection.  An all-released HID report is harmless
+     * and supplies the same ACL traffic without touching the HFP state
+     * machine.
+     */
+    uint8_t report[8] = {0};
+    return esp_hidd_dev_input_set(s_hid, 0, HID_REPORT_ID_KEYBOARD,
+                                  report, sizeof(report));
 }
 
 esp_err_t vibe_bt_composite_prepare_deep_sleep(uint32_t timeout_ms)

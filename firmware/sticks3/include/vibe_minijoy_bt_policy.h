@@ -21,6 +21,14 @@ typedef struct {
     int64_t deadline_ms;
 } vibe_minijoy_ptt_audio_guard_t;
 
+bool vibe_minijoy_bt_should_attempt_automatic_sleep(
+    bool active_work,
+    bool usb_power_valid,
+    bool usb_powered,
+    int64_t now_ms,
+    int64_t last_activity_ms,
+    int64_t deep_sleep_after_ms);
+
 vibe_minijoy_ptt_press_action_t vibe_minijoy_ptt_press_action(
     bool serial_control,
     bool capture_active,

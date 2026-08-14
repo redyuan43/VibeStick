@@ -66,10 +66,11 @@
 #define PROFILE_ERROR_LED_SLOT_MS 280
 #define PROFILE_ERROR_LED_ON_MS 120
 #define PTT_AUDIO_CONNECT_GRACE_MS 3000
+#define POWERED_BT_KEEPALIVE_MS 5000
 #define FRONT_BUTTON_DEBOUNCE_MS 30
 #define M5CTL_UART_PORT UART_NUM_0
 #define M5CTL_LINE_BYTES 128
-#define M5CTL_RESPONSE_BYTES 384
+#define M5CTL_RESPONSE_BYTES 512
 #define M5CTL_UART_RX_BUFFER_BYTES 256
 #define M5CTL_DEFAULT_PAIRING_SECONDS 180
 #define M5CTL_MIN_PAIRING_SECONDS 30
@@ -141,6 +142,9 @@ static int64_t s_last_calibration_log_ms;
 static int64_t s_confirm_deadline_ms;
 static int64_t s_last_activity_ms;
 static int64_t s_next_deep_sleep_attempt_ms;
+static int64_t s_next_bt_keepalive_ms;
+static bool s_usb_sleep_deferred_logged;
+static bool s_usb_status_error_logged;
 static int64_t s_wake_release_since_ms;
 static int64_t s_profile_connect_started_ms;
 static bool s_front_button_pressed;
@@ -250,17 +254,22 @@ static void serial_reply(const char *payload)
 static void serial_status_reply(void)
 {
     vibe_bt_composite_state_t state = bt_state();
+    bool usb_powered = false;
+    bool usb_power_valid =
+        vibe_board_usb_powered(&usb_powered) == ESP_OK;
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_BT);
     char payload[M5CTL_RESPONSE_BYTES];
     snprintf(payload, sizeof(payload),
-             "{\"ok\":true,\"version\":\"%s\",\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"paired\":%s,\"pairing\":%s,\"hid\":%s,\"hfp\":%s,\"audio\":%s,\"wideband\":%s,\"front\":%d,\"side\":%d,\"input_guard\":%s,\"air_mouse\":%s,\"minijoy\":%s,\"last_auth_status\":%ld}",
+             "{\"ok\":true,\"version\":\"%s\",\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"paired\":%s,\"pairing\":%s,\"hid\":%s,\"hfp\":%s,\"audio\":%s,\"wideband\":%s,\"usb_power_valid\":%s,\"usb_powered\":%s,\"front\":%d,\"side\":%d,\"input_guard\":%s,\"air_mouse\":%s,\"minijoy\":%s,\"last_auth_status\":%ld}",
              FIRMWARE_VERSION, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
              state.paired ? "true" : "false", state.pairing ? "true" : "false",
              state.hid_connected ? "true" : "false",
              state.hfp_connected ? "true" : "false",
              state.audio_connected ? "true" : "false",
              state.wideband ? "true" : "false",
+             usb_power_valid ? "true" : "false",
+             usb_powered ? "true" : "false",
              gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0,
              gpio_get_level(VIBE_BOARD_PIN_BUTTON_SIDE) == 0,
              atomic_load(&s_wake_input_guard) ? "true" : "false",
@@ -1354,15 +1363,77 @@ static bool enter_deep_sleep(void)
 
 static void maybe_enter_deep_sleep(int64_t current_ms)
 {
-    if (s_last_activity_ms == 0 ||
-        current_ms - s_last_activity_ms < DEEP_SLEEP_IDLE_MS ||
-        deep_sleep_has_active_work(current_ms) ||
+    bool active_work = deep_sleep_has_active_work(current_ms);
+    if (!vibe_minijoy_bt_should_attempt_automatic_sleep(
+            active_work, true, false, current_ms, s_last_activity_ms,
+            DEEP_SLEEP_IDLE_MS) ||
         (s_next_deep_sleep_attempt_ms > 0 &&
          current_ms < s_next_deep_sleep_attempt_ms)) {
         return;
     }
     s_next_deep_sleep_attempt_ms = current_ms + DEEP_SLEEP_RETRY_MS;
+
+    bool usb_powered = false;
+    esp_err_t power_err = vibe_board_usb_powered(&usb_powered);
+    bool usb_power_valid = power_err == ESP_OK;
+    if (!vibe_minijoy_bt_should_attempt_automatic_sleep(
+            active_work, usb_power_valid, usb_powered, current_ms,
+            s_last_activity_ms, DEEP_SLEEP_IDLE_MS)) {
+        if (!usb_power_valid) {
+            if (!s_usb_status_error_logged) {
+                ESP_LOGW(TAG,
+                         "automatic deep sleep deferred: USB status unavailable: %s",
+                         esp_err_to_name(power_err));
+                s_usb_status_error_logged = true;
+            }
+            s_usb_sleep_deferred_logged = false;
+        } else if (usb_powered) {
+            if (!s_usb_sleep_deferred_logged) {
+                ESP_LOGI(TAG,
+                         "automatic deep sleep deferred while USB powered");
+                s_usb_sleep_deferred_logged = true;
+            }
+            s_usb_status_error_logged = false;
+        }
+        return;
+    }
+    if (s_usb_sleep_deferred_logged) {
+        ESP_LOGI(TAG, "USB power removed; automatic deep sleep enabled");
+    }
+    s_usb_sleep_deferred_logged = false;
+    s_usb_status_error_logged = false;
     (void)enter_deep_sleep();
+}
+
+static void maybe_send_powered_bt_keepalive(int64_t current_ms)
+{
+    if (atomic_load(&s_capture_active)) {
+        /* Let macOS finish its delayed SCO teardown before the next ACL ping. */
+        s_next_bt_keepalive_ms = current_ms + POWERED_BT_KEEPALIVE_MS;
+        return;
+    }
+    if (current_ms < s_next_bt_keepalive_ms) {
+        return;
+    }
+
+    bool usb_powered = false;
+    if (vibe_board_usb_powered(&usb_powered) != ESP_OK || !usb_powered) {
+        return;
+    }
+    vibe_bt_composite_state_t state = bt_state();
+    if (state.audio_connected) {
+        s_next_bt_keepalive_ms = current_ms + POWERED_BT_KEEPALIVE_MS;
+        return;
+    }
+    if (!state.hid_connected || !state.hfp_connected) {
+        return;
+    }
+    s_next_bt_keepalive_ms = current_ms + POWERED_BT_KEEPALIVE_MS;
+    esp_err_t err = vibe_bt_composite_keepalive();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "powered Bluetooth keepalive failed: %s",
+                 esp_err_to_name(err));
+    }
 }
 
 static esp_err_t init_nvs(void)
@@ -1548,6 +1619,7 @@ void app_main(void)
         update_status();
         update_status_leds(current_ms);
         vibe_bt_status_ui_tick(current_ms);
+        maybe_send_powered_bt_keepalive(current_ms);
         maybe_enter_deep_sleep(current_ms);
         vTaskDelay(pdMS_TO_TICKS(APP_LOOP_MS));
     }

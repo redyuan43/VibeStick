@@ -46,15 +46,57 @@ def test_deep_sleep_gracefully_disconnects_profiles_before_power_off() -> None:
     assert "return false;" in bluetooth_prepare
 
 
-def test_usb_power_does_not_block_deep_sleep() -> None:
+def test_usb_power_blocks_only_automatic_deep_sleep() -> None:
     maybe_sleep = _function(
         MAIN_SOURCE,
         "static void maybe_enter_deep_sleep(int64_t current_ms)",
         "static esp_err_t init_nvs",
     )
 
-    assert "vibe_board_usb_powered" not in maybe_sleep
+    assert "vibe_board_usb_powered" in maybe_sleep
+    assert "vibe_minijoy_bt_should_attempt_automatic_sleep" in maybe_sleep
+    assert "automatic deep sleep deferred while USB powered" in maybe_sleep
     assert "enter_deep_sleep();" in maybe_sleep
+
+    handler = _function(MAIN_SOURCE, "static void handle_event", "static void poll_minijoy")
+    forced_sleep = handler.split("case APP_EVENT_SERIAL_SLEEP:", 1)[1].split(
+        "case APP_EVENT_SERIAL_REBOOT:", 1
+    )[0]
+    assert "vibe_board_usb_powered" not in forced_sleep
+
+
+def test_serial_status_exposes_usb_power_state() -> None:
+    status = _function(
+        MAIN_SOURCE,
+        "static void serial_status_reply(void)",
+        "static uint32_t serial_pairing_seconds",
+    )
+
+    assert "vibe_board_usb_powered" in status
+    assert '\\"usb_power_valid\\"' in status
+    assert '\\"usb_powered\\"' in status
+
+
+def test_usb_powered_idle_sends_hfp_keepalive_without_resetting_activity() -> None:
+    keepalive = _function(
+        MAIN_SOURCE,
+        "static void maybe_send_powered_bt_keepalive(int64_t current_ms)",
+        "static esp_err_t init_nvs",
+    )
+
+    assert "#define POWERED_BT_KEEPALIVE_MS 5000" in MAIN_SOURCE
+    assert "vibe_board_usb_powered" in keepalive
+    assert "vibe_bt_composite_keepalive" in keepalive
+    assert "register_activity" not in keepalive
+    assert "esp_hf_client_query_current_operator_name" not in COMPOSITE_SOURCE
+    assert "esp_hidd_dev_input_set" in COMPOSITE_SOURCE
+    assert "BTM_SetDefaultLinkPolicy(0)" in COMPOSITE_SOURCE
+    assert "disable_sniff_policy(address)" in COMPOSITE_SOURCE
+    assert "disable_sniff_policy(param->conn_stat.remote_bda)" in COMPOSITE_SOURCE
+    capture_guard = keepalive.split("if (atomic_load(&s_capture_active))", 1)[1]
+    capture_guard = capture_guard.split("if (current_ms < s_next_bt_keepalive_ms)", 1)[0]
+    assert "s_next_bt_keepalive_ms = current_ms + POWERED_BT_KEEPALIVE_MS" in capture_guard
+    assert "vibe_bt_composite_keepalive(void)" in COMPOSITE_HEADER
 
 
 def test_serial_sleep_uses_the_production_deep_sleep_path() -> None:

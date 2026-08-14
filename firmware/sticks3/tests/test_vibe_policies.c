@@ -69,6 +69,20 @@ static void test_minijoy_ptt_press_policy(void)
            VIBE_MINIJOY_PTT_PRESS_NOOP);
 }
 
+static void test_minijoy_automatic_sleep_policy(void)
+{
+    assert(!vibe_minijoy_bt_should_attempt_automatic_sleep(
+        false, true, true, 1000, 100, 900));
+    assert(!vibe_minijoy_bt_should_attempt_automatic_sleep(
+        false, false, false, 1000, 100, 900));
+    assert(!vibe_minijoy_bt_should_attempt_automatic_sleep(
+        true, true, false, 1000, 100, 900));
+    assert(!vibe_minijoy_bt_should_attempt_automatic_sleep(
+        false, true, false, 999, 100, 900));
+    assert(vibe_minijoy_bt_should_attempt_automatic_sleep(
+        false, true, false, 1000, 100, 900));
+}
+
 static void test_minijoy_ptt_audio_guard(void)
 {
     vibe_minijoy_ptt_audio_guard_t guard = {0};
@@ -286,6 +300,7 @@ int main(void)
     test_ota_versions();
     test_followup_window();
     test_minijoy_ptt_press_policy();
+    test_minijoy_automatic_sleep_policy();
     test_minijoy_ptt_audio_guard();
     test_recording_upload_stats();
     test_power_policy();

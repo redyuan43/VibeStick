@@ -2,6 +2,21 @@
 
 #include <string.h>
 
+bool vibe_minijoy_bt_should_attempt_automatic_sleep(
+    bool active_work,
+    bool usb_power_valid,
+    bool usb_powered,
+    int64_t now_ms,
+    int64_t last_activity_ms,
+    int64_t deep_sleep_after_ms)
+{
+    return !active_work &&
+           usb_power_valid &&
+           !usb_powered &&
+           last_activity_ms > 0 &&
+           now_ms - last_activity_ms >= deep_sleep_after_ms;
+}
+
 vibe_minijoy_ptt_press_action_t vibe_minijoy_ptt_press_action(
     bool serial_control,
     bool capture_active,
