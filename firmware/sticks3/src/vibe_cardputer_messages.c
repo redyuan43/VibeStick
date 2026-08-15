@@ -628,11 +628,11 @@ static esp_err_t play_wav_file(const char *path)
 static void sync_once(void)
 {
     if (!s_config.request || !s_config.download ||
-        !atomic_load(&s_storage_ready) || atomic_load(&s_active)) return;
+        !atomic_load(&s_storage_ready) || !atomic_load(&s_active)) return;
     if (s_config.audio_busy && s_config.audio_busy()) return;
     bool received_new = false;
     for (int page = 0; page < MESSAGE_MAX_COUNT; page++) {
-        if (atomic_load(&s_active)) return;
+        if (!atomic_load(&s_active)) return;
         char path[96];
         snprintf(path, sizeof(path),
                  "/device/messages/sync?after=%lu&limit=1%s",
@@ -846,10 +846,15 @@ static void sync_task(void *argument)
         if (xQueueReceive(s_action_queue, &action,
                           pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
             handle_action(action);
+            if (action == MESSAGE_ACTION_OPEN) {
+                /* Fn+N owns the device; refresh immediately instead of
+                 * waiting for the normal periodic interval. */
+                next_sync_ms = 0;
+            }
         }
         now_ms = message_now_ms();
-        if (now_ms >= next_sync_ms) {
-            if (!atomic_load(&s_active)) sync_once();
+        if (atomic_load(&s_active) && now_ms >= next_sync_ms) {
+            sync_once();
             next_sync_ms = message_now_ms() + MESSAGE_SYNC_INTERVAL_MS;
         }
     }
