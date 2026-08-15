@@ -38,12 +38,11 @@
 #define MESSAGE_INDEX_TMP MESSAGE_ROOT "/messages.jsonl.tmp"
 #define MESSAGE_NOTIFY_PATH MESSAGE_SYSTEM_DIR "/F1_New_SMS.wav"
 #define MESSAGE_FONT_PATH MESSAGE_SYSTEM_DIR "/DroidSansFallback.ttf"
-#define MESSAGE_MAX_COUNT 100
+#define MESSAGE_MAX_COUNT 4
 #define MESSAGE_PAGE_SIZE 4
-#define MESSAGE_SYNC_RESPONSE_BYTES (4 * 1024)
-#define MESSAGE_SYNC_BATCH_SIZE 3
+#define MESSAGE_SYNC_RESPONSE_BYTES (2 * 1024)
 #define MESSAGE_MAX_RESOURCE_BYTES (8 * 1024 * 1024)
-#define MESSAGE_ACTIVE_SYNC_INTERVAL_MS 10000
+#define MESSAGE_SYNC_INTERVAL_MS 10000
 #define MESSAGE_TASK_STACK_BYTES 8192
 #define MESSAGE_ACTION_QUEUE_LENGTH 12
 #define MESSAGE_IO_BUFFER_BYTES 512
@@ -78,13 +77,6 @@ typedef struct {
     size_t audio_size;
 } stored_message_t;
 
-/* Keep only the four visible records in RAM. The complete message metadata
- * remains as JSONL on SD; the cursor/read table is deliberately tiny. */
-typedef struct {
-    uint32_t cursor;
-    bool read;
-} message_ref_t;
-
 typedef enum {
     MESSAGE_ACTION_PREPARE = 0,
     MESSAGE_ACTION_OPEN,
@@ -94,30 +86,20 @@ typedef enum {
     MESSAGE_ACTION_UP,
     MESSAGE_ACTION_DOWN,
     MESSAGE_ACTION_PLAY,
-    MESSAGE_ACTION_RELEASE,
 } message_action_t;
 
 static const char *TAG = "card_messages";
 static vibe_cardputer_messages_config_t s_config;
-static stored_message_t s_messages[MESSAGE_PAGE_SIZE];
-static message_ref_t s_message_refs[MESSAGE_MAX_COUNT];
+static stored_message_t s_messages[MESSAGE_MAX_COUNT];
 static size_t s_message_count;
 static uint32_t s_cursor;
-static uint32_t s_oldest_cursor;
-static bool s_history_has_more;
-static size_t s_loaded_page_start = SIZE_MAX;
 static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_action_queue;
-static SemaphoreHandle_t s_release_done;
 static atomic_bool s_storage_ready;
 static atomic_bool s_active;
 static atomic_bool s_play_queued;
 static atomic_bool s_detail_active;
 static atomic_bool s_play_cancel;
-static atomic_bool s_sync_paused;
-static atomic_bool s_sync_in_progress;
-static atomic_bool s_sync_load_older;
-static TaskHandle_t s_sync_task_handle;
 static size_t s_selected;
 static lv_obj_t *s_layer;
 static lv_obj_t *s_header;
@@ -145,23 +127,6 @@ static int64_t message_now_ms(void);
 static void prepare_messages(void);
 static void render_messages(void);
 static void handle_action(message_action_t action);
-static void sync_once(void);
-static void sync_once_inner(void);
-
-static void message_sync_task(void *argument)
-{
-    (void)argument;
-    while (true) {
-        /* The home screen never polls messages. Once Fn+N owns the display,
-         * it is a dedicated message mode and may refresh without competing
-         * with live voice capture. */
-        TickType_t timeout = atomic_load(&s_active)
-                                 ? pdMS_TO_TICKS(MESSAGE_ACTIVE_SYNC_INTERVAL_MS)
-                                 : portMAX_DELAY;
-        (void)ulTaskNotifyTake(pdTRUE, timeout);
-        if (atomic_load(&s_active)) sync_once();
-    }
-}
 
 static bool enqueue_action(message_action_t action)
 {
@@ -254,90 +219,8 @@ static void clear_legacy_message_cache(void)
     unlink(MESSAGE_INDEX_PATH);
     s_message_count = 0;
     s_cursor = 0;
-    s_oldest_cursor = 0;
     ESP_LOGI(TAG, "legacy message cache cleared for schema v%d",
              MESSAGE_INDEX_SCHEMA_VERSION);
-}
-
-static bool parse_stored_message(cJSON *item, stored_message_t *message)
-{
-    cJSON *cursor = cJSON_GetObjectItemCaseSensitive(item, "cursor");
-    cJSON *read = cJSON_GetObjectItemCaseSensitive(item, "read");
-    cJSON *size = cJSON_GetObjectItemCaseSensitive(item, "audio_size");
-    if (!cJSON_IsNumber(cursor) || cursor->valuedouble <= 0) return false;
-    memset(message, 0, sizeof(*message));
-    message->cursor = (uint32_t)cursor->valuedouble;
-    message->read = cJSON_IsTrue(read);
-    message->audio_size = cJSON_IsNumber(size) ? (size_t)size->valuedouble : 0;
-    copy_json_string(item, "title", message->title, sizeof(message->title));
-    copy_json_string(item, "summary", message->summary, sizeof(message->summary));
-    copy_json_string(item, "spoken_text", message->spoken_text,
-                     sizeof(message->spoken_text));
-    copy_json_string(item, "audio_id", message->audio_id, sizeof(message->audio_id));
-    copy_json_string(item, "audio_sha256", message->audio_sha256,
-                     sizeof(message->audio_sha256));
-    return true;
-}
-
-static int message_ref_index(uint32_t cursor)
-{
-    for (size_t index = 0; index < s_message_count; index++) {
-        if (s_message_refs[index].cursor == cursor) return (int)index;
-    }
-    return -1;
-}
-
-static void message_refs_insert(uint32_t cursor, bool read)
-{
-    if (message_ref_index(cursor) >= 0 || s_message_count >= MESSAGE_MAX_COUNT) return;
-    size_t index = 0;
-    while (index < s_message_count && s_message_refs[index].cursor > cursor) index++;
-    if (index < s_message_count) {
-        memmove(&s_message_refs[index + 1], &s_message_refs[index],
-                (s_message_count - index) * sizeof(s_message_refs[0]));
-    }
-    s_message_refs[index] = (message_ref_t){.cursor = cursor, .read = read};
-    s_message_count++;
-    if (cursor > s_cursor) s_cursor = cursor;
-    s_oldest_cursor = s_message_refs[s_message_count - 1].cursor;
-}
-
-static bool write_message_json(FILE *file, const stored_message_t *message)
-{
-    cJSON *item = cJSON_CreateObject();
-    cJSON_AddNumberToObject(item, "schema_version", MESSAGE_INDEX_SCHEMA_VERSION);
-    cJSON_AddNumberToObject(item, "cursor", message->cursor);
-    cJSON_AddBoolToObject(item, "read", message->read);
-    cJSON_AddStringToObject(item, "title", message->title);
-    cJSON_AddStringToObject(item, "summary", message->summary);
-    cJSON_AddStringToObject(item, "spoken_text", message->spoken_text);
-    cJSON_AddStringToObject(item, "audio_id", message->audio_id);
-    cJSON_AddStringToObject(item, "audio_sha256", message->audio_sha256);
-    cJSON_AddNumberToObject(item, "audio_size", (double)message->audio_size);
-    char *line = cJSON_PrintUnformatted(item);
-    cJSON_Delete(item);
-    bool ok = line && fprintf(file, "%s\n", line) >= 0;
-    cJSON_free(line);
-    return ok;
-}
-
-static bool load_message_record(uint32_t cursor, stored_message_t *message)
-{
-    FILE *file = fopen(MESSAGE_INDEX_PATH, "rb");
-    if (!file) return false;
-    char line[2048];
-    bool found = false;
-    while (fgets(line, sizeof(line), file)) {
-        cJSON *item = cJSON_Parse(line);
-        if (item && parse_stored_message(item, message) && message->cursor == cursor) {
-            found = true;
-            cJSON_Delete(item);
-            break;
-        }
-        cJSON_Delete(item);
-    }
-    fclose(file);
-    return found;
 }
 
 static void load_index(void)
@@ -346,18 +229,36 @@ static void load_index(void)
     if (!file) return;
     bool legacy_schema = false;
     char line[2048];
-    while (fgets(line, sizeof(line), file)) {
+    while (s_message_count < MESSAGE_MAX_COUNT && fgets(line, sizeof(line), file)) {
         cJSON *item = cJSON_Parse(line);
         if (!item) continue;
         cJSON *schema = cJSON_GetObjectItemCaseSensitive(item, "schema_version");
-        stored_message_t message;
-        if (!cJSON_IsNumber(schema) || schema->valueint != MESSAGE_INDEX_SCHEMA_VERSION) {
+        if (!cJSON_IsNumber(schema) ||
+            schema->valueint != MESSAGE_INDEX_SCHEMA_VERSION) {
             legacy_schema = true;
-        } else if (parse_stored_message(item, &message)) {
-            message_refs_insert(message.cursor, message.read);
+            cJSON_Delete(item);
+            break;
+        }
+        stored_message_t *message = &s_messages[s_message_count];
+        memset(message, 0, sizeof(*message));
+        cJSON *cursor = cJSON_GetObjectItemCaseSensitive(item, "cursor");
+        cJSON *read = cJSON_GetObjectItemCaseSensitive(item, "read");
+        cJSON *size = cJSON_GetObjectItemCaseSensitive(item, "audio_size");
+        if (cJSON_IsNumber(cursor) && cursor->valuedouble > 0) {
+            message->cursor = (uint32_t)cursor->valuedouble;
+            message->read = cJSON_IsTrue(read);
+            message->audio_size = cJSON_IsNumber(size) ? (size_t)size->valuedouble : 0;
+            copy_json_string(item, "title", message->title, sizeof(message->title));
+            copy_json_string(item, "summary", message->summary, sizeof(message->summary));
+            copy_json_string(item, "spoken_text", message->spoken_text,
+                             sizeof(message->spoken_text));
+            copy_json_string(item, "audio_id", message->audio_id, sizeof(message->audio_id));
+            copy_json_string(item, "audio_sha256", message->audio_sha256,
+                             sizeof(message->audio_sha256));
+            if (message->cursor > s_cursor) s_cursor = message->cursor;
+            s_message_count++;
         }
         cJSON_Delete(item);
-        if (legacy_schema) break;
     }
     fclose(file);
     if (legacy_schema) clear_legacy_message_cache();
@@ -365,46 +266,43 @@ static void load_index(void)
 
 static esp_err_t save_index(void)
 {
-    FILE *source = fopen(MESSAGE_INDEX_PATH, "rb");
-    FILE *target = fopen(MESSAGE_INDEX_TMP, "wb");
-    if (!target) {
-        if (source) fclose(source);
-        return ESP_FAIL;
-    }
-    char line[2048];
-    bool ok = true;
-    while (source && fgets(line, sizeof(line), source)) {
-        cJSON *item = cJSON_Parse(line);
-        stored_message_t message;
-        if (item && parse_stored_message(item, &message)) {
-            int ref_index = message_ref_index(message.cursor);
-            if (ref_index >= 0) {
-                message.read = s_message_refs[ref_index].read;
-                ok = write_message_json(target, &message);
-            }
-        }
+    FILE *file = fopen(MESSAGE_INDEX_TMP, "wb");
+    if (!file) return ESP_FAIL;
+    for (size_t index = 0; index < s_message_count; index++) {
+        const stored_message_t *message = &s_messages[index];
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "schema_version",
+                               MESSAGE_INDEX_SCHEMA_VERSION);
+        cJSON_AddNumberToObject(item, "cursor", message->cursor);
+        cJSON_AddBoolToObject(item, "read", message->read);
+        cJSON_AddStringToObject(item, "title", message->title);
+        cJSON_AddStringToObject(item, "summary", message->summary);
+        cJSON_AddStringToObject(item, "spoken_text", message->spoken_text);
+        cJSON_AddStringToObject(item, "audio_id", message->audio_id);
+        cJSON_AddStringToObject(item, "audio_sha256", message->audio_sha256);
+        cJSON_AddNumberToObject(item, "audio_size", (double)message->audio_size);
+        char *line = cJSON_PrintUnformatted(item);
         cJSON_Delete(item);
-        if (!ok) break;
+        if (!line || fprintf(file, "%s\n", line) < 0) {
+            cJSON_free(line);
+            fclose(file);
+            unlink(MESSAGE_INDEX_TMP);
+            return ESP_FAIL;
+        }
+        cJSON_free(line);
     }
-    if (source) fclose(source);
-    if (fclose(target) != 0) ok = false;
-    /* FATFS rename does not replace an existing destination. Commit only
-     * after the temporary file has been completely written and closed. */
-    if (ok && unlink(MESSAGE_INDEX_PATH) != 0 && errno != ENOENT) ok = false;
-    if (!ok || rename(MESSAGE_INDEX_TMP, MESSAGE_INDEX_PATH) != 0) {
+    if (fclose(file) != 0) {
         unlink(MESSAGE_INDEX_TMP);
         return ESP_FAIL;
     }
-    return ESP_OK;
-}
-
-static esp_err_t append_message_record(const stored_message_t *message)
-{
-    FILE *file = fopen(MESSAGE_INDEX_PATH, "ab");
-    if (!file) return ESP_FAIL;
-    bool ok = write_message_json(file, message) && fclose(file) == 0;
-    if (!ok) return ESP_FAIL;
-    message_refs_insert(message->cursor, message->read);
+    if (unlink(MESSAGE_INDEX_PATH) != 0 && errno != ENOENT) {
+        unlink(MESSAGE_INDEX_TMP);
+        return ESP_FAIL;
+    }
+    if (rename(MESSAGE_INDEX_TMP, MESSAGE_INDEX_PATH) != 0) {
+        unlink(MESSAGE_INDEX_TMP);
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -416,27 +314,23 @@ static void audio_path(const char *audio_id, char *path, size_t path_size)
 static void remove_message_at(size_t index)
 {
     if (index >= s_message_count) return;
-    stored_message_t message;
-    if (load_message_record(s_message_refs[index].cursor, &message)) {
-        char path[160];
-        audio_path(message.audio_id, path, sizeof(path));
-        unlink(path);
-    }
+    char path[160];
+    audio_path(s_messages[index].audio_id, path, sizeof(path));
+    unlink(path);
     if (index + 1 < s_message_count) {
-        memmove(&s_message_refs[index], &s_message_refs[index + 1],
-                (s_message_count - index - 1) * sizeof(s_message_refs[0]));
+        memmove(&s_messages[index], &s_messages[index + 1],
+                (s_message_count - index - 1) * sizeof(s_messages[0]));
     }
     s_message_count--;
-    s_oldest_cursor = s_message_count ? s_message_refs[s_message_count - 1].cursor : 0;
 }
 
 static void prune_messages(void)
 {
     while (s_message_count >= MESSAGE_MAX_COUNT) {
-        size_t remove_index = s_message_count - 1;
-        for (size_t index = s_message_count; index > 0; index--) {
-            if (s_message_refs[index - 1].read) {
-                remove_index = index - 1;
+        size_t remove_index = 0;
+        for (size_t index = 0; index < s_message_count; index++) {
+            if (s_messages[index].read) {
+                remove_index = index;
                 break;
             }
         }
@@ -649,7 +543,7 @@ static esp_err_t install_cached_font(const char *path, const char *sha_text,
     return ESP_OK;
 }
 
-static esp_err_t parse_message_audio_metadata(cJSON *item, stored_message_t *message)
+static esp_err_t download_message_audio(cJSON *item, stored_message_t *message)
 {
     char url[192] = {0};
     copy_json_string(item, "audio_url", url, sizeof(url));
@@ -667,19 +561,6 @@ static esp_err_t parse_message_audio_metadata(cJSON *item, stored_message_t *mes
         message->audio_size == 0 || message->audio_size > MESSAGE_MAX_RESOURCE_BYTES) {
         return ESP_ERR_INVALID_RESPONSE;
     }
-    return ESP_OK;
-}
-
-static esp_err_t download_message_audio(const stored_message_t *message)
-{
-    ESP_RETURN_ON_FALSE(message && message->audio_id[0] &&
-                            strlen(message->audio_sha256) == 64 &&
-                            message->audio_size > 0 &&
-                            message->audio_size <= MESSAGE_MAX_RESOURCE_BYTES,
-                        ESP_ERR_INVALID_ARG, TAG, "invalid message audio metadata");
-    char url[160];
-    snprintf(url, sizeof(url), "%s%s", MESSAGE_AUDIO_PATH_PREFIX,
-             message->audio_id);
     char destination[160];
     audio_path(message->audio_id, destination, sizeof(destination));
     if (file_sha256_matches(destination, message->audio_sha256,
@@ -744,101 +625,143 @@ static esp_err_t play_wav_file(const char *path)
     return err == ESP_OK ? end_err : err;
 }
 
-static bool sync_interrupted(void)
-{
-    return atomic_load(&s_sync_paused) ||
-           (s_config.audio_busy && s_config.audio_busy());
-}
-
-static void sync_once_inner(void)
+static void sync_once(void)
 {
     if (!s_config.request || !s_config.download ||
-        !atomic_load(&s_storage_ready) || sync_interrupted()) return;
-    const bool loading_older = atomic_exchange(&s_sync_load_older, false);
-    const bool initial_load = !loading_older && s_message_count < 20;
-    if (loading_older && (s_oldest_cursor == 0 || !s_history_has_more)) return;
+        !atomic_load(&s_storage_ready) || atomic_load(&s_active)) return;
+    if (s_config.audio_busy && s_config.audio_busy()) return;
     bool received_new = false;
-    char path[112];
-    if (loading_older) {
-        snprintf(path, sizeof(path), "/device/messages/sync?before=%lu&limit=%u",
-                 (unsigned long)s_oldest_cursor, MESSAGE_SYNC_BATCH_SIZE);
-    } else {
-        snprintf(path, sizeof(path), "/device/messages/sync?after=%lu&limit=%u%s",
-                 (unsigned long)(initial_load ? 0 : s_cursor),
-                 MESSAGE_SYNC_BATCH_SIZE,
-                 initial_load ? "&bootstrap=3" : "");
-    }
-    char *response = malloc(MESSAGE_SYNC_RESPONSE_BYTES);
-    if (!response) return;
-    esp_err_t request_err = s_config.request("GET", path, NULL, response,
-                                             MESSAGE_SYNC_RESPONSE_BYTES);
-    if (request_err != ESP_OK) {
-        ESP_LOGW(TAG, "message sync failed: %s", esp_err_to_name(request_err));
+    for (int page = 0; page < MESSAGE_MAX_COUNT; page++) {
+        if (atomic_load(&s_active)) return;
+        char path[96];
+        snprintf(path, sizeof(path),
+                 "/device/messages/sync?after=%lu&limit=1%s",
+                 (unsigned long)s_cursor,
+                 s_cursor == 0 ? "&bootstrap=4" : "");
+        char *response = malloc(MESSAGE_SYNC_RESPONSE_BYTES);
+        if (!response) {
+            ESP_LOGW(TAG, "sync response allocation failed heap_largest=%u",
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            return;
+        }
+        esp_err_t request_err = s_config.request("GET", path, NULL, response,
+                                                 MESSAGE_SYNC_RESPONSE_BYTES);
+        if (request_err != ESP_OK) {
+            ESP_LOGW(TAG, "sync request failed: %s stack_free=%u",
+                     esp_err_to_name(request_err),
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            free(response);
+            return;
+        }
+        cJSON *root = cJSON_Parse(response);
         free(response);
-        return;
-    }
-    cJSON *root = cJSON_Parse(response);
-    free(response);
-    if (!root || sync_interrupted()) {
-        cJSON_Delete(root);
-        return;
-    }
-    cJSON *resources = cJSON_GetObjectItemCaseSensitive(root, "resources");
-    if (cJSON_IsObject(resources) && !loading_older) {
-        if (!s_system_resources_ready) {
-            s_system_resources_ready = ensure_resource(
-                cJSON_GetObjectItemCaseSensitive(resources, "notification"),
-                MESSAGE_NOTIFY_PATH) == ESP_OK;
+        if (!root) return;
+        if (atomic_load(&s_active)) {
+            cJSON_Delete(root);
+            return;
         }
-        if (!s_font_resource_ready && !sync_interrupted()) {
-            cJSON *font = cJSON_GetObjectItemCaseSensitive(resources, "font");
-            char font_sha[65] = {0};
-            copy_json_string(font, "sha256", font_sha, sizeof(font_sha));
-            cJSON *font_size = cJSON_GetObjectItemCaseSensitive(font, "size");
-            esp_err_t font_err = ensure_resource(font, MESSAGE_FONT_PATH);
-            if (font_err == ESP_OK) {
-                font_err = install_cached_font(MESSAGE_FONT_PATH, font_sha,
-                    cJSON_IsNumber(font_size) ? (size_t)font_size->valuedouble : 0);
+        cJSON *resources = cJSON_GetObjectItemCaseSensitive(root, "resources");
+        if (cJSON_IsObject(resources)) {
+            if (!s_system_resources_ready) {
+                esp_err_t notification_err = ensure_resource(
+                    cJSON_GetObjectItemCaseSensitive(resources, "notification"),
+                    MESSAGE_NOTIFY_PATH);
+                s_system_resources_ready = notification_err == ESP_OK;
+                if (!s_system_resources_ready) {
+                    ESP_LOGW(TAG,
+                             "notification resource unavailable result=%s",
+                             esp_err_to_name(notification_err));
+                }
             }
-            s_font_resource_ready = font_err == ESP_OK;
+            if (!s_font_resource_ready &&
+                (!s_config.audio_busy || !s_config.audio_busy())) {
+                cJSON *font = cJSON_GetObjectItemCaseSensitive(resources,
+                                                               "font");
+                char font_sha[65] = {0};
+                copy_json_string(font, "sha256", font_sha,
+                                 sizeof(font_sha));
+                cJSON *font_size_value = cJSON_GetObjectItemCaseSensitive(
+                    font, "size");
+                size_t font_size = cJSON_IsNumber(font_size_value)
+                                       ? (size_t)font_size_value->valuedouble
+                                       : 0;
+                esp_err_t font_err = ensure_resource(font, MESSAGE_FONT_PATH);
+                if (font_err == ESP_OK) {
+                    font_err = install_cached_font(MESSAGE_FONT_PATH, font_sha,
+                                                   font_size);
+                }
+                s_font_resource_ready = font_err == ESP_OK;
+                if (!s_font_resource_ready) {
+                    ESP_LOGW(TAG, "font resource unavailable result=%s",
+                             esp_err_to_name(font_err));
+                } else {
+                    s_rendered_count = SIZE_MAX;
+                    s_rendered_cursor = UINT32_MAX;
+                }
+            }
         }
+        cJSON *items = cJSON_GetObjectItemCaseSensitive(root, "messages");
+        size_t received = 0;
+        bool page_failed = false;
+        bool index_dirty = false;
+        uint32_t stored_cursor = 0;
+        cJSON *item;
+        cJSON_ArrayForEach(item, items) {
+            cJSON *cursor_value = cJSON_GetObjectItemCaseSensitive(item, "cursor");
+            uint32_t cursor = cJSON_IsNumber(cursor_value)
+                                  ? (uint32_t)cursor_value->valuedouble
+                                  : 0;
+            if (cursor <= s_cursor) continue;
+            stored_message_t message = {.cursor = cursor, .read = false};
+            copy_json_string(item, "title", message.title, sizeof(message.title));
+            copy_json_string(item, "summary", message.summary, sizeof(message.summary));
+            copy_json_string(item, "spoken_text", message.spoken_text,
+                             sizeof(message.spoken_text));
+            if (!message.spoken_text[0]) {
+                strlcpy(message.spoken_text, message.summary,
+                        sizeof(message.spoken_text));
+            }
+            esp_err_t audio_err = download_message_audio(item, &message);
+            if (audio_err != ESP_OK) {
+                ESP_LOGW(TAG, "message audio unavailable cursor=%lu result=%s",
+                         (unsigned long)cursor, esp_err_to_name(audio_err));
+                page_failed = true;
+                break;
+            }
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            prune_messages();
+            s_messages[s_message_count++] = message;
+            s_cursor = cursor;
+            xSemaphoreGive(s_lock);
+            stored_cursor = cursor;
+            index_dirty = true;
+            received++;
+            received_new = true;
+        }
+        cJSON_Delete(root);
+        if (index_dirty) {
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            esp_err_t save_err = save_index();
+            if (save_err != ESP_OK) {
+                s_message_count = 0;
+                s_cursor = 0;
+                load_index();
+            }
+            size_t stored_count = s_message_count;
+            xSemaphoreGive(s_lock);
+            if (save_err != ESP_OK) {
+                ESP_LOGW(TAG, "message index save failed cursor=%lu result=%s",
+                         (unsigned long)stored_cursor, esp_err_to_name(save_err));
+                page_failed = true;
+            } else {
+                ESP_LOGI(TAG, "message stored cursor=%lu count=%u",
+                         (unsigned long)stored_cursor, (unsigned)stored_count);
+            }
+        }
+        if (page_failed) break;
+        if (received == 0) break;
     }
-    bool index_dirty = false;
-    cJSON *items = cJSON_GetObjectItemCaseSensitive(root, "messages");
-    cJSON *item;
-    cJSON_ArrayForEach(item, items) {
-        if (sync_interrupted()) break;
-        stored_message_t message = {.read = false};
-        cJSON *cursor = cJSON_GetObjectItemCaseSensitive(item, "cursor");
-        if (!cJSON_IsNumber(cursor) || cursor->valuedouble <= 0) continue;
-        message.cursor = (uint32_t)cursor->valuedouble;
-        if (message_ref_index(message.cursor) >= 0) continue;
-        copy_json_string(item, "title", message.title, sizeof(message.title));
-        copy_json_string(item, "summary", message.summary, sizeof(message.summary));
-        copy_json_string(item, "spoken_text", message.spoken_text, sizeof(message.spoken_text));
-        if (!message.spoken_text[0]) strlcpy(message.spoken_text, message.summary,
-                                             sizeof(message.spoken_text));
-        if (parse_message_audio_metadata(item, &message) != ESP_OK) continue;
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        prune_messages();
-        esp_err_t store_err = append_message_record(&message);
-        xSemaphoreGive(s_lock);
-        if (store_err != ESP_OK) break;
-        index_dirty = true;
-        received_new |= !loading_older;
-    }
-    cJSON *has_more = cJSON_GetObjectItemCaseSensitive(root, "has_more");
-    if (loading_older || initial_load) s_history_has_more = cJSON_IsTrue(has_more);
-    cJSON_Delete(root);
-    if (index_dirty) {
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        esp_err_t save_err = save_index();
-        s_loaded_page_start = SIZE_MAX;
-        xSemaphoreGive(s_lock);
-        if (save_err != ESP_OK) ESP_LOGW(TAG, "message index save failed: %s",
-                                         esp_err_to_name(save_err));
-    }
-    if (s_cursor > 0 && !sync_interrupted() && !loading_older) {
+    if (s_cursor > 0) {
         char body[48];
         snprintf(body, sizeof(body), "{\"cursor\":%lu}",
                  (unsigned long)s_cursor);
@@ -854,17 +777,6 @@ static void sync_once_inner(void)
         (!s_config.audio_busy || !s_config.audio_busy())) {
         (void)play_wav_file(MESSAGE_NOTIFY_PATH);
     }
-}
-
-static void sync_once(void)
-{
-    if (atomic_load(&s_sync_paused)) return;
-    bool expected = false;
-    if (!atomic_compare_exchange_strong(&s_sync_in_progress, &expected, true)) {
-        return;
-    }
-    if (!atomic_load(&s_sync_paused)) sync_once_inner();
-    atomic_store(&s_sync_in_progress, false);
 }
 
 static void sync_task(void *argument)
@@ -914,7 +826,7 @@ static void sync_task(void *argument)
     load_index();
     size_t unread_count = 0;
     for (size_t index = 0; index < s_message_count; index++) {
-        if (!s_message_refs[index].read) unread_count++;
+        if (!s_messages[index].read) unread_count++;
     }
     atomic_store(&s_storage_ready, true);
     xSemaphoreGive(s_lock);
@@ -926,16 +838,19 @@ static void sync_task(void *argument)
              (unsigned)uxTaskGetStackHighWaterMark(NULL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     if (s_message_count > 0) (void)enqueue_action(MESSAGE_ACTION_PREPARE);
-    BaseType_t sync_result = xTaskCreatePinnedToCore(
-        message_sync_task, "card_msg_sync", MESSAGE_TASK_STACK_BYTES,
-        NULL, 1, &s_sync_task_handle, 0);
-    if (sync_result != pdPASS) {
-        ESP_LOGW(TAG, "message sync task create failed");
-    }
+    int64_t next_sync_ms = message_now_ms() + 15000;
     while (true) {
+        int64_t now_ms = message_now_ms();
+        int64_t wait_ms = next_sync_ms > now_ms ? next_sync_ms - now_ms : 0;
         message_action_t action;
-        if (xQueueReceive(s_action_queue, &action, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(s_action_queue, &action,
+                          pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
             handle_action(action);
+        }
+        now_ms = message_now_ms();
+        if (now_ms >= next_sync_ms) {
+            if (!atomic_load(&s_active)) sync_once();
+            next_sync_ms = message_now_ms() + MESSAGE_SYNC_INTERVAL_MS;
         }
     }
 }
@@ -1054,24 +969,6 @@ static void scroll_detail_manually(int delta)
     display_unlock();
 }
 
-static bool load_visible_page(size_t page_start)
-{
-    if (page_start == s_loaded_page_start) return true;
-    memset(s_messages, 0, sizeof(s_messages));
-    for (size_t slot = 0; slot < MESSAGE_PAGE_SIZE; slot++) {
-        size_t index = page_start + slot;
-        if (index >= s_message_count) break;
-        if (!load_message_record(s_message_refs[index].cursor, &s_messages[slot])) {
-            ESP_LOGW(TAG, "message record missing cursor=%lu",
-                     (unsigned long)s_message_refs[index].cursor);
-            return false;
-        }
-        s_messages[slot].read = s_message_refs[index].read;
-    }
-    s_loaded_page_start = page_start;
-    return true;
-}
-
 static void render_messages(void)
 {
     if (!s_layer) return;
@@ -1085,7 +982,6 @@ static void render_messages(void)
                                          ? count - page_start
                                          : MESSAGE_PAGE_SIZE)
                                   : 0;
-    (void)load_visible_page(page_start);
     char header[48];
     if (s_chinese_font) {
         snprintf(header, sizeof(header), "消息 %u  %u/%u",
@@ -1110,7 +1006,7 @@ static void render_messages(void)
         }
         lv_obj_clear_flag(s_tiles[tile], LV_OBJ_FLAG_HIDDEN);
         size_t index = page_start + tile;
-        const stored_message_t *message = &s_messages[tile];
+        const stored_message_t *message = &s_messages[index];
         char title[40];
         size_t title_len = strlen(message->title);
         bool title_truncated = title_len > 30;
@@ -1161,7 +1057,7 @@ static void blink_timer(lv_timer_t *timer)
     size_t page_start = (s_selected / MESSAGE_PAGE_SIZE) * MESSAGE_PAGE_SIZE;
     for (size_t tile = 0; tile < MESSAGE_PAGE_SIZE; tile++) {
         size_t index = page_start + tile;
-        if (index < s_message_count && !s_message_refs[index].read) {
+        if (index < s_message_count && !s_messages[index].read) {
             lv_obj_set_style_opa(s_unread_dots[tile],
                                  s_blink_on ? LV_OPA_COVER : LV_OPA_20, 0);
         }
@@ -1184,7 +1080,7 @@ static void open_messages(void)
     }
     ensure_message_layer();
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_message_count > 0) s_selected = 0;
+    if (s_message_count > 0) s_selected = s_message_count - 1;
     const size_t count = s_message_count;
     const size_t selected = s_selected;
     const uint32_t cursor = s_cursor;
@@ -1202,7 +1098,7 @@ static void open_messages(void)
 static void prepare_messages(void)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_message_count > 0) s_selected = 0;
+    if (s_message_count > 0) s_selected = s_message_count - 1;
     xSemaphoreGive(s_lock);
     s_rendered_count = SIZE_MAX;
     s_rendered_cursor = UINT32_MAX;
@@ -1243,25 +1139,6 @@ static void close_messages(void)
     if (s_config.restore_home) s_config.restore_home();
 }
 
-static void mark_message_read(uint32_t cursor)
-{
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    int ref_index = message_ref_index(cursor);
-    if (ref_index >= 0 && !s_message_refs[ref_index].read) {
-        s_message_refs[ref_index].read = true;
-        if (save_index() != ESP_OK) {
-            s_message_refs[ref_index].read = false;
-            ESP_LOGW(TAG, "message read state save failed cursor=%lu",
-                     (unsigned long)cursor);
-        } else {
-            s_loaded_page_start = SIZE_MAX;
-            ESP_LOGI(TAG, "message marked read cursor=%lu",
-                     (unsigned long)cursor);
-        }
-    }
-    xSemaphoreGive(s_lock);
-}
-
 static void play_selected(void)
 {
     if (s_config.audio_busy && s_config.audio_busy()) {
@@ -1273,46 +1150,43 @@ static void play_selected(void)
         xSemaphoreGive(s_lock);
         return;
     }
-    stored_message_t message;
+    char path[160];
     char spoken_text[sizeof(s_messages[0].spoken_text)];
-    uint32_t cursor = s_message_refs[s_selected].cursor;
-    if (!load_message_record(cursor, &message)) {
-        xSemaphoreGive(s_lock);
-        return;
-    }
-    strlcpy(spoken_text, message.spoken_text,
+    uint32_t cursor = s_messages[s_selected].cursor;
+    audio_path(s_messages[s_selected].audio_id, path, sizeof(path));
+    strlcpy(spoken_text, s_messages[s_selected].spoken_text,
             sizeof(spoken_text));
     if (!spoken_text[0]) {
-        strlcpy(spoken_text, message.summary,
+        strlcpy(spoken_text, s_messages[s_selected].summary,
                 sizeof(spoken_text));
     }
     xSemaphoreGive(s_lock);
-    /* Text is already on SD: present it immediately instead of making the
-     * user wait for the optional audio file to cross Wi-Fi. */
     atomic_store(&s_play_cancel, false);
     display_lock();
     show_detail_view(spoken_text);
     display_unlock();
-    /* Opening the full message is the read action. Do not keep it unread if
-     * its optional audio download or playback later fails. */
-    mark_message_read(cursor);
-    esp_err_t download_err = download_message_audio(&message);
-    if (download_err != ESP_OK) {
-        ESP_LOGW(TAG, "message audio download failed cursor=%lu result=%s",
-                 (unsigned long)cursor, esp_err_to_name(download_err));
-        display_lock();
-        hide_detail_view();
-        display_unlock();
-        atomic_store(&s_play_cancel, false);
-        return;
-    }
-    char path[160];
-    audio_path(message.audio_id, path, sizeof(path));
     ESP_LOGI(TAG, "message playback start cursor=%lu",
              (unsigned long)cursor);
     esp_err_t err = play_wav_file(path);
+    bool cancelled = atomic_load(&s_play_cancel);
     ESP_LOGI(TAG, "message playback cursor=%lu result=%s",
              (unsigned long)cursor, esp_err_to_name(err));
+    if (err == ESP_OK && !cancelled) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        esp_err_t save_err = ESP_ERR_NOT_FOUND;
+        if (s_selected < s_message_count &&
+            s_messages[s_selected].cursor == cursor) {
+            bool was_read = s_messages[s_selected].read;
+            s_messages[s_selected].read = true;
+            save_err = save_index();
+            if (save_err != ESP_OK) s_messages[s_selected].read = was_read;
+        }
+        xSemaphoreGive(s_lock);
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "message read state save failed cursor=%lu result=%s",
+                     (unsigned long)cursor, esp_err_to_name(save_err));
+        }
+    }
     display_lock();
     hide_detail_view();
     display_unlock();
@@ -1324,25 +1198,20 @@ static void move_selection(message_action_t action)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     size_t old_selected = s_selected;
     uint32_t old_cursor = s_selected < s_message_count
-                              ? s_message_refs[s_selected].cursor
+                              ? s_messages[s_selected].cursor
                               : 0;
-    bool load_older = false;
     if (s_message_count > 0) {
         if (action == MESSAGE_ACTION_LEFT && s_selected > 0) s_selected--;
         if (action == MESSAGE_ACTION_RIGHT && s_selected + 1 < s_message_count) {
             s_selected++;
-        } else if (action == MESSAGE_ACTION_RIGHT) {
-            load_older = s_history_has_more;
         }
         if (action == MESSAGE_ACTION_UP && s_selected >= 2) s_selected -= 2;
         if (action == MESSAGE_ACTION_DOWN && s_selected + 2 < s_message_count) {
             s_selected += 2;
-        } else if (action == MESSAGE_ACTION_DOWN) {
-            load_older = s_history_has_more;
         }
     }
     uint32_t new_cursor = s_selected < s_message_count
-                              ? s_message_refs[s_selected].cursor
+                              ? s_messages[s_selected].cursor
                               : 0;
     size_t page = s_selected / MESSAGE_PAGE_SIZE + 1;
     size_t new_selected = s_selected;
@@ -1372,12 +1241,6 @@ static void move_selection(message_action_t action)
              (int)action, (unsigned long)old_cursor, (unsigned long)new_cursor,
              (unsigned)page,
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    if (load_older && s_sync_task_handle) {
-        atomic_store(&s_sync_load_older, true);
-        xTaskNotifyGive(s_sync_task_handle);
-        ESP_LOGI(TAG, "message history load requested before=%lu",
-                 (unsigned long)s_oldest_cursor);
-    }
 }
 
 static void handle_action(message_action_t action)
@@ -1413,11 +1276,6 @@ static void handle_action(message_action_t action)
         play_selected();
         atomic_store(&s_play_queued, false);
         break;
-    case MESSAGE_ACTION_RELEASE:
-        close_messages();
-        atomic_store(&s_play_cancel, false);
-        if (s_release_done) xSemaphoreGive(s_release_done);
-        break;
     }
 }
 
@@ -1433,38 +1291,24 @@ esp_err_t vibe_cardputer_messages_init(
                                   sizeof(message_action_t));
     ESP_RETURN_ON_FALSE(s_action_queue, ESP_ERR_NO_MEM, TAG,
                         "message action queue");
-    s_release_done = xSemaphoreCreateBinary();
-    ESP_RETURN_ON_FALSE(s_release_done, ESP_ERR_NO_MEM, TAG,
-                        "message release semaphore");
     atomic_store(&s_storage_ready, false);
     atomic_store(&s_active, false);
     atomic_store(&s_play_queued, false);
-    atomic_store(&s_sync_paused, false);
-    atomic_store(&s_sync_in_progress, false);
-    atomic_store(&s_sync_load_older, false);
     return ESP_OK;
 }
 
 esp_err_t vibe_cardputer_messages_start(void)
 {
     BaseType_t sync_result = xTaskCreatePinnedToCore(
-        sync_task, "card_messages", MESSAGE_TASK_STACK_BYTES,
-        NULL, 2, NULL, 0);
+        sync_task, "card_messages", MESSAGE_TASK_STACK_BYTES, NULL, 2, NULL, 0);
     return sync_result == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
 {
     if (!event) return false;
-    const bool entering_messages = !atomic_load(&s_active) && event->pressed &&
-        event->fn && event->row == 3 && event->column == 8;
-    if (event->pressed && (atomic_load(&s_active) || entering_messages) &&
-        s_config.activity) {
-        /* A message-page key is also the wake gesture after automatic display
-         * off. Wake before queuing the action so the first key is not lost. */
-        s_config.activity();
-    }
-    if (entering_messages) {
+    if (!atomic_load(&s_active) && event->pressed && event->fn && event->row == 3 &&
+        event->column == 8) {
         bool storage_ready = atomic_load(&s_storage_ready);
         ESP_LOGI(TAG, "Fn+N shortcut storage_ready=%d",
                  storage_ready ? 1 : 0);
@@ -1472,10 +1316,6 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
         atomic_store(&s_active, true);
         if (!enqueue_action(MESSAGE_ACTION_OPEN)) {
             atomic_store(&s_active, false);
-        } else if (s_sync_task_handle) {
-            /* Refresh only after the user deliberately enters the message
-             * center. This prevents all message HTTP traffic on the home UI. */
-            xTaskNotifyGive(s_sync_task_handle);
         }
         return true;
     }
@@ -1534,43 +1374,10 @@ bool vibe_cardputer_messages_storage_ready(void)
     return atomic_load(&s_storage_ready);
 }
 
-bool vibe_cardputer_messages_pause_sync(uint32_t timeout_ms)
-{
-    atomic_store(&s_sync_paused, true);
-    const int64_t deadline_ms = message_now_ms() + timeout_ms;
-    while (atomic_load(&s_sync_in_progress)) {
-        if (message_now_ms() >= deadline_ms) {
-            /* The in-flight request has a short timeout and will observe the
-             * pause before doing more work. Recording must never be rejected
-             * merely because an old sync request is winding down. */
-            ESP_LOGW(TAG, "message sync yielding to recording");
-            return true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    ESP_LOGI(TAG, "message sync paused for recording");
-    return true;
-}
-
-void vibe_cardputer_messages_resume_sync(void)
-{
-    atomic_store(&s_sync_paused, false);
-    ESP_LOGI(TAG, "message sync resumed");
-}
-
 void vibe_cardputer_messages_release_display_resources(void)
 {
-    if (!atomic_load(&s_active) && !s_layer && !s_chinese_font) return;
-    atomic_store(&s_play_cancel, true);
-    atomic_store(&s_active, false);
-    while (xSemaphoreTake(s_release_done, 0) == pdTRUE) {}
-    const message_action_t action = MESSAGE_ACTION_RELEASE;
-    if (xQueueSend(s_action_queue, &action, pdMS_TO_TICKS(250)) != pdTRUE) {
-        ESP_LOGE(TAG, "message release action queue full");
-        return;
-    }
-    if (xSemaphoreTake(s_release_done, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        ESP_LOGE(TAG, "message release timed out");
+    if (atomic_load(&s_active) || s_layer || s_chinese_font) {
+        close_messages();
     }
 }
 
@@ -1590,12 +1397,6 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
 }
 bool vibe_cardputer_messages_active(void) { return false; }
 bool vibe_cardputer_messages_storage_ready(void) { return false; }
-bool vibe_cardputer_messages_pause_sync(uint32_t timeout_ms)
-{
-    (void)timeout_ms;
-    return true;
-}
-void vibe_cardputer_messages_resume_sync(void) {}
 void vibe_cardputer_messages_release_display_resources(void) {}
 
 #endif
