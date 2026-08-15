@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "vibe_minijoy_bt_policy.h"
 
 #define HID_REPORT_ID_KEYBOARD 1
 #define HID_REPORT_ID_MOUSE 2
@@ -32,6 +33,7 @@
 #define RECONNECT_INITIAL_DELAY_MS 5000
 #define RECONNECT_ATTEMPT_TIMEOUT_MS 8000
 #define RECONNECT_BACKOFF_MAX_MS 30000
+#define CLASSIC_LINK_POLICY_SNIFF 0x0004
 
 /* Bluedroid does not expose Classic link-policy control through esp_gap_bt. */
 typedef uint8_t vibe_btm_status_t;
@@ -40,7 +42,6 @@ extern vibe_btm_status_t BTM_SetLinkPolicy(uint8_t *remote_bda,
 extern void BTM_SetDefaultLinkPolicy(uint16_t settings);
 
 static const char *TAG = "vibe_bt_composite";
-static const char *DEVICE_NAME = "VibeStick MiniJoy";
 
 static esp_hidd_dev_t *s_hid;
 static vibe_bt_composite_state_t s_state;
@@ -51,6 +52,7 @@ static void *s_pcm_context;
 static TaskHandle_t s_audio_pump_task;
 static TaskHandle_t s_reconnect_task;
 static char s_serial[20];
+static char s_device_name[20];
 static esp_bd_addr_t s_reconnect_address;
 static portMUX_TYPE s_reconnect_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_reconnect_target_valid;
@@ -64,6 +66,7 @@ static int64_t s_hfp_retry_at_ms;
 static int64_t s_last_reconnect_request_ms;
 static uint32_t s_hid_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
 static uint32_t s_hfp_retry_delay_ms = RECONNECT_INITIAL_DELAY_MS;
+static bool s_sniff_allowed;
 
 static vibe_bt_composite_state_t state_snapshot(void)
 {
@@ -168,7 +171,7 @@ static esp_hid_device_config_t s_hid_config = {
     .vendor_id = 0x16c0,
     .product_id = 0x05df,
     .version = 0x0200,
-    .device_name = "VibeStick MiniJoy",
+    .device_name = s_device_name,
     .manufacturer_name = "VibeStick",
     .serial_number = s_serial,
     .report_maps = s_report_maps,
@@ -183,12 +186,14 @@ static void notify_state(void)
     }
 }
 
-static void disable_sniff_policy(const esp_bd_addr_t address)
+static void apply_sniff_policy(const esp_bd_addr_t address)
 {
-    uint16_t active_only = 0;
+    uint16_t policy =
+        s_sniff_allowed ? CLASSIC_LINK_POLICY_SNIFF : 0;
     vibe_btm_status_t status =
-        BTM_SetLinkPolicy((uint8_t *)address, &active_only);
-    ESP_LOGI(TAG, "Classic link policy active-only status=%u", status);
+        BTM_SetLinkPolicy((uint8_t *)address, &policy);
+    ESP_LOGI(TAG, "Classic link policy sniff_allowed=%d status=%u",
+             s_sniff_allowed, status);
 }
 
 static void set_scan_mode(bool pairing)
@@ -338,6 +343,7 @@ static void hfp_callback(esp_hf_client_cb_event_t event,
             if (!s_reconnect_suspended) {
                 schedule_hfp_retry(now_ms(), true);
             }
+            s_state.audio_connecting = false;
             s_state.audio_connected = false;
             s_state.wideband = false;
         }
@@ -345,23 +351,27 @@ static void hfp_callback(esp_hf_client_cb_event_t event,
         ESP_LOGI(TAG, "HFP state=%d connected=%d",
                  param->conn_stat.state, hfp_connected);
         if (hfp_connected) {
-            disable_sniff_policy(param->conn_stat.remote_bda);
+            apply_sniff_policy(param->conn_stat.remote_bda);
         }
         notify_state();
         break;
     }
     case ESP_HF_CLIENT_AUDIO_STATE_EVT: {
+        bool audio_connecting =
+            param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTING;
         bool audio_connected =
             param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED ||
             param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC;
         bool wideband =
             param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC;
         portENTER_CRITICAL(&s_reconnect_lock);
+        s_state.audio_connecting = audio_connecting;
         s_state.audio_connected = audio_connected;
         s_state.wideband = wideband;
         portEXIT_CRITICAL(&s_reconnect_lock);
-        ESP_LOGI(TAG, "HFP audio connected=%d codec=%s frame=%u",
-                 audio_connected, wideband ? "mSBC" : "CVSD",
+        ESP_LOGI(TAG, "HFP audio connecting=%d connected=%d codec=%s frame=%u",
+                 audio_connecting, audio_connected,
+                 wideband ? "mSBC" : "CVSD",
                  param->audio_stat.preferred_frame_size);
         notify_state();
         break;
@@ -493,6 +503,10 @@ esp_err_t vibe_bt_composite_init(vibe_bt_state_callback_t state_callback,
 
     uint8_t mac[6] = {0};
     ESP_RETURN_ON_ERROR(esp_read_mac(mac, ESP_MAC_BT), TAG, "read BT mac");
+    ESP_RETURN_ON_FALSE(
+        vibe_minijoy_bt_format_device_name(mac, s_device_name,
+                                            sizeof(s_device_name)),
+        ESP_ERR_INVALID_SIZE, TAG, "format device name");
     snprintf(s_serial, sizeof(s_serial), "%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
@@ -508,7 +522,7 @@ esp_err_t vibe_bt_composite_init(vibe_bt_state_callback_t state_callback,
 
     ESP_RETURN_ON_ERROR(esp_bt_gap_register_callback(gap_callback), TAG,
                         "GAP callback");
-    ESP_RETURN_ON_ERROR(esp_bt_gap_set_device_name(DEVICE_NAME), TAG,
+    ESP_RETURN_ON_ERROR(esp_bt_gap_set_device_name(s_device_name), TAG,
                         "device name");
     esp_bt_io_cap_t io_capability = ESP_BT_IO_CAP_NONE;
     ESP_RETURN_ON_ERROR(esp_bt_gap_set_security_param(
@@ -559,7 +573,7 @@ esp_err_t vibe_bt_composite_init(vibe_bt_state_callback_t state_callback,
 
     vibe_bt_composite_state_t initial_state = state_snapshot();
     ESP_LOGI(TAG, "ready name=%s serial=%s paired=%d free_heap=%" PRIu32,
-             DEVICE_NAME, s_serial, initial_state.paired,
+             s_device_name, s_serial, initial_state.paired,
              esp_get_free_heap_size());
     notify_state();
     return ESP_OK;
@@ -667,7 +681,8 @@ esp_err_t vibe_bt_composite_keepalive(void)
     portEXIT_CRITICAL(&s_reconnect_lock);
     ESP_RETURN_ON_FALSE(target_valid, ESP_ERR_NOT_FOUND, TAG,
                         "bonded host address unavailable");
-    disable_sniff_policy(address);
+    ESP_RETURN_ON_ERROR(vibe_bt_composite_set_sniff_allowed(false), TAG,
+                        "set active-only policy");
 
     /*
      * Keep the shared Classic ACL active without sending an HFP AT command.
@@ -680,6 +695,35 @@ esp_err_t vibe_bt_composite_keepalive(void)
     uint8_t report[8] = {0};
     return esp_hidd_dev_input_set(s_hid, 0, HID_REPORT_ID_KEYBOARD,
                                   report, sizeof(report));
+}
+
+esp_err_t vibe_bt_composite_set_sniff_allowed(bool allowed)
+{
+    if (s_sniff_allowed == allowed) {
+        return ESP_OK;
+    }
+    s_sniff_allowed = allowed;
+    uint16_t default_policy =
+        allowed ? CLASSIC_LINK_POLICY_SNIFF : 0;
+    BTM_SetDefaultLinkPolicy(default_policy);
+
+    vibe_bt_composite_state_t state = state_snapshot();
+    if (!state.hid_connected && !state.hfp_connected) {
+        ESP_LOGI(TAG, "Classic default link policy sniff_allowed=%d", allowed);
+        return ESP_OK;
+    }
+
+    esp_bd_addr_t address = {0};
+    portENTER_CRITICAL(&s_reconnect_lock);
+    bool target_valid = s_reconnect_target_valid;
+    if (target_valid) {
+        memcpy(address, s_reconnect_address, sizeof(address));
+    }
+    portEXIT_CRITICAL(&s_reconnect_lock);
+    ESP_RETURN_ON_FALSE(target_valid, ESP_ERR_NOT_FOUND, TAG,
+                        "bonded host address unavailable");
+    apply_sniff_policy(address);
+    return ESP_OK;
 }
 
 esp_err_t vibe_bt_composite_prepare_deep_sleep(uint32_t timeout_ms)

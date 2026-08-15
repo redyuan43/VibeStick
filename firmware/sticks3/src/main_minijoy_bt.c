@@ -11,9 +11,12 @@
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "driver/uart.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_pm.h"
+#include "esp_private/esp_clk.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -34,10 +37,13 @@
 #include "vibe_motion.h"
 #include "vibe_stick_config.h"
 
-#define APP_LOOP_MS 20
+#define ACTIVE_LOOP_MS 20
+#define STANDBY_LOOP_MS 100
+#define STANDBY_IDLE_MS 30000
 #define PAIRING_WINDOW_MS 120000
 #define SIDE_CLEAR_HOLD_MS 5000
 #define JOY_RETRY_MS 1000
+#define JOY_RETRY_MAX_MS 30000
 #define JOY_DEADZONE 82
 #define JOY_MAX_STEP 24
 #define PCM_STAGING_BYTES 2048
@@ -58,6 +64,7 @@
 #define OTA_TASK_STACK_BYTES 8192
 #define DEEP_SLEEP_IDLE_MS 600000
 #define DEEP_SLEEP_RETRY_MS 5000
+#define DEEP_SLEEP_BT_DISCONNECT_TIMEOUT_MS 12000
 #define WAKE_RELEASE_STABLE_MS 80
 #define IMU_READ_ERROR_LIMIT 5
 #define AIR_MOUSE_CALIBRATION_LOG_MS 1000
@@ -67,18 +74,27 @@
 #define PROFILE_ERROR_LED_ON_MS 120
 #define PTT_AUDIO_CONNECT_GRACE_MS 3000
 #define POWERED_BT_KEEPALIVE_MS 5000
+#define POWER_STATE_POLL_MS 1000
+#define WAKE_PTT_TIMEOUT_MS 15000
 #define FRONT_BUTTON_DEBOUNCE_MS 30
 #define M5CTL_UART_PORT UART_NUM_0
 #define M5CTL_LINE_BYTES 128
-#define M5CTL_RESPONSE_BYTES 512
+#define M5CTL_RESPONSE_BYTES 768
 #define M5CTL_UART_RX_BUFFER_BYTES 256
+#define M5CTL_TASK_STACK_BYTES 4096
 #define M5CTL_DEFAULT_PAIRING_SECONDS 180
 #define M5CTL_MIN_PAIRING_SECONDS 30
 #define M5CTL_MAX_PAIRING_SECONDS 300
+#define POWER_TEST_STANDBY_MS 5000
+#define POWER_TEST_BATTERY_DEEP_SLEEP_MS 120000
+#define POWER_TEST_DEEP_SLEEP_MS 20000
+#define POWER_TEST_TIMER_WAKE_US 2000000ULL
+#define POWER_TEST_WAKE_MAGIC 0x50575446U
 
 typedef enum {
     APP_EVENT_FRONT_DOWN,
     APP_EVENT_FRONT_UP,
+    APP_EVENT_HFP_AUDIO_CONNECTING,
     APP_EVENT_HFP_AUDIO_CONNECTED,
     APP_EVENT_HFP_AUDIO_DISCONNECTED,
     APP_EVENT_TOGGLE_AIR_MOUSE,
@@ -90,6 +106,7 @@ typedef enum {
     APP_EVENT_SERIAL_PTT_DOWN,
     APP_EVENT_SERIAL_PTT_UP,
     APP_EVENT_SERIAL_SLEEP,
+    APP_EVENT_SERIAL_TEST_POWER,
     APP_EVENT_SERIAL_REBOOT,
 } app_event_t;
 
@@ -103,6 +120,12 @@ typedef enum {
     CAPTURE_OWNER_DEVICE_PTT,
     CAPTURE_OWNER_HOST_HFP,
 } capture_owner_t;
+
+typedef enum {
+    POWER_TEST_NORMAL,
+    POWER_TEST_BATTERY,
+    POWER_TEST_BATTERY_FAST,
+} power_test_mode_t;
 
 static const char *TAG = "minijoy_bt";
 static QueueHandle_t s_event_queue;
@@ -119,6 +142,7 @@ static bool s_minijoy_ready;
 static bool s_minijoy_button_down;
 static bool s_joystick_motion_active;
 static int64_t s_minijoy_retry_ms;
+static uint32_t s_minijoy_retry_delay_ms = JOY_RETRY_MS;
 static int64_t s_pairing_deadline_ms;
 static int64_t s_startup_pairing_due_ms;
 static int64_t s_pairing_led_toggle_ms;
@@ -143,7 +167,6 @@ static int64_t s_confirm_deadline_ms;
 static int64_t s_last_activity_ms;
 static int64_t s_next_deep_sleep_attempt_ms;
 static int64_t s_next_bt_keepalive_ms;
-static bool s_usb_sleep_deferred_logged;
 static bool s_usb_status_error_logged;
 static int64_t s_wake_release_since_ms;
 static int64_t s_profile_connect_started_ms;
@@ -152,6 +175,128 @@ static bool s_front_button_candidate;
 static int64_t s_front_button_candidate_since_ms;
 static capture_owner_t s_capture_owner;
 static vibe_minijoy_ptt_audio_guard_t s_ptt_audio_guard;
+static vibe_minijoy_power_state_t s_power_state = VIBE_MINIJOY_POWER_ACTIVE;
+static esp_pm_lock_handle_t s_cpu_max_lock;
+static bool s_cpu_max_lock_held;
+static bool s_pending_wake_ptt;
+static int64_t s_pending_wake_ptt_deadline_ms;
+static int64_t s_next_power_state_poll_ms;
+static bool s_cached_usb_power_valid;
+static bool s_cached_usb_powered;
+static power_test_mode_t s_power_test_mode;
+static RTC_DATA_ATTR uint32_t s_power_test_wake_magic;
+
+static void set_power_state(vibe_minijoy_power_state_t state);
+static void set_minijoy_led(uint32_t color);
+static void set_board_status_led(bool enabled);
+
+static const char *power_state_name(vibe_minijoy_power_state_t state)
+{
+    switch (state) {
+    case VIBE_MINIJOY_POWER_STANDBY:
+        return "STANDBY";
+    case VIBE_MINIJOY_POWER_DEEP_SLEEP:
+        return "DEEP_SLEEP";
+    case VIBE_MINIJOY_POWER_ACTIVE:
+    default:
+        return "ACTIVE";
+    }
+}
+
+static const char *power_test_mode_name(power_test_mode_t mode)
+{
+    switch (mode) {
+    case POWER_TEST_BATTERY:
+        return "BATTERY";
+    case POWER_TEST_BATTERY_FAST:
+        return "BATTERY_FAST";
+    case POWER_TEST_NORMAL:
+    default:
+        return "NORMAL";
+    }
+}
+
+static int64_t power_standby_timeout_ms(power_test_mode_t mode)
+{
+    return mode == POWER_TEST_BATTERY_FAST ? POWER_TEST_STANDBY_MS
+                                           : STANDBY_IDLE_MS;
+}
+
+static int64_t power_deep_sleep_timeout_ms(power_test_mode_t mode)
+{
+    if (mode == POWER_TEST_BATTERY_FAST) {
+        return POWER_TEST_DEEP_SLEEP_MS;
+    }
+    if (mode == POWER_TEST_BATTERY) {
+        return POWER_TEST_BATTERY_DEEP_SLEEP_MS;
+    }
+    return DEEP_SLEEP_IDLE_MS;
+}
+
+static void effective_usb_power(bool physical_valid, bool physical_powered,
+                                bool *valid, bool *powered)
+{
+    if (s_power_test_mode == POWER_TEST_NORMAL) {
+        *valid = physical_valid;
+        *powered = physical_powered;
+    } else {
+        *valid = true;
+        *powered = false;
+    }
+}
+
+static void configure_cpu_ceiling(int max_freq_mhz)
+{
+#if CONFIG_PM_ENABLE
+    const esp_pm_config_t config = {
+        .max_freq_mhz = max_freq_mhz,
+        .min_freq_mhz = 80,
+        .light_sleep_enable = false,
+    };
+    esp_err_t err = esp_pm_configure(&config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "CPU ceiling %dMHz configuration failed: %s",
+                 max_freq_mhz, esp_err_to_name(err));
+    }
+#else
+    (void)max_freq_mhz;
+#endif
+}
+
+static void set_power_state(vibe_minijoy_power_state_t state)
+{
+    if (state == s_power_state) {
+        return;
+    }
+    vibe_minijoy_power_state_t previous = s_power_state;
+    if (state == VIBE_MINIJOY_POWER_ACTIVE) {
+        configure_cpu_ceiling(240);
+        if (s_cpu_max_lock && !s_cpu_max_lock_held) {
+            esp_err_t err = esp_pm_lock_acquire(s_cpu_max_lock);
+            if (err == ESP_OK) {
+                s_cpu_max_lock_held = true;
+            } else {
+                ESP_LOGW(TAG, "CPU max lock acquire failed: %s",
+                         esp_err_to_name(err));
+            }
+        }
+        vibe_bt_status_ui_activity();
+    } else if (state == VIBE_MINIJOY_POWER_STANDBY) {
+        /* Keep the host stack and Classic ACL active. On ESP32-PICO-D4 with
+         * macOS, leaving Classic Sniff can miss its LMP response deadline
+         * (0x22), dropping HID and HFP together. Standby still blanks the
+         * display, disables LEDs, and slows the application loop; deep sleep
+         * remains the fully-off third level. */
+        configure_cpu_ceiling(240);
+        set_minijoy_led(MINIJOY_LED_OFF);
+        set_board_status_led(false);
+        vibe_bt_status_ui_enter_standby();
+    }
+    s_power_state = state;
+    ESP_LOGI(TAG, "power state %s -> %s cpu=%dMHz",
+             power_state_name(previous), power_state_name(state),
+             esp_clk_cpu_freq() / 1000000);
+}
 
 static int64_t now_ms(void)
 {
@@ -162,6 +307,7 @@ static void register_activity(void)
 {
     s_last_activity_ms = now_ms();
     s_next_deep_sleep_attempt_ms = 0;
+    set_power_state(VIBE_MINIJOY_POWER_ACTIVE);
     vibe_bt_status_ui_activity();
 }
 
@@ -219,10 +365,15 @@ static void bt_state_callback(const vibe_bt_composite_state_t *state,
 {
     (void)context;
     bool audio_was_connected;
+    bool audio_was_connecting;
     portENTER_CRITICAL(&s_bt_state_lock);
     audio_was_connected = s_bt_state.audio_connected;
+    audio_was_connecting = s_bt_state.audio_connecting;
     s_bt_state = *state;
     portEXIT_CRITICAL(&s_bt_state_lock);
+    if (state->audio_connecting && !audio_was_connecting) {
+        queue_app_event(APP_EVENT_HFP_AUDIO_CONNECTING);
+    }
     if (state->audio_connected != audio_was_connected) {
         queue_app_event(state->audio_connected
                             ? APP_EVENT_HFP_AUDIO_CONNECTED
@@ -253,6 +404,7 @@ static void serial_reply(const char *payload)
 
 static void serial_status_reply(void)
 {
+    int64_t current_ms = now_ms();
     vibe_bt_composite_state_t state = bt_state();
     bool usb_powered = false;
     bool usb_power_valid =
@@ -261,7 +413,7 @@ static void serial_status_reply(void)
     esp_read_mac(mac, ESP_MAC_BT);
     char payload[M5CTL_RESPONSE_BYTES];
     snprintf(payload, sizeof(payload),
-             "{\"ok\":true,\"version\":\"%s\",\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"paired\":%s,\"pairing\":%s,\"hid\":%s,\"hfp\":%s,\"audio\":%s,\"wideband\":%s,\"usb_power_valid\":%s,\"usb_powered\":%s,\"front\":%d,\"side\":%d,\"input_guard\":%s,\"air_mouse\":%s,\"minijoy\":%s,\"last_auth_status\":%ld}",
+             "{\"ok\":true,\"version\":\"%s\",\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"paired\":%s,\"pairing\":%s,\"hid\":%s,\"hfp\":%s,\"audio\":%s,\"wideband\":%s,\"usb_power_valid\":%s,\"usb_powered\":%s,\"power_test_mode\":\"%s\",\"power_state\":\"%s\",\"ui_status\":\"%s\",\"display_on\":%s,\"imu_error\":%s,\"idle_ms\":%lld,\"cpu_freq_mhz\":%d,\"pending_wake_ptt\":%s,\"front\":%d,\"side\":%d,\"input_guard\":%s,\"air_mouse\":%s,\"minijoy\":%s,\"last_auth_status\":%ld}",
              FIRMWARE_VERSION, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
              state.paired ? "true" : "false", state.pairing ? "true" : "false",
              state.hid_connected ? "true" : "false",
@@ -270,6 +422,16 @@ static void serial_status_reply(void)
              state.wideband ? "true" : "false",
              usb_power_valid ? "true" : "false",
              usb_powered ? "true" : "false",
+             power_test_mode_name(s_power_test_mode),
+             power_state_name(s_power_state),
+             vibe_bt_status_ui_status_name(vibe_bt_status_ui_status()),
+             vibe_bt_status_ui_display_on() ? "true" : "false",
+             s_imu_error ? "true" : "false",
+             (long long)(s_last_activity_ms > 0
+                             ? current_ms - s_last_activity_ms
+                             : 0),
+             esp_clk_cpu_freq() / 1000000,
+             s_pending_wake_ptt ? "true" : "false",
              gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0,
              gpio_get_level(VIBE_BOARD_PIN_BUTTON_SIDE) == 0,
              atomic_load(&s_wake_input_guard) ? "true" : "false",
@@ -331,6 +493,19 @@ static void serial_handle_line(char *line)
     } else if (strcasecmp(command, "SLEEP") == 0) {
         queue_serial_event(APP_EVENT_SERIAL_SLEEP, 0);
         serial_reply("{\"ok\":true,\"queued\":\"sleep\"}");
+    } else if (strcasecmp(command, "TEST_POWER") == 0) {
+        power_test_mode_t mode = POWER_TEST_NORMAL;
+        if (argument && strcasecmp(argument, "BATTERY") == 0) {
+            mode = POWER_TEST_BATTERY;
+        } else if (argument &&
+                   strcasecmp(argument, "BATTERY_FAST") == 0) {
+            mode = POWER_TEST_BATTERY_FAST;
+        } else if (!argument || strcasecmp(argument, "NORMAL") != 0) {
+            serial_reply("{\"ok\":false,\"error\":\"test_power_must_be_normal_battery_or_battery_fast\"}");
+            return;
+        }
+        queue_serial_event(APP_EVENT_SERIAL_TEST_POWER, (uint32_t)mode);
+        serial_reply("{\"ok\":true,\"queued\":\"test_power\"}");
     } else if (strcasecmp(command, "REBOOT") == 0) {
         queue_serial_event(APP_EVENT_SERIAL_REBOOT, 0);
         serial_reply("{\"ok\":true,\"queued\":\"reboot\"}");
@@ -612,12 +787,19 @@ static void open_minijoy(void)
     esp_err_t err = vibe_minijoyc_open();
     if (err == ESP_OK) {
         s_minijoy_ready = true;
+        s_minijoy_retry_delay_ms = JOY_RETRY_MS;
         s_minijoy_led_color = UINT32_MAX;
         set_minijoy_led(MINIJOY_LED_OFF);
         ESP_LOGI(TAG, "MiniJoy ready on GPIO0/GPIO26");
     } else {
-        s_minijoy_retry_ms = now_ms() + JOY_RETRY_MS;
-        ESP_LOGW(TAG, "MiniJoy open failed: %s", esp_err_to_name(err));
+        uint32_t retry_ms = s_minijoy_retry_delay_ms;
+        s_minijoy_retry_ms = now_ms() + retry_ms;
+        s_minijoy_retry_delay_ms =
+            retry_ms >= JOY_RETRY_MAX_MS / 2
+                ? JOY_RETRY_MAX_MS
+                : retry_ms * 2;
+        ESP_LOGW(TAG, "MiniJoy open failed: %s; retry_ms=%u",
+                 esp_err_to_name(err), (unsigned)retry_ms);
     }
 }
 
@@ -626,6 +808,8 @@ static void start_ptt(void)
     if (atomic_load(&s_capture_active)) {
         return;
     }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        vibe_bt_composite_set_sniff_allowed(false));
     clear_confirm_window();
     play_event_sound(VIBE_STICK_SOUND_RECORDING_START, "recording start");
     set_minijoy_led(MINIJOY_LED_MICROPHONE);
@@ -705,9 +889,19 @@ static void stop_ptt(bool arm_followup)
 
 static void start_host_capture(void)
 {
+    if (s_pending_wake_ptt) {
+        s_pending_wake_ptt = false;
+        s_pending_wake_ptt_deadline_ms = 0;
+        ESP_LOGI(TAG, "host HFP capture cancelled queued wake PTT");
+    }
     if (atomic_load(&s_capture_active)) {
         return;
     }
+    /* Keep the active link policy before starting PDM/I2S and the HFP audio
+     * pump. */
+    register_activity();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        vibe_bt_composite_set_sniff_allowed(false));
     clear_confirm_window();
     play_event_sound(VIBE_STICK_SOUND_RECORDING_START,
                      "host recording start");
@@ -738,7 +932,6 @@ static void start_host_capture(void)
     s_capture_owner = CAPTURE_OWNER_HOST_HFP;
     atomic_store(&s_capture_active, true);
     vibe_bt_status_ui_set(VIBE_BT_UI_RECORDING, false);
-    register_activity();
     ESP_LOGI(TAG, "host-initiated HFP capture started");
 }
 
@@ -861,6 +1054,12 @@ static void exit_air_mouse_mode(void)
 static void handle_front_down(void)
 {
     register_activity();
+    if (s_pending_wake_ptt) {
+        s_pending_wake_ptt = false;
+        s_pending_wake_ptt_deadline_ms = 0;
+        ESP_LOGI(TAG, "queued wake PTT cancelled by front button");
+        return;
+    }
     if (s_air_mouse_ignore_front_until_up) {
         return;
     }
@@ -938,6 +1137,13 @@ static void handle_event(const app_event_message_t *message)
     case APP_EVENT_FRONT_UP:
         handle_front_up();
         break;
+    case APP_EVENT_HFP_AUDIO_CONNECTING:
+        /* Leave Sniff and restore the APB clock before the controller starts
+         * negotiating SCO. Waiting for AUDIO_CONNECTED is too late. */
+        register_activity();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            vibe_bt_composite_set_sniff_allowed(false));
+        break;
     case APP_EVENT_HFP_AUDIO_CONNECTED:
         start_host_capture();
         break;
@@ -995,11 +1201,40 @@ static void handle_event(const app_event_message_t *message)
             ESP_LOGW(TAG, "serial deep sleep deferred: active work");
             break;
         }
+        {
+            bool physical_powered = false;
+            esp_err_t power_err = vibe_board_usb_powered(&physical_powered);
+            bool usb_valid = false;
+            bool usb_powered = false;
+            effective_usb_power(power_err == ESP_OK, physical_powered,
+                                &usb_valid, &usb_powered);
+            if (!usb_valid || usb_powered) {
+                ESP_LOGW(TAG,
+                         "serial deep sleep refused: USB powered or status unavailable");
+                break;
+            }
+        }
         ESP_LOGI(TAG, "serial deep sleep requested");
         vTaskDelay(pdMS_TO_TICKS(100));
         if (!enter_deep_sleep()) {
             ESP_LOGW(TAG, "serial deep sleep request failed");
         }
+        break;
+    case APP_EVENT_SERIAL_TEST_POWER:
+        if (message->value > POWER_TEST_BATTERY_FAST) {
+            ESP_LOGW(TAG, "invalid power test mode=%" PRIu32,
+                     message->value);
+            break;
+        }
+        s_power_test_mode = (power_test_mode_t)message->value;
+        s_power_test_wake_magic = 0;
+        register_activity();
+        s_next_power_state_poll_ms = 0;
+        ESP_LOGW(TAG,
+                 "diagnostic power environment=%s volatile=1 standby_ms=%lld deep_sleep_ms=%lld",
+                 power_test_mode_name(s_power_test_mode),
+                 (long long)power_standby_timeout_ms(s_power_test_mode),
+                 (long long)power_deep_sleep_timeout_ms(s_power_test_mode));
         break;
     case APP_EVENT_SERIAL_REBOOT:
         ESP_LOGI(TAG, "serial reboot requested");
@@ -1111,7 +1346,7 @@ static void poll_air_mouse(int64_t current_ms)
     float delta_seconds = s_last_imu_sample_ms > 0
                               ? (float)(current_ms - s_last_imu_sample_ms) /
                                     1000.0f
-                              : (float)APP_LOOP_MS / 1000.0f;
+                              : (float)ACTIVE_LOOP_MS / 1000.0f;
     s_last_imu_sample_ms = current_ms;
 
     vibe_air_mouse_output_t output = {0};
@@ -1210,7 +1445,7 @@ static void update_status(void)
                      PTT_AUDIO_CONNECT_GRACE_MS);
         }
     }
-    if (s_imu_error) {
+    if (s_imu_error && s_air_mouse_enabled) {
         vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
     } else if (ptt_audio_state == VIBE_MINIJOY_PTT_AUDIO_FAILED) {
         vibe_bt_status_ui_set(VIBE_BT_UI_AUDIO_FAILED, s_minijoy_ready);
@@ -1257,6 +1492,32 @@ static void update_wake_input_guard(int64_t current_ms)
     }
 }
 
+static void update_pending_wake_ptt(int64_t current_ms)
+{
+    if (!s_pending_wake_ptt || atomic_load(&s_wake_input_guard)) {
+        return;
+    }
+    if (current_ms >= s_pending_wake_ptt_deadline_ms) {
+        s_pending_wake_ptt = false;
+        s_pending_wake_ptt_deadline_ms = 0;
+        vibe_bt_status_ui_set(VIBE_BT_UI_ERROR, s_minijoy_ready);
+        play_event_sound(VIBE_STICK_SOUND_ERROR, "wake PTT timeout");
+        register_activity();
+        ESP_LOGW(TAG, "queued wake PTT timed out after %dms",
+                 WAKE_PTT_TIMEOUT_MS);
+        return;
+    }
+    vibe_bt_composite_state_t state = bt_state();
+    if (!state.hid_connected || !state.hfp_connected) {
+        return;
+    }
+    s_pending_wake_ptt = false;
+    s_pending_wake_ptt_deadline_ms = 0;
+    ESP_LOGI(TAG, "queued wake PTT starting after HID/HFP reconnect");
+    register_activity();
+    start_ptt();
+}
+
 static void poll_front_button(int64_t current_ms)
 {
     bool pressed = vibe_input_front_pressed();
@@ -1285,6 +1546,7 @@ static bool deep_sleep_has_active_work(int64_t current_ms)
     vibe_bt_composite_state_t state = bt_state();
     return atomic_load(&s_capture_active) ||
            atomic_load(&s_wake_input_guard) || state.pairing ||
+           s_pending_wake_ptt || s_air_mouse_enabled ||
            s_pairing_deadline_ms > current_ms ||
            s_startup_pairing_due_ms > current_ms ||
            s_confirm_deadline_ms > current_ms;
@@ -1298,8 +1560,16 @@ static esp_err_t configure_deep_sleep_wake_sources(void)
     ESP_RETURN_ON_ERROR(
         esp_sleep_enable_ext0_wakeup(VIBE_BOARD_PIN_BUTTON_FRONT, 0), TAG,
         "front button wake");
-    return esp_sleep_enable_ext1_wakeup_io(
-        1ULL << VIBE_BOARD_PIN_BUTTON_SIDE, ESP_EXT1_WAKEUP_ALL_LOW);
+    ESP_RETURN_ON_ERROR(
+        esp_sleep_enable_ext1_wakeup_io(
+            1ULL << VIBE_BOARD_PIN_BUTTON_SIDE, ESP_EXT1_WAKEUP_ALL_LOW),
+        TAG, "side button wake");
+    if (s_power_test_mode == POWER_TEST_BATTERY_FAST) {
+        ESP_RETURN_ON_ERROR(
+            esp_sleep_enable_timer_wakeup(POWER_TEST_TIMER_WAKE_US), TAG,
+            "diagnostic timer wake");
+    }
+    return ESP_OK;
 }
 
 static bool enter_deep_sleep(void)
@@ -1315,6 +1585,9 @@ static bool enter_deep_sleep(void)
                  esp_err_to_name(err));
         return false;
     }
+    /* Bluetooth profile teardown is timing-sensitive; retain the active CPU
+     * clock for the short shutdown transaction. */
+    configure_cpu_ceiling(240);
     bool resume_motion_on_error =
         s_imu_available && !vibe_motion_suspended();
     err = vibe_motion_prepare_deep_sleep();
@@ -1332,7 +1605,8 @@ static bool enter_deep_sleep(void)
         }
         return false;
     }
-    err = vibe_bt_composite_prepare_deep_sleep(1200);
+    err = vibe_bt_composite_prepare_deep_sleep(
+        DEEP_SLEEP_BT_DISCONNECT_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "deep sleep Bluetooth preparation failed: %s",
                  esp_err_to_name(err));
@@ -1352,56 +1626,72 @@ static bool enter_deep_sleep(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_bt_status_ui_prepare_deep_sleep());
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_set_external_5v(false));
     ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_prepare_deep_sleep());
+    if (s_power_test_mode == POWER_TEST_BATTERY_FAST) {
+        s_power_test_wake_magic = POWER_TEST_WAKE_MAGIC;
+        ESP_LOGW(TAG,
+                 "diagnostic deep sleep will timer-wake as front button in %llu us",
+                 POWER_TEST_TIMER_WAKE_US);
+    }
+    set_power_state(VIBE_MINIJOY_POWER_DEEP_SLEEP);
     ESP_LOGI(TAG,
-             "entering deep sleep idle_ms=%d wake_front=%d wake_side=%d",
-             DEEP_SLEEP_IDLE_MS, (int)VIBE_BOARD_PIN_BUTTON_FRONT,
+             "entering deep sleep idle_ms=%lld wake_front=%d wake_side=%d",
+             (long long)power_deep_sleep_timeout_ms(s_power_test_mode),
+             (int)VIBE_BOARD_PIN_BUTTON_FRONT,
              (int)VIBE_BOARD_PIN_BUTTON_SIDE);
     vTaskDelay(pdMS_TO_TICKS(50));
     esp_deep_sleep_start();
     return true;
 }
 
-static void maybe_enter_deep_sleep(int64_t current_ms)
+static void update_power_state(int64_t current_ms)
 {
     bool active_work = deep_sleep_has_active_work(current_ms);
-    if (!vibe_minijoy_bt_should_attempt_automatic_sleep(
-            active_work, true, false, current_ms, s_last_activity_ms,
-            DEEP_SLEEP_IDLE_MS) ||
-        (s_next_deep_sleep_attempt_ms > 0 &&
-         current_ms < s_next_deep_sleep_attempt_ms)) {
+    if (current_ms >= s_next_power_state_poll_ms) {
+        bool usb_powered = false;
+        esp_err_t power_err = vibe_board_usb_powered(&usb_powered);
+        s_cached_usb_power_valid = power_err == ESP_OK;
+        s_cached_usb_powered = s_cached_usb_power_valid && usb_powered;
+        s_next_power_state_poll_ms = current_ms + POWER_STATE_POLL_MS;
+        if (!s_cached_usb_power_valid && !s_usb_status_error_logged) {
+            ESP_LOGW(TAG, "power state forced ACTIVE: USB status unavailable: %s",
+                     esp_err_to_name(power_err));
+            s_usb_status_error_logged = true;
+        } else if (s_cached_usb_power_valid) {
+            s_usb_status_error_logged = false;
+        }
+    }
+
+    bool usb_power_valid = false;
+    bool usb_powered = false;
+    effective_usb_power(s_cached_usb_power_valid, s_cached_usb_powered,
+                        &usb_power_valid, &usb_powered);
+    /* ESP32-PICO-D4 can time out (0x22) while leaving Classic Sniff with a
+     * macOS host. Keep ACL active in both powered and standby states; deep
+     * sleep is the only state that intentionally disconnects Bluetooth. */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        vibe_bt_composite_set_sniff_allowed(false));
+    int64_t standby_after_ms =
+        power_standby_timeout_ms(s_power_test_mode);
+    int64_t deep_sleep_after_ms =
+        power_deep_sleep_timeout_ms(s_power_test_mode);
+
+    vibe_minijoy_power_state_t desired =
+        vibe_minijoy_bt_desired_power_state(
+            active_work, usb_power_valid, usb_powered, current_ms,
+            s_last_activity_ms, standby_after_ms, deep_sleep_after_ms);
+    if (desired == VIBE_MINIJOY_POWER_ACTIVE) {
+        set_power_state(desired);
+        return;
+    }
+    if (desired == VIBE_MINIJOY_POWER_STANDBY) {
+        set_power_state(desired);
+        return;
+    }
+    if (s_next_deep_sleep_attempt_ms > 0 &&
+        current_ms < s_next_deep_sleep_attempt_ms) {
         return;
     }
     s_next_deep_sleep_attempt_ms = current_ms + DEEP_SLEEP_RETRY_MS;
-
-    bool usb_powered = false;
-    esp_err_t power_err = vibe_board_usb_powered(&usb_powered);
-    bool usb_power_valid = power_err == ESP_OK;
-    if (!vibe_minijoy_bt_should_attempt_automatic_sleep(
-            active_work, usb_power_valid, usb_powered, current_ms,
-            s_last_activity_ms, DEEP_SLEEP_IDLE_MS)) {
-        if (!usb_power_valid) {
-            if (!s_usb_status_error_logged) {
-                ESP_LOGW(TAG,
-                         "automatic deep sleep deferred: USB status unavailable: %s",
-                         esp_err_to_name(power_err));
-                s_usb_status_error_logged = true;
-            }
-            s_usb_sleep_deferred_logged = false;
-        } else if (usb_powered) {
-            if (!s_usb_sleep_deferred_logged) {
-                ESP_LOGI(TAG,
-                         "automatic deep sleep deferred while USB powered");
-                s_usb_sleep_deferred_logged = true;
-            }
-            s_usb_status_error_logged = false;
-        }
-        return;
-    }
-    if (s_usb_sleep_deferred_logged) {
-        ESP_LOGI(TAG, "USB power removed; automatic deep sleep enabled");
-    }
-    s_usb_sleep_deferred_logged = false;
-    s_usb_status_error_logged = false;
     (void)enter_deep_sleep();
 }
 
@@ -1416,8 +1706,13 @@ static void maybe_send_powered_bt_keepalive(int64_t current_ms)
         return;
     }
 
+    bool physical_powered = false;
+    esp_err_t power_err = vibe_board_usb_powered(&physical_powered);
+    bool usb_valid = false;
     bool usb_powered = false;
-    if (vibe_board_usb_powered(&usb_powered) != ESP_OK || !usb_powered) {
+    effective_usb_power(power_err == ESP_OK, physical_powered,
+                        &usb_valid, &usb_powered);
+    if (!usb_valid || !usb_powered) {
         return;
     }
     vibe_bt_composite_state_t state = bt_state();
@@ -1445,6 +1740,28 @@ static esp_err_t init_nvs(void)
         err = nvs_flash_init();
     }
     return err;
+}
+
+static esp_err_t init_power_management(void)
+{
+#if CONFIG_PM_ENABLE
+    const esp_pm_config_t config = {
+        .max_freq_mhz = 240,
+        .min_freq_mhz = 80,
+        .light_sleep_enable = false,
+    };
+    ESP_RETURN_ON_ERROR(esp_pm_configure(&config), TAG,
+                        "configure power management");
+    ESP_RETURN_ON_ERROR(
+        esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "active_cpu",
+                           &s_cpu_max_lock),
+        TAG, "create active CPU lock");
+    ESP_RETURN_ON_ERROR(esp_pm_lock_acquire(s_cpu_max_lock), TAG,
+                        "acquire active CPU lock");
+    s_cpu_max_lock_held = true;
+    ESP_LOGI(TAG, "power management max=240MHz min=80MHz light_sleep=0");
+#endif
+    return ESP_OK;
 }
 
 static bool startup_ota_requested(void)
@@ -1512,19 +1829,35 @@ void app_main(void)
 {
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
     uint64_t ext1_status = esp_sleep_get_ext1_wakeup_status();
+    bool diagnostic_front_wake =
+        wake_cause == ESP_SLEEP_WAKEUP_TIMER &&
+        s_power_test_wake_magic == POWER_TEST_WAKE_MAGIC;
+    s_power_test_wake_magic = 0;
+    bool woke_from_front = wake_cause == ESP_SLEEP_WAKEUP_EXT0 ||
+                           diagnostic_front_wake;
     bool woke_from_button = wake_cause == ESP_SLEEP_WAKEUP_EXT0 ||
-                            wake_cause == ESP_SLEEP_WAKEUP_EXT1;
+                            wake_cause == ESP_SLEEP_WAKEUP_EXT1 ||
+                            diagnostic_front_wake;
     if (woke_from_button) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_FRONT));
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             rtc_gpio_deinit(VIBE_BOARD_PIN_BUTTON_SIDE));
         atomic_store(&s_wake_input_guard, true);
+        if (woke_from_front) {
+            s_pending_wake_ptt = true;
+            s_pending_wake_ptt_deadline_ms = now_ms() + WAKE_PTT_TIMEOUT_MS;
+        }
+        if (diagnostic_front_wake) {
+            ESP_LOGW(TAG,
+                     "diagnostic timer wake injected as front-button wake");
+        }
         ESP_LOGI(TAG, "deep-sleep wake cause=%d ext1=0x%llx",
                  (int)wake_cause, (unsigned long long)ext1_status);
     }
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(vibe_board_init_power());
+    ESP_ERROR_CHECK(init_power_management());
     ESP_ERROR_CHECK(vibe_board_set_external_5v(false));
     vTaskDelay(pdMS_TO_TICKS(80));
     ESP_ERROR_CHECK(vibe_board_set_external_5v(true));
@@ -1571,7 +1904,8 @@ void app_main(void)
     s_front_button_candidate = s_front_button_pressed;
     s_front_button_candidate_since_ms = now_ms();
     BaseType_t serial_task_created = xTaskCreatePinnedToCore(
-        serial_maintenance_task, "m5ctl_uart", 3072, NULL, 4, NULL, 0);
+        serial_maintenance_task, "m5ctl_uart", M5CTL_TASK_STACK_BYTES, NULL,
+        4, NULL, 0);
     ESP_ERROR_CHECK(serial_task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     s_last_activity_ms = now_ms();
     open_minijoy();
@@ -1595,6 +1929,7 @@ void app_main(void)
         while (xQueueReceive(s_event_queue, &event, 0) == pdTRUE) {
             handle_event(&event);
         }
+        update_pending_wake_ptt(current_ms);
         poll_minijoy();
         current_ms = now_ms();
         poll_air_mouse(current_ms);
@@ -1617,10 +1952,19 @@ void app_main(void)
             s_pairing_deadline_ms = 0;
         }
         update_status();
-        update_status_leds(current_ms);
+        if (s_power_state == VIBE_MINIJOY_POWER_ACTIVE) {
+            update_status_leds(current_ms);
+        } else if (s_power_state == VIBE_MINIJOY_POWER_STANDBY) {
+            set_minijoy_led(MINIJOY_LED_OFF);
+            set_board_status_led(false);
+            vibe_bt_status_ui_enter_standby();
+        }
         vibe_bt_status_ui_tick(current_ms);
         maybe_send_powered_bt_keepalive(current_ms);
-        maybe_enter_deep_sleep(current_ms);
-        vTaskDelay(pdMS_TO_TICKS(APP_LOOP_MS));
+        update_power_state(current_ms);
+        vTaskDelay(pdMS_TO_TICKS(
+            s_power_state == VIBE_MINIJOY_POWER_STANDBY
+                ? STANDBY_LOOP_MS
+                : ACTIVE_LOOP_MS));
     }
 }

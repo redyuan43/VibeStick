@@ -11,6 +11,7 @@ typedef struct {
     bool pairing;
     bool hid_connected;
     bool hfp_connected;
+    bool audio_connecting;
     bool audio_connected;
     bool wideband;
     int32_t last_auth_status;
@@ -30,6 +31,7 @@ esp_err_t vibe_bt_composite_end_pairing(void);
 esp_err_t vibe_bt_composite_clear_bonds(void);
 esp_err_t vibe_bt_composite_request_reconnect(void);
 esp_err_t vibe_bt_composite_keepalive(void);
+esp_err_t vibe_bt_composite_set_sniff_allowed(bool allowed);
 esp_err_t vibe_bt_composite_prepare_deep_sleep(uint32_t timeout_ms);
 vibe_bt_composite_state_t vibe_bt_composite_state(void);
 esp_err_t vibe_bt_composite_send_right_shift(bool pressed);

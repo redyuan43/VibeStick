@@ -1,6 +1,41 @@
 #include "vibe_minijoy_bt_policy.h"
 
+#include <stdio.h>
 #include <string.h>
+
+bool vibe_minijoy_bt_format_device_name(const uint8_t mac[6], char *out,
+                                         size_t out_size)
+{
+    if (!mac || !out || out_size == 0) {
+        return false;
+    }
+    int length = snprintf(out, out_size, "VibeStick-%02X%02X", mac[4],
+                          mac[5]);
+    return length > 0 && (size_t)length < out_size;
+}
+
+vibe_minijoy_power_state_t vibe_minijoy_bt_desired_power_state(
+    bool active_work,
+    bool usb_power_valid,
+    bool usb_powered,
+    int64_t now_ms,
+    int64_t last_activity_ms,
+    int64_t standby_after_ms,
+    int64_t deep_sleep_after_ms)
+{
+    if (active_work || !usb_power_valid || usb_powered ||
+        last_activity_ms <= 0 || now_ms < last_activity_ms) {
+        return VIBE_MINIJOY_POWER_ACTIVE;
+    }
+    int64_t idle_ms = now_ms - last_activity_ms;
+    if (idle_ms >= deep_sleep_after_ms) {
+        return VIBE_MINIJOY_POWER_DEEP_SLEEP;
+    }
+    if (idle_ms >= standby_after_ms) {
+        return VIBE_MINIJOY_POWER_STANDBY;
+    }
+    return VIBE_MINIJOY_POWER_ACTIVE;
+}
 
 bool vibe_minijoy_bt_should_attempt_automatic_sleep(
     bool active_work,
@@ -10,11 +45,10 @@ bool vibe_minijoy_bt_should_attempt_automatic_sleep(
     int64_t last_activity_ms,
     int64_t deep_sleep_after_ms)
 {
-    return !active_work &&
-           usb_power_valid &&
-           !usb_powered &&
-           last_activity_ms > 0 &&
-           now_ms - last_activity_ms >= deep_sleep_after_ms;
+    return vibe_minijoy_bt_desired_power_state(
+               active_work, usb_power_valid, usb_powered, now_ms,
+               last_activity_ms, deep_sleep_after_ms, deep_sleep_after_ms) ==
+           VIBE_MINIJOY_POWER_DEEP_SLEEP;
 }
 
 vibe_minijoy_ptt_press_action_t vibe_minijoy_ptt_press_action(

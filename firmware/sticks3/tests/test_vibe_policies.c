@@ -81,6 +81,37 @@ static void test_minijoy_automatic_sleep_policy(void)
         false, true, false, 999, 100, 900));
     assert(vibe_minijoy_bt_should_attempt_automatic_sleep(
         false, true, false, 1000, 100, 900));
+
+    assert(vibe_minijoy_bt_desired_power_state(
+               false, true, true, 1000, 100, 300, 900) ==
+           VIBE_MINIJOY_POWER_ACTIVE);
+    assert(vibe_minijoy_bt_desired_power_state(
+               false, false, false, 1000, 100, 300, 900) ==
+           VIBE_MINIJOY_POWER_ACTIVE);
+    assert(vibe_minijoy_bt_desired_power_state(
+               true, true, false, 1000, 100, 300, 900) ==
+           VIBE_MINIJOY_POWER_ACTIVE);
+    assert(vibe_minijoy_bt_desired_power_state(
+               false, true, false, 399, 100, 300, 900) ==
+           VIBE_MINIJOY_POWER_ACTIVE);
+    assert(vibe_minijoy_bt_desired_power_state(
+               false, true, false, 400, 100, 300, 900) ==
+           VIBE_MINIJOY_POWER_STANDBY);
+    assert(vibe_minijoy_bt_desired_power_state(
+               false, true, false, 1000, 100, 300, 900) ==
+           VIBE_MINIJOY_POWER_DEEP_SLEEP);
+}
+
+static void test_minijoy_dynamic_device_name(void)
+{
+    char name[20] = {0};
+    const uint8_t first[6] = {0x14, 0x08, 0x08, 0x52, 0xf9, 0x62};
+    const uint8_t second[6] = {0xc8, 0x85, 0x41, 0x68, 0x39, 0x0a};
+    assert(vibe_minijoy_bt_format_device_name(first, name, sizeof(name)));
+    assert(strcmp(name, "VibeStick-F962") == 0);
+    assert(vibe_minijoy_bt_format_device_name(second, name, sizeof(name)));
+    assert(strcmp(name, "VibeStick-390A") == 0);
+    assert(!vibe_minijoy_bt_format_device_name(second, name, 8));
 }
 
 static void test_minijoy_ptt_audio_guard(void)
@@ -301,6 +332,7 @@ int main(void)
     test_followup_window();
     test_minijoy_ptt_press_policy();
     test_minijoy_automatic_sleep_policy();
+    test_minijoy_dynamic_device_name();
     test_minijoy_ptt_audio_guard();
     test_recording_upload_stats();
     test_power_policy();

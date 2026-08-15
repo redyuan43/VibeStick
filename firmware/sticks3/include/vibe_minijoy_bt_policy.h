@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef enum {
@@ -20,6 +21,24 @@ typedef struct {
     vibe_minijoy_ptt_audio_state_t state;
     int64_t deadline_ms;
 } vibe_minijoy_ptt_audio_guard_t;
+
+typedef enum {
+    VIBE_MINIJOY_POWER_ACTIVE,
+    VIBE_MINIJOY_POWER_STANDBY,
+    VIBE_MINIJOY_POWER_DEEP_SLEEP,
+} vibe_minijoy_power_state_t;
+
+vibe_minijoy_power_state_t vibe_minijoy_bt_desired_power_state(
+    bool active_work,
+    bool usb_power_valid,
+    bool usb_powered,
+    int64_t now_ms,
+    int64_t last_activity_ms,
+    int64_t standby_after_ms,
+    int64_t deep_sleep_after_ms);
+
+bool vibe_minijoy_bt_format_device_name(const uint8_t mac[6], char *out,
+                                         size_t out_size);
 
 bool vibe_minijoy_bt_should_attempt_automatic_sleep(
     bool active_work,

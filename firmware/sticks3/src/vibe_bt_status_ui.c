@@ -295,10 +295,12 @@ static void draw_bottom_bar(void)
                                  ? (s_air_mouse_calibrated ? "IMU READY"
                                                            : "KEEP STILL")
                                  : (s_minijoy_ready ? "JOY OK"
-                                                    : "JOY OFF"))));
+                                                    : "BT READY"))));
     uint16_t joy_color = profile_error
                              ? color_warning()
-                             : (ota_status || s_air_mouse_enabled ||
+                             : (ota_status ||
+                                        s_status == VIBE_BT_UI_CONNECTED ||
+                                        s_air_mouse_enabled ||
                                         s_minijoy_ready ||
                                         s_status == VIBE_BT_UI_RECORDING
                                     ? color_foreground()
@@ -575,6 +577,40 @@ static bool wake_display(void)
     return false;
 }
 
+const char *vibe_bt_status_ui_status_name(vibe_bt_ui_status_t status)
+{
+    switch (status) {
+    case VIBE_BT_UI_WAITING: return "WAITING";
+    case VIBE_BT_UI_CONNECTING: return "CONNECTING";
+    case VIBE_BT_UI_PAIRING: return "PAIRING";
+    case VIBE_BT_UI_CONNECTED: return "CONNECTED";
+    case VIBE_BT_UI_RECORDING: return "RECORDING";
+    case VIBE_BT_UI_NO_BOND: return "NO_BOND";
+    case VIBE_BT_UI_HID_FAILED: return "HID_FAILED";
+    case VIBE_BT_UI_HFP_FAILED: return "HFP_FAILED";
+    case VIBE_BT_UI_PROFILES_FAILED: return "PROFILES_FAILED";
+    case VIBE_BT_UI_AUDIO_FAILED: return "AUDIO_FAILED";
+    case VIBE_BT_UI_OTA_CONNECTING: return "OTA_CONNECTING";
+    case VIBE_BT_UI_OTA_CHECKING: return "OTA_CHECKING";
+    case VIBE_BT_UI_OTA_DOWNLOADING: return "OTA_DOWNLOADING";
+    case VIBE_BT_UI_OTA_CURRENT: return "OTA_CURRENT";
+    case VIBE_BT_UI_OTA_FAILED: return "OTA_FAILED";
+    case VIBE_BT_UI_ERROR:
+    default:
+        return "ERROR";
+    }
+}
+
+vibe_bt_ui_status_t vibe_bt_status_ui_status(void)
+{
+    return s_status;
+}
+
+bool vibe_bt_status_ui_display_on(void)
+{
+    return s_display_on;
+}
+
 esp_err_t vibe_bt_status_ui_init(void)
 {
     s_transfer_done = xSemaphoreCreateBinary();
@@ -656,6 +692,11 @@ void vibe_bt_status_ui_set(vibe_bt_ui_status_t status, bool minijoy_ready)
         return;
     }
 
+    ESP_LOGI(TAG, "status %s -> %s minijoy=%d display_on=%d",
+             vibe_bt_status_ui_status_name(previous_status),
+             vibe_bt_status_ui_status_name(status), minijoy_ready,
+             s_display_on);
+
     int64_t current_ms = esp_timer_get_time() / 1000;
     s_last_activity_ms = current_ms;
     if (status == VIBE_BT_UI_CONNECTED &&
@@ -677,6 +718,17 @@ void vibe_bt_status_ui_activity(void)
 {
     s_last_activity_ms = esp_timer_get_time() / 1000;
     (void)wake_display();
+}
+
+void vibe_bt_status_ui_enter_standby(void)
+{
+    if (!s_panel || !s_display_on) {
+        return;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(s_panel, false));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_board_set_lcd_brightness(0));
+    s_display_on = false;
+    s_pet_current_frame = VIBE_MINIJOY_PET_FRAME_COUNT;
 }
 
 void vibe_bt_status_ui_set_air_mouse(bool enabled, bool calibrated)
