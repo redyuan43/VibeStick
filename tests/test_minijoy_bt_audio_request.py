@@ -164,6 +164,33 @@ def test_three_level_power_state_and_front_wake_ptt() -> None:
     assert "WAKE_PTT_TIMEOUT_MS" in wake_ptt
 
 
+def test_wake_ptt_hands_capture_to_host_and_cannot_stick_forever() -> None:
+    handler = _function(
+        MAIN_SOURCE, "static void handle_event",
+        "static void poll_minijoy",
+    )
+    audio_connected = handler.split(
+        "case APP_EVENT_HFP_AUDIO_CONNECTED:", 1
+    )[1].split("case APP_EVENT_HFP_AUDIO_DISCONNECTED:", 1)[0]
+    assert "handoff_wake_ptt_to_host_capture()" in audio_connected
+
+    handoff = _function(
+        MAIN_SOURCE, "static bool handoff_wake_ptt_to_host_capture(void)",
+        "static void start_host_capture(void)",
+    )
+    assert "vibe_bt_composite_send_right_shift(false)" in handoff
+    assert "s_capture_owner = CAPTURE_OWNER_HOST_HFP" in handoff
+    assert "vibe_minijoy_ptt_audio_clear" in handoff
+
+    wake_ptt = _function(
+        MAIN_SOURCE, "static void update_pending_wake_ptt(int64_t current_ms)",
+        "static void poll_front_button",
+    )
+    assert "WAKE_PTT_HANDOFF_TIMEOUT_MS" in wake_ptt
+    assert "stop_ptt(false)" in wake_ptt
+    assert "s_wake_ptt_handoff_pending = true" in wake_ptt
+
+
 def test_volatile_power_test_environment_can_exercise_deep_wake() -> None:
     serial = _function(
         MAIN_SOURCE,

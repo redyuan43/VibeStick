@@ -76,6 +76,7 @@
 #define POWERED_BT_KEEPALIVE_MS 5000
 #define POWER_STATE_POLL_MS 1000
 #define WAKE_PTT_TIMEOUT_MS 15000
+#define WAKE_PTT_HANDOFF_TIMEOUT_MS 5000
 #define FRONT_BUTTON_DEBOUNCE_MS 30
 #define M5CTL_UART_PORT UART_NUM_0
 #define M5CTL_LINE_BYTES 128
@@ -180,6 +181,8 @@ static esp_pm_lock_handle_t s_cpu_max_lock;
 static bool s_cpu_max_lock_held;
 static bool s_pending_wake_ptt;
 static int64_t s_pending_wake_ptt_deadline_ms;
+static bool s_wake_ptt_handoff_pending;
+static int64_t s_wake_ptt_handoff_deadline_ms;
 static int64_t s_next_power_state_poll_ms;
 static bool s_cached_usb_power_valid;
 static bool s_cached_usb_powered;
@@ -859,6 +862,8 @@ static void stop_ptt(bool arm_followup)
     if (s_capture_owner != CAPTURE_OWNER_DEVICE_PTT) {
         return;
     }
+    s_wake_ptt_handoff_pending = false;
+    s_wake_ptt_handoff_deadline_ms = 0;
     vibe_minijoy_ptt_audio_clear(&s_ptt_audio_guard);
     esp_err_t err = vibe_bt_composite_send_right_shift(false);
     if (err != ESP_OK) {
@@ -885,6 +890,27 @@ static void stop_ptt(bool arm_followup)
              s_minijoy_ready, arm_followup ? CONFIRM_WINDOW_MS : 0,
              (unsigned)esp_get_free_heap_size(),
              (unsigned)esp_get_minimum_free_heap_size());
+}
+
+static bool handoff_wake_ptt_to_host_capture(void)
+{
+    if (!s_wake_ptt_handoff_pending ||
+        s_capture_owner != CAPTURE_OWNER_DEVICE_PTT ||
+        !atomic_load(&s_capture_active)) {
+        return false;
+    }
+    s_wake_ptt_handoff_pending = false;
+    s_wake_ptt_handoff_deadline_ms = 0;
+    esp_err_t err = vibe_bt_composite_send_right_shift(false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wake PTT Right Shift up failed: %s",
+                 esp_err_to_name(err));
+    }
+    vibe_minijoy_ptt_audio_clear(&s_ptt_audio_guard);
+    s_capture_owner = CAPTURE_OWNER_HOST_HFP;
+    ESP_LOGI(TAG,
+             "wake PTT handed off to host capture after SCO connected");
+    return true;
 }
 
 static void start_host_capture(void)
@@ -1145,7 +1171,9 @@ static void handle_event(const app_event_message_t *message)
             vibe_bt_composite_set_sniff_allowed(false));
         break;
     case APP_EVENT_HFP_AUDIO_CONNECTED:
-        start_host_capture();
+        if (!handoff_wake_ptt_to_host_capture()) {
+            start_host_capture();
+        }
         break;
     case APP_EVENT_HFP_AUDIO_DISCONNECTED:
         stop_host_capture();
@@ -1494,6 +1522,15 @@ static void update_wake_input_guard(int64_t current_ms)
 
 static void update_pending_wake_ptt(int64_t current_ms)
 {
+    if (s_wake_ptt_handoff_pending) {
+        if (current_ms >= s_wake_ptt_handoff_deadline_ms) {
+            ESP_LOGW(TAG,
+                     "wake PTT SCO handoff timed out after %dms; stopping capture",
+                     WAKE_PTT_HANDOFF_TIMEOUT_MS);
+            stop_ptt(false);
+        }
+        return;
+    }
     if (!s_pending_wake_ptt || atomic_load(&s_wake_input_guard)) {
         return;
     }
@@ -1515,7 +1552,14 @@ static void update_pending_wake_ptt(int64_t current_ms)
     s_pending_wake_ptt_deadline_ms = 0;
     ESP_LOGI(TAG, "queued wake PTT starting after HID/HFP reconnect");
     register_activity();
+    s_wake_ptt_handoff_pending = true;
+    s_wake_ptt_handoff_deadline_ms =
+        current_ms + WAKE_PTT_HANDOFF_TIMEOUT_MS;
     start_ptt();
+    if (s_capture_owner != CAPTURE_OWNER_DEVICE_PTT) {
+        s_wake_ptt_handoff_pending = false;
+        s_wake_ptt_handoff_deadline_ms = 0;
+    }
 }
 
 static void poll_front_button(int64_t current_ms)
