@@ -4,15 +4,19 @@
 
 ![VibeStick home screen showing Codex and Claude providers](assets/brand/home-screen-preview.png)
 
-VibeStick turns an M5Stack StickS3, M5StickC Plus, or M5StickC Plus SE into a compact wireless
-voice-input controller. The production bridge, OTA service, device registry,
-and desktop interaction run in CapsWriter on port `8765`.
+VibeStick turns an M5Stack StickS3, M5StickC Plus, M5StickC Plus SE, or
+Cardputer Adv into a compact wireless voice-input controller. The production
+bridge, OTA service, device registry, and desktop interaction run in
+CapsWriter on port `8765`.
 
 The Python package in this repository is intentionally telemetry-only. It
 stores and serves battery-test data on port `8878`; it is not a second voice
 bridge.
 
-VibeStick targets M5Stack StickS3, M5StickC Plus, and M5StickC Plus SE hardware and is not an official M5Stack project. Third-party agent names such as Codex and Claude describe compatible local tools and integrations only.
+VibeStick targets M5Stack StickS3, M5StickC Plus, M5StickC Plus SE, and
+Cardputer Adv hardware and is not an official M5Stack project. Third-party
+agent names such as Codex and Claude describe compatible local tools and
+integrations only.
 
 ## Battery discharge telemetry
 
@@ -67,19 +71,13 @@ cd VibeStick
 
 ```sh
 open -e firmware/sticks3/include/vibe_stick_secrets.h
-open -e .env
 ```
 
 In `vibe_stick_secrets.h`, set Wi-Fi SSID, Wi-Fi password, and the Mac bridge host. `scripts/setup.sh` tries to auto-fill `VIBE_STICK_BRIDGE_HOST` with the detected en0 LAN IP when the file still has the example placeholder. Add `VIBE_STICK_WIFI_PROFILES` there if the device should remember multiple 2.4 GHz networks; the firmware stores those profiles in ESP NVS so normal OTA updates keep them.
 
-In `.env`, set the ASR key and any provider choices. The default ASR example is SiliconFlow:
-
-```sh
-VIBE_STICK_ASR_PROVIDER=openai-compatible
-VIBE_STICK_ASR_BASE_URL=https://api.siliconflow.cn/v1
-VIBE_STICK_ASR_API_KEY=your-siliconflow-key
-VIBE_STICK_ASR_MODEL=FunAudioLLM/SenseVoiceSmall
-```
+Configure ASR, provider observation, and paste behavior in CapsWriter, not in
+this repository. This repository's `.env` is only for the telemetry token,
+port, and URL.
 
 3. 👤 Plug the StickS3 into the Mac with the USB-C data cable.
 
@@ -101,13 +99,17 @@ Or install via Espressif's [official guide](https://docs.espressif.com/projects/
 6. Build and flash the firmware:
 
 ```sh
-./scripts/firmware.sh stickc_plus -p <port> build flash
+./scripts/firmware.sh stickc_plus -p <port> -b 115200 build flash
 
 # M5StickC Plus SE (no IMU or lift-to-talk support)
-./scripts/firmware.sh stickc_plus_se -p <port> build flash
+./scripts/firmware.sh stickc_plus_se -p <port> -b 115200 build flash
+
+# Cardputer Adv
+./scripts/firmware.sh cardputer_adv -p <port> -b 115200 build flash
 ```
 
-For StickS3, replace `stickc_plus` with `sticks3`.
+For StickS3, replace `stickc_plus` with `sticks3`. The script rejects serial
+flash baud rates other than `115200`.
 
 If you do not know the port, run:
 
@@ -119,13 +121,13 @@ Wait for `Hash of data verified`.
 
 7. 👤 Short-press the power button to wake the screen. The blue LED should turn off, the screen should turn on, and you should see the VibeStick home screen. Before networking is ready, it may show offline.
 
-8. Install the local macOS bridge and HUD:
+8. Start the CapsWriter M5 bridge from
+`/home/ivan/github/capswriter-agx-client` and verify it listens on `8765`.
+Follow that project's installation instructions for the macOS app, ASR, and
+paste permissions.
 
-```sh
-./scripts/install.sh
-```
-
-9. 👤 When macOS prompts that `python3.14` wants Accessibility control, click "Open System Settings" and enable it. This permission is needed for paste injection.
+9. 👤 Grant Accessibility permission to the CapsWriter application when macOS
+prompts. This permission is needed for paste injection.
 
 10. Check the setup:
 
@@ -133,15 +135,15 @@ Wait for `Hash of data verified`.
 ./scripts/doctor.sh
 ```
 
-Aim for all required checks to pass. Then glance at the StickS3: Codex / Claude status and 5H / 7D usage should show real values when the corresponding local provider data is available.
-
-If Codex works but the Claude column shows `--%`, that is expected: Claude usage is disabled by default (safer), so to display it set `VIBE_STICK_CLAUDE_USAGE=on` and make sure Claude Code is logged in via `claude` and `/login`.
+Aim for all firmware and telemetry checks to pass. CapsWriter has its own
+runtime diagnostics for the production bridge.
 
 11. 👤 Open any text box, press the front blue button once, speak, and press it again to send. Long-press and release still works as push-to-talk. In both modes, VibeStick transcribes audio from the device microphone and pastes the text automatically.
 
 StickS3 and M5StickC Plus also support lift-to-talk mode. The default `PTT` mode supports front-button tap-to-talk and push-to-talk behavior. On StickS3, hold the side button for 3 seconds to open settings; a single side-button click does nothing, while a quick double-click starts bridge discovery. Inside settings, a short side-button press cycles through `MODE`, `SLEEP`, and `VERSION`; a short front-button press changes the selected value; holding the front button for 1.5 seconds saves the settings. `MODE` selects `PTT` or `LIFT`, and `SLEEP` selects 1, 2, 5, or 10 minutes (5 minutes by default). In `LIFT`, the device uses its flat desktop pose as the baseline, starts recording when lifted, and sends recognition after it is placed back flat and stable. The onboard status LED lights while the front button is held or a recording is active, and is forced off before deep sleep.
 
-For development without installing LaunchAgents, run `./scripts/dev.sh` from the repository root instead of `./scripts/install.sh`.
+`./scripts/dev.sh` in this repository starts only the battery telemetry service
+on `8878`; it cannot replace CapsWriter for normal device use.
 
 ## Wi-Fi OTA Firmware Updates
 
@@ -155,7 +157,15 @@ Build and publish an OTA image for a board:
 ./scripts/ota_publish.sh sticks3
 ```
 
-For M5StickC Plus, replace `sticks3` with `stickc_plus`. Published files are written to `firmware/sticks3/ota/`; the bridge serves them through `/ota/manifest?board=...` and `/ota/bin?board=...`. Once the device is on Wi-Fi, it installs an image only when the manifest has a strictly higher semantic version than the running firmware. Equal or lower versions are rejected even when their build IDs or hashes differ. Accepted images are downloaded to the inactive OTA slot before the device switches boot partitions and restarts.
+Repeat the build and publish commands with `stickc_plus`, `stickc_plus_se`, or
+`cardputer_adv` for the other independent targets. Published files are written
+to `firmware/sticks3/ota/`; CapsWriter serves them through
+`/ota/manifest?board=...` and `/ota/bin?board=...`. Once the device is on
+Wi-Fi, it installs an image only when the manifest has a strictly higher
+semantic version than the running firmware. Equal or lower versions are
+rejected even when their build IDs or hashes differ. Accepted images are
+downloaded to the inactive OTA slot before the device switches boot
+partitions and restarts.
 
 ## Troubleshooting
 
@@ -171,7 +181,14 @@ Adjust the path if your ESP-IDF checkout is somewhere else. Run this once in eve
 
 ### Flashing says "Device not configured" or cannot open the serial port
 
-Unplug and replug the USB-C data cable. Put the StickS3 into download mode again: long-press the side power button until the blue LED double-blinks and the screen turns off. Run `ls /dev/cu.*` to find the port, then retry `idf.py -p <port> build flash`.
+Unplug and replug the USB-C data cable. Put the StickS3 into download mode
+again: long-press the side power button until the blue LED double-blinks and
+the screen turns off. Run `ls /dev/cu.*` to find the port, then retry through
+the board wrapper so flashing remains fixed at `115200` baud:
+
+```sh
+./scripts/firmware.sh <board> -p <port> -b 115200 build flash
+```
 
 ### StickS3 cannot join Wi-Fi
 
@@ -179,19 +196,17 @@ Use a 2.4 GHz Wi-Fi network. StickS3 / ESP32-S3 does not support 5 GHz Wi-Fi.
 
 ### Recording transcribes but does not paste
 
-Grant Accessibility permission to the Python runner that performs paste injection. On macOS, open System Settings -> Privacy & Security -> Accessibility, then enable `python3.14` or the terminal / launcher that runs VibeStick.
+Check CapsWriter's Accessibility permission and paste diagnostics. The Python
+telemetry process in this repository never performs paste injection.
 
 ### "No transcription adapter configured"
 
-Configure ASR in `.env`, especially `VIBE_STICK_ASR_PROVIDER`, `VIBE_STICK_ASR_BASE_URL`, and `VIBE_STICK_ASR_API_KEY`, then run:
-
-```sh
-./scripts/install.sh
-```
+Configure the ASR backend in CapsWriter. This repository has no transcription
+adapter.
 
 ### Cannot find `.env`
 
-`.env` is a hidden file. Open it with:
+`.env` is a hidden file used only by local telemetry scripts. Open it with:
 
 ```sh
 open -e .env
@@ -199,76 +214,20 @@ open -e .env
 
 ### Transcription fails or times out with SSL/network errors
 
-The ASR provider is usually unreachable from your current network. For users in China, try SiliconFlow at <https://cloud.siliconflow.cn/i/7ZCoy9fU>. Otherwise configure a reachable OpenAI-compatible ASR provider or your network proxy.
+Use CapsWriter's ASR diagnostics and configuration. VibeStick firmware only
+uploads PCM to CapsWriter on `8765`.
 
-## Configuration
+## Configuration Ownership
 
 Do not commit real API keys, local tokens, Wi-Fi credentials, local logs, or generated recording files.
 
-Empty values in `.env` generally mean "use the built-in default". `scripts/dev.sh` loads `.env` from the repository root. `scripts/install.sh` copies `.env` to `~/Library/Application Support/VibeStick/.env`, and the LaunchAgent runner loads that installed file.
-
-### Core settings
-
-- `VIBE_STICK_PROJECT_ROOT`: project root used for local Codex session observation.
-- `VIBE_STICK_PROJECT_NAME`: optional display-name override.
-- `VIBE_STICK_PROVIDER`: active provider selection, `auto`, `codex`, or `claude`; default `auto`.
-- `VIBE_STICK_BRIDGE_TOKEN`: shared token required whenever the bridge binds outside loopback, such as `0.0.0.0`.
-- `VIBE_STICK_MAX_RECORDING_AUDIO_BYTES`: max `/recording/audio` body size, default `2000000`.
-- `VIBE_STICK_RECORDING_USE_MAC_MIC`: set to `0` to disable Mac microphone fallback.
-- `VIBE_STICK_AUTO_ENTER`: set to `1` to press Return after pasting.
-
-### ASR option 1: SiliconFlow (recommended default)
-
-```sh
-VIBE_STICK_ASR_PROVIDER=openai-compatible
-VIBE_STICK_ASR_BASE_URL=https://api.siliconflow.cn/v1
-VIBE_STICK_ASR_API_KEY=your-siliconflow-key
-VIBE_STICK_ASR_MODEL=FunAudioLLM/SenseVoiceSmall
-VIBE_STICK_ASR_LANGUAGE=zh
-VIBE_STICK_ASR_TIMEOUT_SECONDS=15
-VIBE_STICK_ASR_ATTEMPTS=2
-```
-
-Audio sent to a cloud ASR provider leaves the Mac.
-
-### ASR option 2: any OpenAI-compatible provider
-
-Use any provider that accepts `POST {base_url}/audio/transcriptions`.
-
-```sh
-VIBE_STICK_ASR_PROVIDER=openai-compatible
-VIBE_STICK_ASR_BASE_URL=https://example.com/v1
-VIBE_STICK_ASR_API_KEY=your-api-key
-VIBE_STICK_ASR_MODEL=provider-model-name
-```
-
-Groq is also supported as an overseas preset:
-
-```sh
-VIBE_STICK_ASR_PROVIDER=groq
-VIBE_STICK_ASR_API_KEY=your-groq-key
-```
-
-The legacy aliases `VIBE_STICK_GROQ_API_KEY`, `VIBE_STICK_GROQ_MODEL`, and `VIBE_STICK_GROQ_LANGUAGE` remain supported.
-
-### ASR option 3: local command (offline)
-
-```sh
-VIBE_STICK_TRANSCRIBE_CMD=/path/to/transcribe-command
-VIBE_STICK_TRANSCRIBE_TIMEOUT_SECONDS=120
-```
-
-The command receives the recording session JSON on stdin and should print the final transcript to stdout.
-
-### Claude usage
-
-To see Claude 5H/7D usage, use `VIBE_STICK_PROVIDER=claude` or `VIBE_STICK_PROVIDER=auto`, set `VIBE_STICK_CLAUDE_USAGE=on`, and make sure Claude Code CLI has logged in through Terminal with `claude` and `/login`.
-
-- `VIBE_STICK_CLAUDE_USAGE`: set to `on` to fetch real Claude Code subscription usage; default `off`.
-- `CLAUDE_CODE_OAUTH_TOKEN`: optional Claude Code OAuth access token. If unset, the bridge tries local Claude Code keychain/file credentials.
-- `VIBE_STICK_CLAUDE_USAGE_INTERVAL_SECONDS`: Claude usage poll cadence, default `300`, minimum `30`.
-
-Claude usage support calls an undocumented Anthropic endpoint using the user's local Claude Code subscription credentials and client headers. It is opt-in, may break without notice, and never exposes the token or raw endpoint response through the bridge HTTP API. If no successful Claude usage snapshot has ever been captured, the StickS3 shows `--%`; after a successful snapshot, temporary usage refresh failures keep the last known values and mark them stale.
+- `firmware/sticks3/include/vibe_stick_secrets.h`: device Wi-Fi,
+  `192.168.31.225:8765` CapsWriter target, bridge profiles, and device token.
+- `.env`: local battery telemetry settings such as
+  `VIBE_STICK_TELEMETRY_TOKEN`, `VIBE_STICK_TELEMETRY_PORT`, and
+  `VIBE_STICK_TELEMETRY_URL`.
+- CapsWriter configuration: ASR, provider status, quota observation, device
+  registry, recordings, OTA serving, and paste behavior.
 
 ## Project layout
 
@@ -289,26 +248,22 @@ VibeStick/
 ## Checks
 
 ```sh
-python3 -m compileall -q bridge/src tests
-PYTHONPATH=bridge/src python3 -m unittest discover -s tests
-bash -n scripts/setup.sh scripts/doctor.sh scripts/install.sh
+./scripts/check.sh
 ```
 
 Firmware builds still require ESP-IDF:
 
 ```sh
 . $HOME/esp/esp-idf/export.sh
-./scripts/firmware.sh stickc_plus build
-./scripts/firmware.sh sticks3 build
+./scripts/check.sh --firmware
 ```
 
 ## Current limits
 
-- This is a cleaned prototype, not a packaged Mac app or DMG.
-- The firmware targets M5Stack StickS3 and M5StickC Plus; other devices are not declared supported.
-- Codex quota is inferred from local Codex session JSONL events with `rate_limits`; it is not an official quota API.
-- Claude usage comes from an undocumented Claude Code OAuth endpoint and is disabled by default.
-- ASR reliability depends on microphone capture, uploaded PCM quality, provider availability, and configured model.
+- Real-device regression, serial flashing, and live OTA verification require
+  connected hardware and a running CapsWriter service.
+- Cardputer has the smallest OTA margin and should be watched during future
+  feature growth.
 
 ## Contributing & Security
 

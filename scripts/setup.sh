@@ -206,6 +206,6 @@ fi
 
 printf '\n%s\n' "Next steps:"
 printf '%s\n' "1. Edit firmware/sticks3/include/vibe_stick_secrets.h with Wi-Fi SSID, password, and Mac IP."
-printf '%s\n' "2. Optionally edit .env with ASR settings such as VIBE_STICK_ASR_PROVIDER and VIBE_STICK_ASR_API_KEY."
+printf '%s\n' "2. Configure ASR, provider state, OTA serving, and paste behavior in CapsWriter."
 printf '%s\n' "3. Re-run scripts/setup.sh after changing firmware network settings to sync battery telemetry secrets."
 printf '%s\n' "4. Run scripts/doctor.sh to check the local setup before building or flashing."

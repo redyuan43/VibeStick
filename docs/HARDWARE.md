@@ -2,7 +2,8 @@
 
 ## Supported Devices
 
-VibeStick targets M5Stack StickS3 and M5StickC Plus.
+VibeStick targets M5Stack StickS3, M5StickC Plus 1.1, M5StickC Plus SE,
+and Cardputer Adv.
 
 The dedicated battery-telemetry firmware is separate from the main product
 firmware. It supports both boards for screen-on, Wi-Fi-connected discharge
@@ -57,7 +58,8 @@ The Wi-Fi network must be 2.4 GHz. If the SSID is a combined 2.4/5 GHz network a
 
 ## Flashing
 
-For the full Chinese install and upgrade guide covering both USB and OTA paths for StickS3 and M5StickC Plus, see [`INSTALL.zh-CN.md`](INSTALL.zh-CN.md).
+For the full Chinese install and upgrade guide covering all four targets, see
+[`INSTALL.zh-CN.md`](INSTALL.zh-CN.md).
 
 Load ESP-IDF into every new terminal before running `idf.py`:
 
@@ -72,7 +74,9 @@ Build or flash through the board-aware wrapper:
 ```sh
 scripts/firmware.sh sticks3 build
 scripts/firmware.sh stickc_plus build
-scripts/firmware.sh stickc_plus -p /dev/ttyUSB0 flash monitor
+scripts/firmware.sh stickc_plus_se build
+scripts/firmware.sh cardputer_adv build
+scripts/firmware.sh stickc_plus -p /dev/ttyUSB0 -b 115200 flash monitor
 ```
 
 If automatic flashing fails, put the device into download mode and retry:
@@ -80,12 +84,14 @@ If automatic flashing fails, put the device into download mode and retry:
 1. Plug the device into the computer with a data cable.
 2. Use the device-specific download-mode button sequence.
 3. Run `ls /dev/cu.*` to find the serial port.
-4. Retry `scripts/firmware.sh <board> -p <port> flash`.
+4. Retry `scripts/firmware.sh <board> -p <port> -b 115200 flash`.
 5. After flashing, wake the device and confirm the VibeStick home screen appears.
 
 ## Runtime Network
 
-The firmware talks to the Mac bridge by HTTP. The Mac bridge should listen on `0.0.0.0:8765` when the device is on the same Wi-Fi network.
+The firmware talks to the CapsWriter M5 bridge by HTTP. CapsWriter should
+listen on `0.0.0.0:8765` when the device is on the same Wi-Fi network. The
+Python service in this repository is battery telemetry only on `8878`.
 
 ## Battery-Test Firmware
 

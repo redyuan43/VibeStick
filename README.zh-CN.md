@@ -6,7 +6,9 @@
 
 ![VibeStick 语音输入流程，显示 StickS3 录音状态和 Mac HUD](assets/brand/voice-input-preview.png)
 
-VibeStick 把 M5Stack StickS3 / M5StickC Plus 变成一个桌面 AI agent 小终端：显示状态、5H/7D 用量、提醒音，并支持长按说话后自动转写粘贴到 Mac。
+VibeStick 把 M5Stack StickS3、M5StickC Plus、M5StickC Plus SE 和
+Cardputer Adv 变成桌面 AI agent 小终端：显示状态、5H/7D 用量、提醒音，
+并支持录音后自动转写粘贴到 Mac。
 
 VibeStick 面向 M5Stack StickS3 和 M5StickC Plus，不是 M5Stack 官方项目。Codex、Claude 等第三方 agent 名称只用于说明本地兼容工具和集成。
 
@@ -26,7 +28,7 @@ VibeStick 面向 M5Stack StickS3 和 M5StickC Plus，不是 M5Stack 官方项目
 只读实时曲线页面：
 
 ```text
-http://127.0.0.1:8765/telemetry
+http://127.0.0.1:8878/telemetry
 ```
 
 隔离构建、烧录、完整放电、CSV 导出和结果解释见
@@ -37,12 +39,13 @@ http://127.0.0.1:8765/telemetry
 - [ ] M5 StickS3 或 M5StickC Plus｜一根数据线｜一台电脑（最好是Mac）
 - [ ] Wi-Fi（必须是 2.4GHz） 名称｜Wi-Fi密码｜语音识别模型 API Key
 -  语音转写API key 推荐 SiliconFlow：<https://cloud.siliconflow.cn/i/7ZCoy9fU>。国内直连、有免费额度、OpenAI 兼容；演示视频用的就是 SiliconFlow。可改用其他 OpenAI 兼容服务的 `base_url` 和模型名称。
--  如要显示 Claude 5H/7D 用量（该功能默认关闭）。需要 Claude Code CLI（在终端运行 `claude` 后执行 `/login`），并在 `.env` 中设置 `VIBE_STICK_CLAUDE_USAGE=on`。
+- [ ] 已在 CapsWriter 中配置 ASR、provider 状态和粘贴权限。
 
 
 ## 安装
 
-详细安装、USB 烧录、Wi-Fi OTA、S3 / Plus 双设备固件说明见：[docs/INSTALL.zh-CN.md](docs/INSTALL.zh-CN.md)。
+详细安装、USB 烧录、Wi-Fi OTA 和四目标固件说明见：
+[docs/INSTALL.zh-CN.md](docs/INSTALL.zh-CN.md)。
 
 本地 Wi-Fi 密码、API key 和 token 的安全规则见：[docs/LOCAL_SECRETS.zh-CN.md](docs/LOCAL_SECRETS.zh-CN.md)。
 
@@ -62,19 +65,12 @@ cd VibeStick
 
 ```sh
 open -e firmware/sticks3/include/vibe_stick_secrets.h
-open -e .env
 ```
 
 在 `vibe_stick_secrets.h` 里填写 Wi-Fi 名称、Wi-Fi 密码、Mac bridge host。只要文件里还保留示例占位值，`scripts/setup.sh` 会尝试把 `VIBE_STICK_BRIDGE_HOST` 自动写成检测到的 en0 局域网 IP。需要记住多个地点的 2.4GHz Wi-Fi 时，可以在同一个 ignored 文件里增加 `VIBE_STICK_WIFI_PROFILES`；固件会把多组 profile 保存到 ESP NVS，普通 OTA 升级会保留。
 
-在 `.env` 里填写 ASR key 和需要的 provider 设置。默认推荐 SiliconFlow：
-
-```sh
-VIBE_STICK_ASR_PROVIDER=openai-compatible
-VIBE_STICK_ASR_BASE_URL=https://api.siliconflow.cn/v1
-VIBE_STICK_ASR_API_KEY=your-siliconflow-key
-VIBE_STICK_ASR_MODEL=FunAudioLLM/SenseVoiceSmall
-```
+ASR、provider 观察和粘贴行为在 CapsWriter 中配置，不在本仓库的
+`.env` 中配置。本仓库 `.env` 只供 `8878` 电池遥测服务使用。
 
 3. 👤 用 USB-C 数据线把 StickS3 插到 Mac。
 
@@ -93,26 +89,29 @@ fi
 
 也可以按 Espressif [官方指南](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32s3/get-started/index.html)安装。如果 `install.sh` 失败，请确认已安装 `git`、`python3`、`cmake`，或改按官方指南处理。如果 ESP-IDF 安装在其他位置，请调整路径。
 
-6. 构建并烧录固件。S3 和 Plus 是两个不同的固件目标，命令里的 board 参数必须和设备对应：
+6. 构建并烧录固件。四个固件目标相互独立，命令里的 board 参数必须和
+设备对应：
 
 ```sh
 ./scripts/firmware.sh sticks3 build
-./scripts/firmware.sh sticks3 -p /dev/ttyACM0 flash monitor
+./scripts/firmware.sh sticks3 -p /dev/ttyACM0 -b 115200 flash monitor
 ./scripts/firmware.sh stickc_plus build
-./scripts/firmware.sh stickc_plus -p /dev/ttyUSB0 flash monitor
+./scripts/firmware.sh stickc_plus -p /dev/ttyUSB0 -b 115200 flash monitor
 ```
 
-如果不知道端口，运行 `ls -l /dev/serial/by-id /dev/ttyACM* /dev/ttyUSB*`。等到终端出现 `Hash of data verified`。如果自动烧录失败，请让设备进入下载模式后重试。更完整的 USB/OTA 升级矩阵见 [安装文档](docs/INSTALL.zh-CN.md)。
+Plus SE 和 Cardputer Adv 分别使用 `stickc_plus_se`、`cardputer_adv`。
+所有板型串口烧录固定为 `115200`。如果不知道端口，运行
+`ls -l /dev/serial/by-id /dev/ttyACM* /dev/ttyUSB*`。等到终端出现
+`Hash of data verified`。如果自动烧录失败，请让设备进入下载模式后重试。
+更完整的 USB/OTA 升级矩阵见 [安装文档](docs/INSTALL.zh-CN.md)。
 
 7. 👤 短按电源键唤醒屏幕。蓝灯应熄灭、屏幕亮起，此时应看到 VibeStick 首页。联网前可能显示离线。
 
-8. 安装本机 macOS bridge 和 HUD：
+8. 在 `/home/ivan/github/capswriter-agx-client` 启动 CapsWriter M5 bridge，
+并确认它监听 `8765`。macOS App、ASR 和粘贴权限按 CapsWriter 项目说明配置。
 
-```sh
-./scripts/install.sh
-```
-
-9. 👤 当 macOS 弹出 `python3.14` 想用辅助功能控制这台电脑时，点击“打开系统设置”并勾选允许。粘贴转写结果需要这个权限。
+9. 👤 当 macOS 提示时，为 CapsWriter 应用授予辅助功能权限。粘贴转写
+结果需要这个权限。
 
 10. 检查安装状态：
 
@@ -120,21 +119,21 @@ fi
 ./scripts/doctor.sh
 ```
 
-尽量让必须项全部 PASS。然后看一眼 StickS3：如果本机 provider 数据可用，Codex / Claude 状态和 5H / 7D 应该出现真实值。
-
-如果 Codex 已经能用、而 Claude 那栏显示 `--%`，这是正常的：Claude 用量默认关闭（更安全）；如需显示，请设置 `VIBE_STICK_CLAUDE_USAGE=on`，并确保 Claude Code 已通过 `claude` 和 `/login` 登录。
+尽量让固件和遥测检查全部 PASS。CapsWriter 的生产 bridge 诊断在
+CapsWriter 项目内执行。
 
 11. 👤 打开任意文本框，单击正面蓝键开始说话，再单击一次发送。长按后松开仍保留按住说话模式。两种方式都会使用设备内置麦克风录音，VibeStick 应自动转写并粘贴。
 
 StickS3 和 M5StickC Plus 都支持拿起录音模式：默认 `PTT` 支持正面按键单击开关录音和长按说话。StickS3 长按侧键 3 秒进入设置；侧键单击不执行操作，快速双击才启动桥接搜网。进入设置后，短按侧键依次切换 `MODE`、`SLEEP`、`VERSION` 页面，短按正面键修改当前值，长按正面键 1.5 秒保存。`MODE` 可选 `PTT` 或 `LIFT`，`SLEEP` 可选 1、2、5、10 分钟（默认 5 分钟）。`LIFT` 会用设备平放状态做基线，拿起开始录音，放回桌面并稳定后发送识别。正面键按下或录音期间，机身状态灯会亮；进入深睡前会强制熄灭。
 
-开发调试时可以用 `./scripts/dev.sh` 替代 `./scripts/install.sh`，它会在当前终端里运行 bridge。
+本仓库的 `./scripts/dev.sh` 只启动 `8878` 电池遥测服务，不能替代
+CapsWriter 的语音和 OTA bridge。
 
 ## Wi-Fi OTA 固件更新
 
 当前固件使用双 OTA app 分区。第一次从旧 single-app 分区升级到双 OTA 分区时，仍然需要通过 USB 烧录一次完整固件；完成这一次后，后续固件可以通过同一 Wi-Fi 下的 bridge 发布。
 
-OTA 也分 S3 和 Plus 两个版本，不能混用。构建并发布 OTA 包：
+OTA 也按四个目标独立发布，不能混用。构建并发布 OTA 包：
 
 ```sh
 . "$HOME/esp/esp-idf/export.sh"
@@ -142,9 +141,16 @@ OTA 也分 S3 和 Plus 两个版本，不能混用。构建并发布 OTA 包：
 ./scripts/ota_publish.sh sticks3
 ./scripts/firmware.sh stickc_plus build
 ./scripts/ota_publish.sh stickc_plus
+./scripts/firmware.sh stickc_plus_se build
+./scripts/ota_publish.sh stickc_plus_se
+./scripts/firmware.sh cardputer_adv build
+./scripts/ota_publish.sh cardputer_adv
 ```
 
-发布后的文件会写入 `firmware/sticks3/ota/`，bridge 会通过 `/ota/manifest?board=...` 和 `/ota/bin?board=...` 提供给设备。设备连上 Wi-Fi 后会自动检查；发现 build id 不同的新固件时，会下载到备用 OTA 分区、切换启动分区并重启。
+四个目标的版本、二进制和 manifest 相互独立。发布后的文件会写入
+`firmware/sticks3/ota/`，CapsWriter 会通过 `/ota/manifest?board=...`
+和 `/ota/bin?board=...` 提供给设备。设备只接受语义化版本严格高于当前
+运行版本的 manifest；仅 hash 或 build ID 不同不能触发降级。
 完整升级说明见 [docs/INSTALL.zh-CN.md](docs/INSTALL.zh-CN.md)。
 
 ## 常见问题排查
@@ -161,7 +167,9 @@ ESP-IDF 没有加载到当前 shell，或者还没有安装。先 source ESP-IDF
 
 ### 烧录报 "Device not configured" 或连不上串口
 
-重新插拔 USB-C 数据线。再次进入下载模式：长按侧面电源键，直到蓝灯双闪、屏幕熄灭。运行 `ls /dev/cu.*` 找端口，然后重试 `idf.py -p <port> build flash`。
+重新插拔 USB-C 数据线。再次进入下载模式：长按侧面电源键，直到蓝灯
+双闪、屏幕熄灭。运行 `ls /dev/cu.*` 找端口，然后重试
+`./scripts/firmware.sh <board> -p <port> -b 115200 build flash`。
 
 ### StickS3 连不上 Wi-Fi
 
@@ -169,19 +177,16 @@ ESP-IDF 没有加载到当前 shell，或者还没有安装。先 source ESP-IDF
 
 ### 录音能转写但没有粘贴
 
-给执行粘贴的 Python runner 开辅助功能权限。macOS 路径：系统设置 -> 隐私与安全性 -> 辅助功能，然后允许 `python3.14` 或运行 VibeStick 的终端 / 启动器。
+检查 CapsWriter 的辅助功能权限和粘贴诊断。本仓库的 Python 遥测进程
+不会执行粘贴。
 
 ### "No transcription adapter configured"
 
-在 `.env` 里配置 ASR，尤其是 `VIBE_STICK_ASR_PROVIDER`、`VIBE_STICK_ASR_BASE_URL`、`VIBE_STICK_ASR_API_KEY`，然后重新安装：
-
-```sh
-./scripts/install.sh
-```
+在 CapsWriter 中配置 ASR。本仓库没有转写 adapter。
 
 ### 找不到 `.env`
 
-`.env` 是隐藏文件。用下面命令打开：
+`.env` 是仅供本地遥测脚本使用的隐藏文件。用下面命令打开：
 
 ```sh
 open -e .env
@@ -189,76 +194,19 @@ open -e .env
 
 ### 录音转写失败、SSL 报错或超时
 
-通常是当前网络访问不到所选 ASR 服务。国内用户建议换 SiliconFlow：<https://cloud.siliconflow.cn/i/7ZCoy9fU>。也可以配置其他可访问的 OpenAI 兼容 ASR，或配置网络代理。
+使用 CapsWriter 的 ASR 诊断和配置。本固件只向 `8765` 的 CapsWriter
+上传 PCM。
 
-## 配置说明
+## 配置归属
 
 不要把真实 API key、本地 token、Wi-Fi 密码、本地日志、录音文件提交到 git。
 
-`.env` 里的空值通常表示“使用内置默认值”。`scripts/dev.sh` 会读取仓库根目录的 `.env`。`scripts/install.sh` 会把 `.env` 复制到 `~/Library/Application Support/VibeStick/.env`，LaunchAgent 运行时读取安装后的文件。
-
-### 核心设置
-
-- `VIBE_STICK_PROJECT_ROOT`：本地 Codex session 观察路径。
-- `VIBE_STICK_PROJECT_NAME`：可选显示名称。
-- `VIBE_STICK_PROVIDER`：当前 provider，`auto`、`codex` 或 `claude`；默认 `auto`。
-- `VIBE_STICK_BRIDGE_TOKEN`：bridge 绑定到非 loopback 地址时必需的共享 token，例如 `0.0.0.0`。
-- `VIBE_STICK_MAX_RECORDING_AUDIO_BYTES`：`/recording/audio` 最大请求体大小，默认 `2000000`。
-- `VIBE_STICK_RECORDING_USE_MAC_MIC`：设为 `0` 可关闭 Mac 麦克风兜底。
-- `VIBE_STICK_AUTO_ENTER`：设为 `1` 会在粘贴后自动按 Return。
-
-### ASR 方案 1：SiliconFlow（默认推荐）
-
-```sh
-VIBE_STICK_ASR_PROVIDER=openai-compatible
-VIBE_STICK_ASR_BASE_URL=https://api.siliconflow.cn/v1
-VIBE_STICK_ASR_API_KEY=your-siliconflow-key
-VIBE_STICK_ASR_MODEL=FunAudioLLM/SenseVoiceSmall
-VIBE_STICK_ASR_LANGUAGE=zh
-VIBE_STICK_ASR_TIMEOUT_SECONDS=15
-VIBE_STICK_ASR_ATTEMPTS=2
-```
-
-使用云端 ASR 时，音频会离开本机 Mac。
-
-### ASR 方案 2：任意 OpenAI 兼容服务
-
-只要服务支持 `POST {base_url}/audio/transcriptions` 即可。
-
-```sh
-VIBE_STICK_ASR_PROVIDER=openai-compatible
-VIBE_STICK_ASR_BASE_URL=https://example.com/v1
-VIBE_STICK_ASR_API_KEY=your-api-key
-VIBE_STICK_ASR_MODEL=provider-model-name
-```
-
-Groq 也作为海外可选 preset 保留：
-
-```sh
-VIBE_STICK_ASR_PROVIDER=groq
-VIBE_STICK_ASR_API_KEY=your-groq-key
-```
-
-旧别名 `VIBE_STICK_GROQ_API_KEY`、`VIBE_STICK_GROQ_MODEL`、`VIBE_STICK_GROQ_LANGUAGE` 仍然支持。
-
-### ASR 方案 3：本地命令（离线）
-
-```sh
-VIBE_STICK_TRANSCRIBE_CMD=/path/to/transcribe-command
-VIBE_STICK_TRANSCRIBE_TIMEOUT_SECONDS=120
-```
-
-这个命令会从 stdin 收到录音 session JSON，并应把最终转写文本打印到 stdout。
-
-### Claude 用量
-
-想显示 Claude 5H/7D 用量，请使用 `VIBE_STICK_PROVIDER=claude` 或 `VIBE_STICK_PROVIDER=auto`，设置 `VIBE_STICK_CLAUDE_USAGE=on`，并确保 Claude Code CLI 已在终端通过 `claude` 和 `/login` 登录。
-
-- `VIBE_STICK_CLAUDE_USAGE`：设为 `on` 后获取真实 Claude Code 订阅用量；默认 `off`。
-- `CLAUDE_CODE_OAUTH_TOKEN`：可选 Claude Code OAuth access token。未设置时，bridge 会尝试读取本机 Claude Code keychain / 文件凭据。
-- `VIBE_STICK_CLAUDE_USAGE_INTERVAL_SECONDS`：Claude 用量轮询间隔，默认 `300`，最小 `30`。
-
-Claude usage 会使用用户本机 Claude Code 订阅凭据和 client headers 调用未公开的 Anthropic endpoint。它是 opt-in，可能随时失效；bridge HTTP API 不会暴露 token 或原始 endpoint 响应。如果从未成功抓取过 Claude usage，StickS3 会显示 `--%`；成功抓取后，临时刷新失败会保留上一次值并标记 stale。
+- `firmware/sticks3/include/vibe_stick_secrets.h`：设备 Wi-Fi、
+  `192.168.31.225:8765` CapsWriter 地址、bridge profiles 和设备 token。
+- `.env`：本地电池遥测的 `VIBE_STICK_TELEMETRY_TOKEN`、
+  `VIBE_STICK_TELEMETRY_PORT` 和 `VIBE_STICK_TELEMETRY_URL`。
+- CapsWriter 配置：ASR、provider 状态、quota、设备注册、录音、OTA
+  服务和粘贴行为。
 
 ## 项目结构
 
@@ -279,26 +227,20 @@ VibeStick/
 ## 检查命令
 
 ```sh
-python3 -m compileall -q bridge/src tests
-PYTHONPATH=bridge/src python3 -m unittest discover -s tests
-bash -n scripts/setup.sh scripts/doctor.sh scripts/install.sh
+./scripts/check.sh
 ```
 
 固件构建仍需要 ESP-IDF：
 
 ```sh
 . $HOME/esp/esp-idf/export.sh
-./scripts/firmware.sh stickc_plus build
-./scripts/firmware.sh sticks3 build
+./scripts/check.sh --firmware
 ```
 
 ## 当前限制
 
-- 这是整理后的原型，不是打包好的 Mac app 或 DMG。
-- 固件面向 M5Stack StickS3 和 M5StickC Plus；其他设备未声明支持。
-- Codex quota 来自本地 Codex session JSONL 里的 `rate_limits`，不是官方 quota API。
-- Claude usage 来自未公开的 Claude Code OAuth endpoint，默认关闭。
-- ASR 可靠性取决于麦克风采集、上传 PCM 质量、provider 可达性和模型配置。
+- 真机回归、串口烧录和实时 OTA 校验需要连接硬件并启动 CapsWriter。
+- Cardputer 的 OTA 余量最小，后续增加功能时需要持续关注。
 
 ## 贡献与安全
 

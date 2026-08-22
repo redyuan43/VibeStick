@@ -37,7 +37,7 @@ case "$board" in
   sticks3)
     chip="esp32s3"
     project="firmware/telemetry/sticks3"
-    flash_baud="${VIBE_STICK_FLASH_BAUD:-460800}"
+    flash_baud="${VIBE_STICK_FLASH_BAUD:-115200}"
     ;;
   stickc_plus_11)
     chip="esp32"
@@ -49,6 +49,11 @@ case "$board" in
     exit 2
     ;;
 esac
+
+if [[ "$flash_baud" != "115200" ]]; then
+  echo "Battery firmware flashing is fixed at 115200 baud." >&2
+  exit 2
+fi
 
 if ! command -v idf.py >/dev/null 2>&1; then
   echo "idf.py not found. Source ESP-IDF 5.5.1 export.sh first." >&2

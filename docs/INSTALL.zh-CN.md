@@ -1,14 +1,18 @@
 # VibeStick 安装与固件升级
 
-本文档说明如何安装 VibeStick、编译固件，以及通过 USB 或 Wi-Fi OTA 升级两种设备版本：
+本文档说明如何安装 VibeStick、编译固件，以及通过 USB 或 Wi-Fi OTA
+升级四个独立设备目标：
 
-| 设备 | board 参数 | USB 升级 | OTA 升级 |
-| --- | --- | --- | --- |
-| M5Stack StickS3 | `sticks3` | 支持 | 支持 |
-| M5StickC Plus | `stickc_plus` | 支持 | 支持 |
-| M5StickC Plus SE | `stickc_plus_se` | 支持 | 不支持（该板无 IMU） |
+| 设备 | board 参数 | USB | OTA | 运动能力 |
+| --- | --- | --- | --- | --- |
+| M5Stack StickS3 | `sticks3` | 支持 | 支持 | IMU / LIFT |
+| M5StickC Plus 1.1 | `stickc_plus` | 支持 | 支持 | IMU / LIFT |
+| M5StickC Plus SE | `stickc_plus_se` | 支持 | 支持 | 无 IMU，禁用 LIFT |
+| Cardputer Adv | `cardputer_adv` | 支持 | 支持 | 键盘 / Opt / air mouse |
 
-S3 和 Plus 的固件不能混用。USB 烧录会写入 bootloader、partition table 和 app；OTA 只发布 app bin，要求设备已经有 OTA 分区布局。
+四个目标的固件、版本号、NVS 兼容验证和 OTA channel 不能混用。USB
+烧录会写入 bootloader、partition table 和 app；OTA 只发布 app bin，
+要求设备已经有 OTA 分区布局。
 
 ## 1. 准备环境
 
@@ -24,14 +28,17 @@ cd ~/github/VibeStick
 ./scripts/setup.sh
 ```
 
-本地账号、密码、API key 和 token 的提交规则见：[本地密钥与 Wi-Fi 配置](LOCAL_SECRETS.zh-CN.md)。
+本地密码和 token 的提交规则见：
+[本地密钥与 Wi-Fi 配置](LOCAL_SECRETS.zh-CN.md)。
 
-编辑固件和 bridge 配置：
+编辑固件网络配置：
 
 ```sh
 open -e firmware/sticks3/include/vibe_stick_secrets.h
-open -e .env
 ```
+
+本仓库 `.env` 只配置 `8878` 电池遥测服务。ASR、provider、录音、OTA
+服务和粘贴行为在 CapsWriter 项目中配置。
 
 `vibe_stick_secrets.h` 至少需要填写：
 
@@ -84,6 +91,8 @@ Linux 上常见端口：
 | --- | --- |
 | StickS3 | `/dev/ttyACM0` |
 | M5StickC Plus | `/dev/ttyUSB0` |
+| M5StickC Plus SE | `/dev/ttyUSB0` |
+| Cardputer Adv | `/dev/ttyACM0` |
 
 实际端口以本机枚举为准：
 
@@ -104,7 +113,7 @@ USB 是最稳的升级方式，也是在切换到 OTA 分区布局时必须执�
 烧录 S3：
 
 ```sh
-./scripts/firmware.sh sticks3 -p /dev/ttyACM0 flash monitor
+./scripts/firmware.sh sticks3 -p /dev/ttyACM0 -b 115200 flash monitor
 ```
 
 编译 Plus：
@@ -116,13 +125,18 @@ USB 是最稳的升级方式，也是在切换到 OTA 分区布局时必须执�
 烧录 Plus：
 
 ```sh
-./scripts/firmware.sh stickc_plus -p /dev/ttyUSB0 flash monitor
+./scripts/firmware.sh stickc_plus -p /dev/ttyUSB0 -b 115200 flash monitor
 
 # Plus SE 与 Plus 1.1 都使用 FTDI 串口；固定使用 115200。
 ./scripts/firmware.sh stickc_plus_se -p /dev/ttyUSB0 -b 115200 flash monitor
+
+# Cardputer Adv
+./scripts/firmware.sh cardputer_adv -p /dev/ttyACM0 -b 115200 flash monitor
 ```
 
-如果自动烧录失败，让设备进入下载模式后重试。烧录完成后终端应出现 `Hash of data verified`。
+`scripts/firmware.sh` 会拒绝任何非 `115200` 的 flash 波特率。如果自动
+烧录失败，让设备进入下载模式后重试。烧录完成后终端应出现
+`Hash of data verified`。
 
 ## 5. Wi-Fi OTA 编译和发布
 
@@ -142,11 +156,33 @@ CapsWriter 的语音和 OTA bridge。
 ./scripts/ota_publish.sh sticks3
 ```
 
+也可以用统一发布脚本，但必须显式指定受影响目标：
+
+```sh
+./scripts/release-firmware.sh sticks3
+
+# 本次公共架构重构影响四板：
+./scripts/release-firmware.sh all
+```
+
+服务或设备暂时不可用时可先执行
+`./scripts/release-firmware.sh --local-only <board...|all>`；这只完成本地
+构建、容量检查、OTA 发布和 manifest 校验，不代表最终交付完成。
+
 发布 Plus OTA：
 
 ```sh
 ./scripts/firmware.sh stickc_plus build
 ./scripts/ota_publish.sh stickc_plus
+```
+
+发布 Plus SE 和 Cardputer Adv OTA：
+
+```sh
+./scripts/firmware.sh stickc_plus_se build
+./scripts/ota_publish.sh stickc_plus_se
+./scripts/firmware.sh cardputer_adv build
+./scripts/ota_publish.sh cardputer_adv
 ```
 
 OTA 文件会写入：
@@ -163,7 +199,23 @@ CapsWriter bridge 会通过下面两个接口提供 OTA：
 /ota/bin?board=sticks3
 ```
 
-Plus 对应把 `sticks3` 换成 `stickc_plus`。设备连上 Wi-Fi 后会自动检查 manifest；发现新的 build id 或 elf sha 后，下载到备用 OTA 分区、切换启动分区并重启。
+其他目标对应把 `sticks3` 换成 `stickc_plus`、`stickc_plus_se` 或
+`cardputer_adv`。设备连上 Wi-Fi 后会自动检查 manifest；只有 manifest
+的语义化版本严格高于运行版本才允许下载。相同或更低版本即使 hash、
+ELF hash 或 build ID 不同也必须拒绝。
+
+发布后必须从实时 CapsWriter 服务逐板核对：
+
+```sh
+curl -fsS "http://192.168.31.225:8765/ota/manifest?board=sticks3"
+curl -fsS "http://192.168.31.225:8765/ota/manifest?board=stickc_plus"
+curl -fsS "http://192.168.31.225:8765/ota/manifest?board=stickc_plus_se"
+curl -fsS "http://192.168.31.225:8765/ota/manifest?board=cardputer_adv"
+```
+
+返回的 `version`、`build_id`、`size`、`sha256` 和 `elf_sha256` 必须与
+刚生成的本地 manifest 一致。随后逐板确认设备启动日志报告新版本，并
+验证 OTA 安装成功以及低版本 manifest 被拒绝。
 
 ## 6. 选择 USB 还是 OTA
 
@@ -173,7 +225,7 @@ Plus 对应把 `sticks3` 换成 `stickc_plus`。设备连上 Wi-Fi 后会自动�
 | 修改了 partition table / bootloader / sdkconfig 分区布局 | USB |
 | Wi-Fi 链路不稳定、OTA 很慢或失败 | USB |
 | 日常只更新 app 代码，Wi-Fi 稳定 | OTA |
-| 同时接着 S3 和 Plus，分别更新两台 | 分别用对应 board 参数 |
+| 同时更新多种板型 | 分别用对应 board 参数构建、发布和验证 |
 
 当前如果 S3 OTA 传输出现高延迟、长时间卡在几十 KB TCP 队列、或者 ping 超过几百毫秒，优先改用 USB 烧录。
 
@@ -193,13 +245,15 @@ ping -c 10 <S3-IP>
 
 部分 S3 的 USB/JTAG 串口不一定能被 esptool 成功 hard reset。烧录完成后手动按 Reset 键启动 app。
 
-### Plus 和 S3 固件会不会混
+### 四个目标的固件会不会混
 
 不会，只要命令里的 board 参数正确：
 
 ```sh
 ./scripts/firmware.sh sticks3 ...
 ./scripts/firmware.sh stickc_plus ...
+./scripts/firmware.sh stickc_plus_se ...
+./scripts/firmware.sh cardputer_adv ...
 ```
 
 脚本会使用不同的 build 目录、sdkconfig 和 CMake board 定义。

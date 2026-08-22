@@ -61,7 +61,7 @@ require_bridge_token_ready() {
   secret_token="$(secret_value VIBE_STICK_BRIDGE_TOKEN "$SECRETS_PATH")"
 
   if is_placeholder_token "$env_token"; then
-    printf '%s\n' "VIBE_STICK_BRIDGE_TOKEN is required because install.sh exposes the bridge on 0.0.0.0." >&2
+    printf '%s\n' "VIBE_STICK_BRIDGE_TOKEN is required because install.sh exposes telemetry on 0.0.0.0:8878." >&2
     printf '%s\n' "Run scripts/setup.sh to generate and sync the bridge token." >&2
     exit 1
   fi
@@ -72,7 +72,7 @@ require_bridge_token_ready() {
   fi
   if [ "$env_token" != "$secret_token" ]; then
     printf '%s\n' "VIBE_STICK_BRIDGE_TOKEN differs between .env and firmware secrets." >&2
-    printf '%s\n' "Refusing to install because the device would receive 401 responses for protected POST requests." >&2
+    printf '%s\n' "Refusing to install until telemetry and firmware share the intended device token." >&2
     exit 1
   fi
 }

@@ -140,7 +140,7 @@ check_dotenv() {
 
   env_token="$(env_value VIBE_STICK_BRIDGE_TOKEN "$ENV_PATH")"
   if is_placeholder_token "$env_token"; then
-    warn "VIBE_STICK_BRIDGE_TOKEN is empty or placeholder; binding 0.0.0.0 would be unsafe and install/dev scripts will refuse it."
+    warn "VIBE_STICK_BRIDGE_TOKEN is empty or placeholder; exposing telemetry on 0.0.0.0 would be unsafe and install/dev scripts will refuse it."
   else
     pass "VIBE_STICK_BRIDGE_TOKEN is set in .env."
   fi
@@ -187,12 +187,12 @@ check_token_match() {
   secret_token="$(secret_value VIBE_STICK_BRIDGE_TOKEN "$SECRETS_PATH")"
   if [ "$env_token" = "$secret_token" ]; then
     if is_placeholder_token "$env_token"; then
-      warn "Bridge tokens match but are empty or placeholder."
+      warn "Shared device tokens match but are empty or placeholder."
     else
-      pass "Bridge token matches between .env and firmware secrets."
+      pass "Shared device token matches between .env and firmware secrets."
     fi
   else
-    fail "Bridge token differs between .env and firmware secrets; button POST requests will get 401."
+    fail "Shared device token differs between .env and firmware secrets; sync it with CapsWriter before normal device use."
   fi
 }
 

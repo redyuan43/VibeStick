@@ -1,0 +1,18 @@
+{
+  "sticks3": {
+    "baseline_size": 1626880,
+    "ota_partition_size": 1843200
+  },
+  "stickc_plus": {
+    "baseline_size": 1573264,
+    "ota_partition_size": 1740800
+  },
+  "stickc_plus_se": {
+    "baseline_size": 1561936,
+    "ota_partition_size": 1740800
+  },
+  "cardputer_adv": {
+    "baseline_size": 1723024,
+    "ota_partition_size": 1843200
+  }
+}

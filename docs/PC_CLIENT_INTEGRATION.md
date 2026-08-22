@@ -189,6 +189,8 @@ Supported board names:
 
 - `sticks3`
 - `stickc_plus`
+- `stickc_plus_se`
+- `cardputer_adv`
 
 When no update is available, return:
 
@@ -206,7 +208,7 @@ When an update is available, return a manifest shaped like:
   "available": true,
   "board": "stickc_plus",
   "version": "v0.1.4-3-gdirty",
-  "build_id": "Jul  5 2026 18:17:38 05bab9f8ded0",
+  "build_id": "stickc_plus-v0.1.40",
   "project_name": "vibe_stick_stickc_plus",
   "idf_version": "v5.5.1",
   "size": 1468000,
@@ -217,8 +219,10 @@ When an update is available, return a manifest shaped like:
 }
 ```
 
-The firmware compares `elf_sha256` first. If the current firmware ELF hash
-matches the manifest, it skips the update.
+The firmware must reject a manifest whose semantic version is equal to or
+lower than the running firmware version. A changed build ID, binary hash, or
+ELF hash never authorizes a downgrade. For a strictly newer version, matching
+hashes may still be used to skip a redundant transfer.
 
 The firmware downloads the binary from:
 
@@ -250,6 +254,8 @@ Expected files:
 ```text
 stickc_plus.json
 stickc_plus.bin
+stickc_plus_se.json
+stickc_plus_se.bin
 sticks3.json
 sticks3.bin
 cardputer_adv.json
@@ -298,6 +304,10 @@ Before shipping a PC client integration:
   `firmware/sticks3/ota`.
 - `GET /ota/bin?board=stickc_plus` returns the exact binary referenced by the
   manifest.
+- The same checks pass independently for `sticks3`, `stickc_plus_se`, and
+  `cardputer_adv`.
+- Every live manifest matches the locally published version, build ID, size,
+  SHA-256, and ELF SHA.
 - The bridge logs OTA manifest and binary requests with remote IP, board, and
   result; this makes field debugging much faster.
 

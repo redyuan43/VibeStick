@@ -34,5 +34,6 @@ esp_err_t vibe_cardputer_messages_init(
 esp_err_t vibe_cardputer_messages_start(void);
 bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event);
 bool vibe_cardputer_messages_active(void);
+bool vibe_cardputer_messages_busy(void);
 bool vibe_cardputer_messages_storage_ready(void);
 void vibe_cardputer_messages_release_display_resources(void);

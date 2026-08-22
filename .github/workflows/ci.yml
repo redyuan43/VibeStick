@@ -21,16 +21,21 @@ jobs:
         run: python3 -m compileall -q bridge/src tests
 
       - name: Run unit tests
-        run: PYTHONPATH=bridge/src python3 -m unittest discover -s tests
+        run: |
+          python3 -m pip install pytest
+          python3 -m pytest -q
 
       - name: Run firmware host tests
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libcjson-dev
           firmware/telemetry/tests/run-host-tests.sh
           firmware/sticks3/tests/run-host-tests.sh
 
       - name: Check shell and dashboard JavaScript
         run: |
-          bash -n scripts/setup.sh scripts/doctor.sh scripts/install.sh scripts/dev.sh scripts/battery-firmware.sh scripts/battery-test.sh
+          python3 scripts/check-firmware-architecture.py
+          bash -n scripts/setup.sh scripts/doctor.sh scripts/install.sh scripts/dev.sh scripts/battery-firmware.sh scripts/battery-test.sh scripts/check.sh scripts/check-firmware.sh
           node --check bridge/src/vibe_stick/web/telemetry/telemetry.js
 
   telemetry-firmware:
@@ -59,7 +64,7 @@ jobs:
     container: espressif/idf:v5.5.1
     strategy:
       matrix:
-        board: [sticks3, stickc_plus]
+        board: [sticks3, stickc_plus, stickc_plus_se, cardputer_adv]
 
     steps:
       - name: Check out repository
@@ -67,4 +72,12 @@ jobs:
 
       - name: Build VibeStick firmware
         shell: bash
-        run: scripts/firmware.sh "${{ matrix.board }}" build
+        run: |
+          scripts/firmware.sh "${{ matrix.board }}" build
+          python3 scripts/check-firmware-size.py "${{ matrix.board }}"
+
+      - name: Upload VibeStick firmware image
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibestick-${{ matrix.board }}
+          path: firmware/sticks3/build-${{ matrix.board }}/vibe_stick_${{ matrix.board }}.bin

@@ -97,6 +97,8 @@ static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_action_queue;
 static atomic_bool s_storage_ready;
 static atomic_bool s_active;
+static atomic_bool s_ui_transition;
+static atomic_bool s_sync_in_progress;
 static atomic_bool s_play_queued;
 static atomic_bool s_detail_active;
 static atomic_bool s_play_cancel;
@@ -625,7 +627,7 @@ static esp_err_t play_wav_file(const char *path)
     return err == ESP_OK ? end_err : err;
 }
 
-static void sync_once(void)
+static void sync_once_inner(void)
 {
     if (!s_config.request || !s_config.download ||
         !atomic_load(&s_storage_ready) || !atomic_load(&s_active)) return;
@@ -656,7 +658,7 @@ static void sync_once(void)
         cJSON *root = cJSON_Parse(response);
         free(response);
         if (!root) return;
-        if (atomic_load(&s_active)) {
+        if (!atomic_load(&s_active)) {
             cJSON_Delete(root);
             return;
         }
@@ -777,6 +779,16 @@ static void sync_once(void)
         (!s_config.audio_busy || !s_config.audio_busy())) {
         (void)play_wav_file(MESSAGE_NOTIFY_PATH);
     }
+}
+
+static void sync_once(void)
+{
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_sync_in_progress, &expected, true)) {
+        return;
+    }
+    sync_once_inner();
+    atomic_store(&s_sync_in_progress, false);
 }
 
 static void sync_task(void *argument)
@@ -1265,9 +1277,11 @@ static void handle_action(message_action_t action)
         break;
     case MESSAGE_ACTION_OPEN:
         open_messages();
+        atomic_store(&s_ui_transition, false);
         break;
     case MESSAGE_ACTION_CLOSE:
         close_messages();
+        atomic_store(&s_ui_transition, false);
         break;
     case MESSAGE_ACTION_LEFT:
     case MESSAGE_ACTION_RIGHT:
@@ -1298,6 +1312,8 @@ esp_err_t vibe_cardputer_messages_init(
                         "message action queue");
     atomic_store(&s_storage_ready, false);
     atomic_store(&s_active, false);
+    atomic_store(&s_ui_transition, false);
+    atomic_store(&s_sync_in_progress, false);
     atomic_store(&s_play_queued, false);
     return ESP_OK;
 }
@@ -1314,13 +1330,23 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
     if (!event) return false;
     if (!atomic_load(&s_active) && event->pressed && event->fn && event->row == 3 &&
         event->column == 8) {
+        if (atomic_load(&s_ui_transition) ||
+            atomic_load(&s_sync_in_progress)) {
+            return true;
+        }
+        if (s_config.audio_busy && s_config.audio_busy()) {
+            ESP_LOGI(TAG, "Fn+N ignored while Opt or recording is busy");
+            return true;
+        }
         bool storage_ready = atomic_load(&s_storage_ready);
         ESP_LOGI(TAG, "Fn+N shortcut storage_ready=%d",
                  storage_ready ? 1 : 0);
         if (!storage_ready) return true;
         atomic_store(&s_active, true);
+        atomic_store(&s_ui_transition, true);
         if (!enqueue_action(MESSAGE_ACTION_OPEN)) {
             atomic_store(&s_active, false);
+            atomic_store(&s_ui_transition, false);
         }
         return true;
     }
@@ -1362,7 +1388,11 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
     }
     if (action == MESSAGE_ACTION_CLOSE) {
         atomic_store(&s_active, false);
-        if (!enqueue_action(action)) atomic_store(&s_active, true);
+        atomic_store(&s_ui_transition, true);
+        if (!enqueue_action(action)) {
+            atomic_store(&s_active, true);
+            atomic_store(&s_ui_transition, false);
+        }
     } else {
         (void)enqueue_action(action);
     }
@@ -1374,6 +1404,13 @@ bool vibe_cardputer_messages_active(void)
     return atomic_load(&s_active);
 }
 
+bool vibe_cardputer_messages_busy(void)
+{
+    return atomic_load(&s_active) ||
+           atomic_load(&s_ui_transition) ||
+           atomic_load(&s_sync_in_progress);
+}
+
 bool vibe_cardputer_messages_storage_ready(void)
 {
     return atomic_load(&s_storage_ready);
@@ -1382,7 +1419,9 @@ bool vibe_cardputer_messages_storage_ready(void)
 void vibe_cardputer_messages_release_display_resources(void)
 {
     if (atomic_load(&s_active) || s_layer || s_chinese_font) {
+        atomic_store(&s_ui_transition, true);
         close_messages();
+        atomic_store(&s_ui_transition, false);
     }
 }
 
@@ -1401,6 +1440,7 @@ bool vibe_cardputer_messages_handle_key(const vibe_key_event_t *event)
     return false;
 }
 bool vibe_cardputer_messages_active(void) { return false; }
+bool vibe_cardputer_messages_busy(void) { return false; }
 bool vibe_cardputer_messages_storage_ready(void) { return false; }
 void vibe_cardputer_messages_release_display_resources(void) {}
 

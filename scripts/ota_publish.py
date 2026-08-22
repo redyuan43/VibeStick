@@ -75,13 +75,8 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def firmware_build_id(image: Path, fallback: str) -> str:
-    data = image.read_bytes()
-    pattern = rb"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ 0-9]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}"
-    matches = re.findall(pattern, data)
-    if not matches:
-        return fallback
-    return matches[-1].decode("ascii")
+def firmware_build_id(board: str, version: str) -> str:
+    return f"{board}-v{version}" if version else board
 
 
 def firmware_version(board: str) -> str:
@@ -114,10 +109,9 @@ def publish(board: str, image: Path) -> Path:
     shutil.copy2(image, target_image)
     file_sha256 = sha256(target_image)
     image_sha256 = info.get("validation_hash", "").split()[0] or file_sha256
-    compile_time = info.get("compile_time", "")
-    build_id = firmware_build_id(target_image, compile_time)
     elf_sha256 = info.get("elf_file_sha256", "").split()[0]
     version = firmware_version(board) or info.get("app_version", "")
+    build_id = firmware_build_id(board, version)
 
     manifest = {
         "available": True,

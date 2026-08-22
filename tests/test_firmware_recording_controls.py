@@ -3,24 +3,58 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MAIN_C = ROOT / "firmware" / "sticks3" / "src" / "main.c"
+MAIN_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_app_runtime.c"
 AUDIO_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_audio.c"
 BOARD_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_board.c"
 BOARD_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board.h"
 BOARD_PROFILE_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_board_profile.h"
 MOTION_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_motion.c"
 MOTION_H = ROOT / "firmware" / "sticks3" / "include" / "vibe_motion.h"
+MOTION_CONTROLLER_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_motion_controller.c"
+)
 INPUT_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_input.c"
+INPUT_ROUTER_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_input_router.c"
+)
 RECORDING_UPLOAD_C = (
     ROOT / "firmware" / "sticks3" / "src" / "vibe_recording_upload.c"
+)
+RECORDING_CONTROLLER_H = (
+    ROOT / "firmware" / "sticks3" / "include" / "vibe_recording_controller.h"
+)
+RECORDING_CONTROLLER_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_recording_controller.c"
+)
+POWER_RUNTIME_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_power_runtime.c"
+)
+OTA_RUNTIME_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_ota_runtime.c"
+)
+UI_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_ui.c"
+STATE_JSON_C = ROOT / "firmware" / "sticks3" / "src" / "vibe_state_json.c"
+WIFI_RUNTIME_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_wifi_runtime.c"
+)
+BRIDGE_REGISTRY_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_bridge_registry.c"
+)
+BRIDGE_CLIENT_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_bridge_client.c"
+)
+CARDPUTER_RUNTIME_C = (
+    ROOT / "firmware" / "sticks3" / "src" / "vibe_cardputer_runtime.c"
 )
 
 
 def test_front_single_click_toggles_device_recording() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    router = INPUT_ROUTER_C.read_text(encoding="utf-8")
 
     assert "VIBE_STICK_EVENT_RECORDING_TOGGLE" in source
-    assert "queue_event(VIBE_STICK_EVENT_RECORDING_TOGGLE);" in source
+    assert "queue_input_signal(VIBE_INPUT_SIGNAL_FRONT_SINGLE);" in source
+    assert "return VIBE_STICK_EVENT_RECORDING_TOGGLE;" in router
     assert 'handle_recording_start("button_tap_start", "TAP TO SEND")' in source
     assert 'handle_recording_stop("button_tap_stop")' in source
     assert "front tap toggle mode=%s" in source
@@ -29,6 +63,15 @@ def test_front_single_click_toggles_device_recording() -> None:
     assert "front gpio fallback down mode=%s" in source
     assert "front gpio fallback single duration=%lld mode=%s" in source
     assert 'post_simple_event("button_short", NULL)' not in source
+
+
+def test_recording_control_requests_do_not_wait_for_device_command_long_polls() -> None:
+    source = BRIDGE_CLIENT_C.read_text(encoding="utf-8")
+    request = source.split("esp_err_t vibe_bridge_client_request", 1)[1]
+
+    assert "esp_http_client_init(&config)" in request
+    assert "vibe_bridge_client_lock(bridge_client)" not in request
+    assert "vibe_bridge_client_unlock(bridge_client)" not in request
 
 
 def test_cyber_front_gpio_fallback_does_not_duplicate_iot_button_events() -> None:
@@ -158,6 +201,7 @@ def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
 
 def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    registry = BRIDGE_REGISTRY_C.read_text(encoding="utf-8")
     bridge_probe = source.split("static bool bridge_probe_discovered", 1)[1]
     bridge_probe = bridge_probe.split("static bool bridge_probe_profile", 1)[0]
     socket_wait = source.split("static void bridge_wait_for_socket_connections", 1)[1]
@@ -170,8 +214,10 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     task = task.split("static bool start_bridge_discovery_task", 1)[0]
     start_task = source.split("static bool start_bridge_discovery_task", 1)[1]
     start_task = start_task.split("static void bridge_ensure_target", 1)[0]
-    bridge_load = source.split("static esp_err_t bridge_target_load_nvs", 1)[1]
-    bridge_load = bridge_load.split("static esp_err_t bridge_target_save_nvs", 1)[0]
+    bridge_load = registry.split("static esp_err_t target_load", 1)[1]
+    bridge_load = bridge_load.split(
+        "esp_err_t vibe_bridge_registry_save_target", 1
+    )[0]
 
     assert 'http_request_target("GET", host, port, "", "/health"' in bridge_probe
     assert "k_configured_bridge_profiles[index].token" in bridge_probe
@@ -187,18 +233,18 @@ def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     assert "bridge_profiles_merge_scan_results" not in discovery
     assert "bridge_profiles_save_nvs" not in discovery
     assert "s_bridge_scan_profiles[s_bridge_scan_profile_count++] = *profile" in source
-    assert "vibe_bridge_profiles_merge(" in merge
-    assert "bridge_profiles_save_nvs(scan_ssid)" in merge
-    assert "changed" in merge
+    assert "vibe_bridge_registry_merge_scan(" in merge
+    assert "vibe_bridge_profiles_merge(" in registry
+    assert "profiles_save_current(registry, scan_ssid)" in registry
     assert task.count("bridge_profiles_merge_scan_results(scan_ssid)") == 1
     assert "bridge_discover_subnet_profiles()" in task
     assert "bridge_target_set_profile" not in task
     assert '"manual-search"' not in task
     assert "show_persistent_mode_switch_visual" in start_task
-    assert "BRIDGE_PROFILE_STORE_KEY" in source
-    assert "nvs_get_blob(handle, BRIDGE_PROFILE_STORE_KEY" in source
-    assert "nvs_set_blob(handle, BRIDGE_PROFILE_STORE_KEY" in source
-    assert "bridge_profile_index_by_id(profile_id)" in bridge_load
+    assert "BRIDGE_PROFILE_STORE_KEY" in registry
+    assert "nvs_get_blob(" in registry
+    assert "nvs_set_blob(" in registry
+    assert "vibe_bridge_registry_profile_index(registry, profile_id)" in bridge_load
 
 
 def test_bridge_discovery_fallback_id_is_bounded() -> None:
@@ -234,24 +280,25 @@ def test_battery_curves_are_board_specific_and_calibrated() -> None:
 
 def test_idle_pet_bobs_briefly_then_uses_a_low_frequency_static_timer() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
-    policy = (ROOT / "firmware/sticks3/src/vibe_bridge_profile_policy.c").read_text(
-        encoding="utf-8"
-    )
+    ui = UI_C.read_text(encoding="utf-8")
     activity = source.split("static void register_activity(void)\n{", 1)[1]
     activity = activity.split("static void update_power_saving", 1)[0]
-    update_pet = source.split("static void update_pet_visual(void)\n{", 1)[1]
+    ui_activity = ui.split("void vibe_ui_register_activity(vibe_ui_t *ui)", 1)[1]
+    ui_activity = ui_activity.split("void vibe_ui_complete_fast_resume", 1)[0]
+    update_pet = ui.split("static void update_pet(vibe_ui_impl_t *state)\n{", 1)[1]
     update_pet = update_pet.split("static void pet_timer_cb", 1)[0]
 
-    assert "#define VIBE_STICK_PET_ACTIVE_TIMER_MS 300" in source
-    assert "#define VIBE_STICK_PET_IDLE_TIMER_MS 1000" in source
-    assert "#define VIBE_STICK_PET_IDLE_BOB_STEPS 16" in source
-    assert "static int s_pet_idle_bob_steps_remaining;" in source
-    assert "s_pet_idle_bob_steps_remaining = VIBE_STICK_PET_IDLE_BOB_STEPS;" in activity
-    assert "lv_timer_set_period(s_pet_timer, VIBE_STICK_PET_ACTIVE_TIMER_MS);" in activity
-    assert "sequence.key != 0 || s_pet_idle_bob_steps_remaining > 0" in update_pet
-    assert "s_pet_idle_bob_steps_remaining--;" in update_pet
-    assert "set_pet_timer_period(VIBE_STICK_PET_IDLE_TIMER_MS);" in update_pet
-    assert "set_pet_vertical_offset(14);" in update_pet
+    assert "#define VIBE_UI_PET_ACTIVE_MS 300" in ui
+    assert "#define VIBE_UI_PET_IDLE_MS 1000" in ui
+    assert "#define VIBE_UI_PET_IDLE_BOB_STEPS 16" in ui
+    assert "int pet_idle_bob_steps_remaining;" in ui
+    assert "vibe_ui_register_activity(&s_ui);" in activity
+    assert "VIBE_UI_PET_IDLE_BOB_STEPS;" in ui_activity
+    assert "VIBE_UI_PET_ACTIVE_MS" in ui_activity
+    assert "state->pet_idle_bob_steps_remaining > 0" in update_pet
+    assert "state->pet_idle_bob_steps_remaining--;" in update_pet
+    assert "VIBE_UI_PET_IDLE_MS" in update_pet
+    assert "set_pet_offset(state, 14);" in update_pet
 
 
 def test_side_button_only_scans_on_double_click_and_arms_selection_window() -> None:
@@ -279,7 +326,7 @@ def test_side_button_only_scans_on_double_click_and_arms_selection_window() -> N
     assert "VIBE_STICK_EVENT_BRIDGE_SCAN_FULL" not in side_single
     assert "side button single click ignored; double click to scan" in side_single
     assert "VIBE_STICK_EVENT_SETTINGS_PAGE_NEXT" in side_single
-    assert "VIBE_STICK_EVENT_BRIDGE_SCAN_FULL" in side_double
+    assert "VIBE_INPUT_SIGNAL_SIDE_SCAN" in side_double
     assert "BRIDGE_SELECTION_ENTRY_WINDOW_MS" in side_double
     assert "VIBE_STICK_EVENT_BRIDGE_SELECTION_NEXT" not in side_double
     assert "start_bridge_discovery_task" not in cycle
@@ -321,13 +368,17 @@ def test_front_button_enters_persistent_bridge_selection_and_confirms_on_hold() 
 
 def test_full_scan_uses_probe_lock_but_saved_bridge_switch_does_not() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    registry = BRIDGE_REGISTRY_C.read_text(encoding="utf-8")
+    registry_header = (
+        ROOT / "firmware" / "sticks3" / "include" / "vibe_bridge_registry.h"
+    ).read_text(encoding="utf-8")
     discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
     discovery = discovery.split("static bool bridge_discovered_profile_equal", 1)[0]
     cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
     cycle = cycle.split("static esp_err_t bridge_prepare_active_target", 1)[0]
 
-    assert "static SemaphoreHandle_t s_bridge_probe_lock;" in source
-    assert "s_bridge_probe_lock = xSemaphoreCreateMutex();" in source
+    assert "SemaphoreHandle_t probe_lock;" in registry_header
+    assert "registry->probe_lock = xSemaphoreCreateMutex();" in registry
     assert "static void bridge_probe_lock(void)" in source
     assert "static void bridge_probe_unlock(void)" in source
     assert "bridge_probe_lock();" in discovery
@@ -345,34 +396,34 @@ def test_full_scan_uses_probe_lock_but_saved_bridge_switch_does_not() -> None:
 
 def test_bridge_profile_store_access_uses_lock_and_snapshots() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    registry = BRIDGE_REGISTRY_C.read_text(encoding="utf-8")
+    registry_header = (
+        ROOT / "firmware" / "sticks3" / "include" / "vibe_bridge_registry.h"
+    ).read_text(encoding="utf-8")
     policy = (ROOT / "firmware/sticks3/src/vibe_bridge_profile_policy.c").read_text(
         encoding="utf-8"
     )
-    snapshot_at = source.split("static bool bridge_profile_snapshot_at", 1)[1]
-    snapshot_at = snapshot_at.split("static bool bridge_target_profile_snapshot", 1)[0]
-    saved_snapshot = source.split("static bool bridge_saved_profile_snapshot_at", 1)[1]
-    saved_snapshot = saved_snapshot.split("static bool bridge_profile_snapshot_at", 1)[0]
+    snapshot_at = registry.split(
+        "bool vibe_bridge_registry_profile_snapshot", 1
+    )[1].split("bool vibe_bridge_registry_target_profile", 1)[0]
+    saved_snapshot = registry.split(
+        "bool vibe_bridge_registry_saved_profile_snapshot", 1
+    )[1].split("bool vibe_bridge_registry_profile_snapshot", 1)[0]
     merge = source.split("static bool bridge_profiles_merge_scan_results", 1)[1]
     merge = merge.split("static void bridge_discovery_task", 1)[0]
     cycle = source.split("static void cycle_bridge_profile(void)\n{", 1)[1]
     cycle = cycle.split("static esp_err_t bridge_prepare_active_target", 1)[0]
 
-    assert "static SemaphoreHandle_t s_bridge_profiles_lock;" in source
-    assert "s_bridge_profiles_lock = xSemaphoreCreateMutex();" in source
-    assert "static void bridge_profiles_lock(void)" in source
-    assert "static void bridge_profiles_unlock(void)" in source
-    assert "bridge_profiles_lock();" in snapshot_at
-    assert "bridge_profiles_unlock();" in snapshot_at
-    assert "vibe_bridge_profile_snapshot_from_discovered" in snapshot_at
-    assert "bridge_profiles_lock();" in merge
-    assert "bridge_profile_views_rebuild();" in merge
-    assert "vibe_bridge_profiles_merge(" in merge
-    assert "bridge_profiles_unlock();" in merge
-    assert merge.index("bridge_profiles_unlock();") < merge.index(
-        "bridge_profiles_save_nvs(scan_ssid)"
-    )
-    assert "bridge_profiles_lock();" in saved_snapshot
-    assert "vibe_bridge_profile_snapshot_from_discovered" in saved_snapshot
+    assert "SemaphoreHandle_t profiles_lock;" in registry_header
+    assert "registry->profiles_lock = xSemaphoreCreateMutex();" in registry
+    assert "profiles_lock(registry);" in snapshot_at
+    assert "profiles_unlock(registry);" in snapshot_at
+    assert "profiles_lock(registry);" in saved_snapshot
+    assert "profiles_unlock(registry);" in saved_snapshot
+    assert "profiles_lock(registry);" in registry
+    assert "profiles_unlock(registry);" in registry
+    assert "vibe_bridge_registry_merge_scan(" in merge
+    assert "vibe_bridge_profiles_merge(" in registry
     assert "bridge_saved_profile_snapshot_at(index, &profile)" in cycle
     assert "bridge_saved_profile_snapshot_at(next_index, &next)" in cycle
     assert "bool vibe_bridge_profiles_merge(" in policy
@@ -380,8 +431,9 @@ def test_bridge_profile_store_access_uses_lock_and_snapshots() -> None:
 
 def test_background_merge_keeps_active_target_and_wifi_identity_stable() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    registry = BRIDGE_REGISTRY_C.read_text(encoding="utf-8")
     target_lookup = source.split("static bool bridge_target_profile_snapshot", 1)[1]
-    target_lookup = target_lookup.split("static void bridge_profile_views_rebuild", 1)[0]
+    target_lookup = target_lookup.split("static void bridge_profiles_clear", 1)[0]
     discovery = source.split("static size_t bridge_discover_subnet_profiles", 1)[1]
     discovery = discovery.split("static bool bridge_profiles_merge_scan_results", 1)[0]
     merge = source.split("static bool bridge_profiles_merge_scan_results", 1)[1]
@@ -389,14 +441,19 @@ def test_background_merge_keeps_active_target_and_wifi_identity_stable() -> None
     task = source.split("static void bridge_discovery_task", 1)[1]
     task = task.split("static bool start_bridge_discovery_task", 1)[0]
 
-    assert "strcmp(profile->id, target->profile_id) == 0" in target_lookup
-    assert "k_configured_bridge_profiles" in target_lookup
+    assert "vibe_bridge_registry_target_profile(" in target_lookup
+    assert "target->profile_id) == 0" in registry
+    assert "registry->config.configured_profiles" in registry
     assert "target->profile_index" not in target_lookup
     assert "current_wifi_ssid(scan_ssid" in discovery
     assert "bridge_profiles_merge_scan_results" not in discovery
     assert "bridge_profiles_merge_scan_results(scan_ssid)" in task
-    assert "strcmp(current_ssid, scan_ssid) != 0" in merge
-    assert "bridge_profiles_save_nvs(scan_ssid)" in merge
+    assert "vibe_bridge_registry_merge_scan(" in merge
+    merge_runtime = registry.split(
+        "bool vibe_bridge_registry_merge_scan", 1
+    )[1].split("esp_err_t vibe_bridge_registry_upsert_manual", 1)[0]
+    assert "strcmp(ssid, scan_ssid) != 0" in merge_runtime
+    assert "profiles_save_current(registry, scan_ssid)" in merge_runtime
 
 
 def test_rediscovered_bridge_address_refreshes_active_target() -> None:
@@ -414,31 +471,39 @@ def test_rediscovered_bridge_address_refreshes_active_target() -> None:
 
 def test_concurrent_bridge_switch_ignores_stale_network_results() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    registry = BRIDGE_REGISTRY_C.read_text(encoding="utf-8")
     note_result = source.split("static void bridge_target_note_result", 1)[1]
     note_result = note_result.split("static bool bridge_target_needs_selection", 1)[0]
     request = source.split("static esp_err_t http_request_timeout", 1)[1]
     request = request.split("static esp_err_t http_request(", 1)[0]
 
     assert "expected_profile_id" in note_result
-    assert "strcmp(s_bridge_target.profile_id, expected_profile_id) != 0" in note_result
-    assert "bridge result ignored for stale profile id=%s" in note_result
+    assert "vibe_bridge_registry_note_result(" in note_result
+    assert "strcmp(registry->target.profile_id, expected_profile_id) != 0" in registry
+    assert "bridge result ignored for stale profile id=%s" in registry
     assert "bridge_target_note_result(target.profile_id, err);" in request
 
 
 def test_background_scan_uses_atomic_recording_lifecycle_flags() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
+    controller_header = RECORDING_CONTROLLER_H.read_text(encoding="utf-8")
+    controller = RECORDING_CONTROLLER_C.read_text(encoding="utf-8")
     busy = source.split("static bool recording_network_busy", 1)[1]
-    busy = busy.split("static agent_state_t", 1)[0]
+    busy = busy.split("static vibe_app_state_t", 1)[0]
 
-    assert "static atomic_bool s_recording_session_active;" in source
+    assert "atomic_bool session_active;" in controller_header
+    assert "atomic_bool finalize_active;" in controller_header
+    assert "atomic_store(&controller->session_active" in controller
     assert "static atomic_bool s_active;" in upload_source
     assert "atomic_load(&s_recording_session_active)" in busy
     assert "vibe_recording_upload_active()" in busy
     assert "s_recording_session_id[0]" not in busy
     assert "s_recording_upload_task" not in busy
-    assert "set_recording_session_active(true);" in source
-    assert "set_recording_session_active(false);" in source
+    assert "recording_begin_session(session_id, notify_bridge)" in source
+    assert "recording_reset_session();" in source
+    assert "atomic_store(&controller->session_active, true);" in controller
+    assert "atomic_store(&controller->session_active, false);" in controller
     assert "atomic_exchange(&s_active, true)" in upload_source
     assert "atomic_store(&s_active, false);" in upload_source
     assert "xSemaphoreTake(s_completion, portMAX_DELAY)" in upload_source
@@ -490,7 +555,7 @@ def test_discovery_supports_legacy_and_generic_bridge_identity() -> None:
 def test_serial_debug_command_uses_the_side_button_event_path() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     serial_task = source.split("static void serial_debug_task", 1)[1]
-    serial_task = serial_task.split("void app_main", 1)[0]
+    serial_task = serial_task.split("void vibe_app_runtime_start", 1)[0]
 
     assert "esp_rom_output_rx_one_char(&input)" in serial_task
     assert "usb_serial_jtag_driver_install(&usb_config)" in serial_task
@@ -567,6 +632,7 @@ def test_followup_enter_and_escape_use_distinct_buzz_sounds() -> None:
 def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
+    wifi_source = WIFI_RUNTIME_C.read_text(encoding="utf-8")
 
     assert "chunk_id=%lu" in source
     assert "chunk_crc32=%08lx" in source
@@ -576,13 +642,17 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     assert '\\"total_chunks\\":%lu' in source
     assert '\\"total_bytes\\":%lu' in source
     assert "recording stopped automatically after audio upload failure" in source
-    assert "s_recording_chunk_id++" in source
+    controller = RECORDING_CONTROLLER_C.read_text(encoding="utf-8")
+    assert "VIBE_RECORDING_COMMAND_NOTE_CHUNK" in source
+    assert "controller->chunk_id++;" in controller
+    assert "controller->uploaded_bytes +=" in controller
     assert "RECORDING_UPLOAD_HTTP_TIMEOUT_MS 5000" in source
     assert ".timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS" in source
     assert "RECORDING_UPLOAD_RETRY_COUNT 3" in upload_source
     assert "set_failed();\n            break;" in upload_source
     assert "recording diagnostics board=%s" in upload_source
-    assert "esp_wifi_sta_get_ap_info" in source
+    assert "esp_wifi_sta_get_ap_info" in wifi_source
+    assert "vibe_wifi_runtime_rssi(&s_wifi)" in source
     assert "post_ms_min" in upload_source
     assert "vibe_recording_upload_log_diagnostics" in source
 
@@ -605,6 +675,64 @@ def test_cardputer_recording_reuses_http_client_and_reports_profile_revision() -
     assert "esp_http_client_set_user_data(client, NULL)" in post_binary
     assert "s_recording_http_client = NULL" in source
     assert "recording_http_client_cleanup();" in source
+
+
+def test_cardputer_opt_and_message_center_are_mutually_exclusive() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    card_runtime = CARDPUTER_RUNTIME_C.read_text(encoding="utf-8")
+    opt_busy = source.split("static bool card_opt_busy(void)", 1)[1]
+    opt_busy = opt_busy.split("static bool card_message_busy", 1)[0]
+    runtime_busy = card_runtime.split(
+        "bool vibe_cardputer_runtime_opt_busy", 1
+    )[1].split("void vibe_cardputer_runtime_opt_action_complete", 1)[0]
+    recording_start = source.split(
+        "static bool handle_recording_start_internal", 1
+    )[1].split("static bool handle_recording_start", 1)[0]
+    keyboard = source.rsplit("static void card_keyboard_event", 1)[1]
+    keyboard = keyboard.split("#endif", 1)[0]
+    app_task = source.split("static void app_task(void *arg)", 1)[1]
+    app_task = app_task.split("#if VIBE_STICK_SERIAL_DEBUG_ENABLED", 1)[0]
+
+    assert "vibe_cardputer_runtime_opt_busy(&s_card_runtime)" in opt_busy
+    assert "atomic_load(&runtime->opt_down)" in runtime_busy
+    assert "atomic_load(&runtime->opt_button_committed)" in runtime_busy
+    assert "atomic_load(&runtime->opt_pending_clicks) > 0" in runtime_busy
+    assert "atomic_load(&runtime->opt_actions_pending) > 0" in runtime_busy
+    assert "recording_network_busy()" in opt_busy
+    assert (
+        "if (vibe_cardputer_runtime_messages_busy(&s_card_runtime))"
+        in recording_start
+    )
+    assert "recording start ignored while message center is busy" in recording_start
+    assert keyboard.index(
+        "if (vibe_cardputer_runtime_messages_busy(&s_card_runtime))"
+    ) < (
+        keyboard.index(
+            "vibe_cardputer_runtime_opt_press(&s_card_runtime);"
+        )
+    )
+    assert "VIBE_STICK_EVENT_CARD_OPT_COMPLETE" in app_task
+    assert app_task.count("queue_event(VIBE_STICK_EVENT_CARD_OPT_COMPLETE)") == 4
+    assert "vibe_cardputer_runtime_opt_action_complete(" in app_task
+
+
+def test_cardputer_opt_queue_ownership_covers_dispatch_window() -> None:
+    card_runtime = CARDPUTER_RUNTIME_C.read_text(encoding="utf-8")
+    queue_helper = card_runtime.split("static bool queue_opt_command", 1)[1]
+    queue_helper = queue_helper.split("static void opt_long_timer_cb", 1)[0]
+    opt_gestures = card_runtime.split("static void opt_long_timer_cb", 1)[1]
+    opt_gestures = opt_gestures.split(
+        "bool vibe_cardputer_runtime_messages_busy", 1
+    )[0]
+
+    assert "atomic_fetch_add(&runtime->opt_actions_pending, 1)" in queue_helper
+    assert "atomic_fetch_sub(&runtime->opt_actions_pending, 1)" in queue_helper
+    assert "!runtime->config.queue_command(" in queue_helper
+    assert "VIBE_STICK_EVENT_CARD_OPT_TAP" not in opt_gestures
+    assert "VIBE_STICK_EVENT_CARD_OPT_DOUBLE" not in opt_gestures
+    assert "VIBE_STICK_EVENT_CARD_OPT_HOLD_START" not in opt_gestures
+    assert "VIBE_STICK_EVENT_CARD_OPT_HOLD_STOP" not in opt_gestures
+    assert opt_gestures.count("queue_opt_command(") == 4
 
 
 def test_remote_audio_commands_reuse_sessions_and_ack_after_upload() -> None:
@@ -631,6 +759,7 @@ def test_lift_requires_a_real_flat_posture_before_arming() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     motion_source = MOTION_C.read_text(encoding="utf-8")
     motion_header = MOTION_H.read_text(encoding="utf-8")
+    controller = MOTION_CONTROLLER_C.read_text(encoding="utf-8")
     lift_mode = source.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[1]
     lift_mode = lift_mode.split("static void start_manual_motion_calibration", 1)[0]
     app_task = source.split("static void app_task(void *arg)", 1)[1]
@@ -640,7 +769,8 @@ def test_lift_requires_a_real_flat_posture_before_arming() -> None:
     assert "static bool s_flat_stable;" in motion_source
     assert "s_flat_stable = false;" in motion_source
     assert "s_flat_stable = true;" in motion_source
-    assert "s_motion_lift_armed = false;" in lift_mode
+    assert "VIBE_MOTION_COMMAND_SET_LIFT_READY" in lift_mode
+    assert "state->lift_armed = false;" in controller
     assert 'set_motion_arm_prompt(true);' in lift_mode
     assert '"PLACE FLAT"' in source
     assert "vibe_motion_is_flat_stable()" in app_task
@@ -711,48 +841,54 @@ def test_battery_level_uses_voltage_curve_and_voltage_api() -> None:
 
 def test_battery_display_filters_raw_voltage_status() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    power_runtime = POWER_RUNTIME_C.read_text(encoding="utf-8")
 
     assert "VIBE_STICK_BATTERY_SAMPLE_COUNT 5" in source
     assert "VIBE_STICK_BATTERY_USB_UNPLUG_HOLD_MS 30000" in source
     assert "VIBE_STICK_BATTERY_WAKE_STABILIZE_MS 5000" in source
-    assert "median_battery_sample()" in source
-    assert "battery_drop_hold_active(now_ms)" in source
+    assert "median_sample(state)" in power_runtime
+    assert "runtime->config.usb_unplug_hold_ms" in power_runtime
+    assert "runtime->config.wake_stabilize_ms" in power_runtime
     assert "RTC_DATA_ATTR static int s_retained_battery_display_level" in source
-    assert "s_retained_battery_magic == VIBE_STICK_BATTERY_RTC_MAGIC" in source
-    assert "s_deep_sleep_wake_ms = esp_timer_get_time() / 1000;" in source
+    assert ".retained_valid =" in source
+    assert "VIBE_STICK_BATTERY_RTC_MAGIC" in source
+    assert "VIBE_POWER_COMMAND_SET_WAKE_TIME" in source
     assert "vibe_board_battery_voltage_mv(&battery_voltage_mv)" in source
     assert "power status battery_raw=%d battery_display=%d battery_mv=%d charging=%d usb=%d" in source
 
 
 def test_battery_display_holds_full_while_external_power_remains_connected() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    power_runtime = POWER_RUNTIME_C.read_text(encoding="utf-8")
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
 
-    assert "static bool s_battery_full_latched;" in source
-    assert "s_battery_full_latched = false;" in source
+    assert "bool battery_full_latched;" in (
+        ROOT / "firmware/sticks3/include/vibe_power_runtime.h"
+    ).read_text(encoding="utf-8")
+    assert "VIBE_POWER_COMMAND_SET_FULL_LATCH" in source
     assert "battery_level >= VIBE_STICK_BATTERY_FULL_LATCH_PERCENT" in source
-    assert "if (s_battery_full_latched)" in source
-    assert "target_level = 100;" in source
+    assert "if (state->battery_full_latched)" in power_runtime
+    assert "target_level = 100;" in power_runtime
     assert "#define VIBE_BOARD_HOLD_FULL_BATTERY_ICON 0" in board_profile
     assert "#define VIBE_BOARD_HOLD_FULL_BATTERY_ICON 1" in board_profile
 
 
 def test_battery_ui_uses_color_bands_without_a_percentage_label() -> None:
-    source = MAIN_C.read_text(encoding="utf-8")
-    battery_ui = source.split("static void set_battery_ui", 1)[1]
-    battery_ui = battery_ui.split("typedef struct {", 1)[0]
+    ui = UI_C.read_text(encoding="utf-8")
+    battery_ui = ui.split("static void set_battery(", 1)[1]
+    battery_ui = battery_ui.split("static bool set_pet_frame", 1)[0]
 
-    assert "BATTERY_LOW_THRESHOLD_PERCENT 20" in source
-    assert "BATTERY_HIGH_THRESHOLD_PERCENT 50" in source
-    assert "s_battery_label" not in source
+    assert "BATTERY_LOW_THRESHOLD_PERCENT 20" in ui
+    assert "BATTERY_HIGH_THRESHOLD_PERCENT 50" in ui
+    assert "battery_label" not in ui
     assert 'snprintf(battery' not in battery_ui
-    assert "battery_value < BATTERY_LOW_THRESHOLD_PERCENT" in battery_ui
-    assert "battery_value < BATTERY_HIGH_THRESHOLD_PERCENT" in battery_ui
+    assert "battery < BATTERY_LOW_THRESHOLD_PERCENT" in battery_ui
+    assert "battery < BATTERY_HIGH_THRESHOLD_PERCENT" in battery_ui
     assert "0xef4444" in battery_ui
     assert "0xfacc15" in battery_ui
     assert "0x32d583" in battery_ui
-    assert "lv_obj_set_style_border_color(s_battery_icon, battery_color, 0);" in battery_ui
-    assert "lv_obj_set_style_bg_color(s_battery_fill, battery_color, 0);" in battery_ui
+    assert "lv_obj_set_style_border_color(state->battery_icon, color, 0);" in battery_ui
+    assert "lv_obj_set_style_bg_color(state->battery_fill, color, 0);" in battery_ui
 
 
 def test_state_polling_stops_while_screen_is_off() -> None:
@@ -780,6 +916,7 @@ def test_ota_check_blocks_sleep_without_waking_display() -> None:
 
 def test_ota_check_runs_on_network_wake_and_periodically() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    ota_runtime = OTA_RUNTIME_C.read_text(encoding="utf-8")
     config = (ROOT / "firmware" / "sticks3" / "include" / "vibe_stick_config.h").read_text(
         encoding="utf-8"
     )
@@ -789,40 +926,45 @@ def test_ota_check_runs_on_network_wake_and_periodically() -> None:
     assert "start_ota_check_task();" in source
     assert "#define OTA_PERIODIC_CHECK_MS 300000" in source
     assert "#define OTA_BATTERY_CHECK_MS 1800000" in source
-    assert "s_last_ota_check_ms" in source
-    assert "now_ms - s_last_ota_check_ms >= ota_interval_ms" in source
-    assert "ota_power_policy_allows" in source
+    assert "runtime->last_check_ms" in ota_runtime
+    assert "now_ms - runtime->last_check_ms < interval_ms" in ota_runtime
+    assert "power_allowed" in ota_runtime
+    assert "vibe_ota_runtime_tick(&s_ota, now_ms)" in source
     assert "VIBE_STICK_OTA_CHECK_MS" not in config
 
 
 def test_ota_download_has_bounded_waits_and_always_clears_overlay() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
-    update = source.split("static esp_err_t perform_ota_update", 1)[1]
-    update = update.split("static void ota_check_task", 1)[0]
-    check = source.split("static void ota_check_task", 1)[1]
-    check = check.split("static void start_ota_check_task", 1)[0]
+    ota_runtime = OTA_RUNTIME_C.read_text(encoding="utf-8")
+    update = ota_runtime.split("static esp_err_t perform_update", 1)[1]
+    update = update.split("static void check_task", 1)[0]
+    check = ota_runtime.split("static void check_task", 1)[1]
+    check = check.split("esp_err_t vibe_ota_runtime_init", 1)[0]
 
     assert "#define OTA_DOWNLOAD_TIMEOUT_MS 180000" in source
     assert "#define OTA_NO_PROGRESS_TIMEOUT_MS 20000" in source
-    assert "now_ms - download_started_ms >= OTA_DOWNLOAD_TIMEOUT_MS" in update
-    assert "now_ms - last_progress_ms >= OTA_NO_PROGRESS_TIMEOUT_MS" in update
+    assert "now_ms - started_ms >=" in update
+    assert "runtime->config.download_timeout_ms" in update
+    assert "now_ms - last_progress_ms >=" in update
+    assert "runtime->config.no_progress_timeout_ms" in update
     assert "last_progress_ms = esp_timer_get_time() / 1000;" in update
     assert "ESP_ERR_TIMEOUT" in update
     assert "bool overlay_shown = false;" in check
     assert "overlay_shown = true;" in check
     assert "if (overlay_shown)" in check
-    assert "show_recording_overlay(NULL, NULL, false);" in check
+    assert "runtime->dependencies.overlay(" in check
+    assert "NULL, NULL, false" in check
 
 
 def test_ota_rejects_lower_semantic_versions_before_hash_comparison() -> None:
-    source = MAIN_C.read_text(encoding="utf-8")
+    ota_runtime = OTA_RUNTIME_C.read_text(encoding="utf-8")
     policy = (ROOT / "firmware/sticks3/src/vibe_ota_policy.c").read_text(
         encoding="utf-8"
     )
-    ota_check = source.split("static bool ota_manifest_is_new", 1)[1]
-    ota_check = ota_check.split("static esp_err_t perform_ota_update", 1)[0]
+    ota_check = ota_runtime.split("static bool manifest_is_new", 1)[1]
+    ota_check = ota_check.split("static esp_err_t perform_update", 1)[0]
 
-    assert '#include "vibe_ota_policy.h"' in source
+    assert '#include "vibe_ota_policy.h"' in ota_runtime
     assert "bool vibe_ota_parse_semantic_version" in policy
     assert "bool vibe_ota_compare_semantic_versions" in policy
     assert "vibe_ota_update_decision(" in ota_check
@@ -838,6 +980,7 @@ def test_ota_rejects_lower_semantic_versions_before_hash_comparison() -> None:
 
 def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    router = INPUT_ROUTER_C.read_text(encoding="utf-8")
 
     assert "s_motion_start_pending" in source
     assert "s_motion_wake_network_pending" in source
@@ -851,7 +994,8 @@ def test_lift_motion_start_is_deferred_instead_of_dropped() -> None:
     assert 'show_recording_overlay("CONNECTING", "", true);' in source
     assert "request_wifi_reconnect_now();" in source
     assert "motion lift start deferred request cancelled by flat posture" in source
-    assert "queue_event(VIBE_STICK_EVENT_MOTION_START)" in source
+    assert "queue_input_signal(VIBE_INPUT_SIGNAL_MOTION_LIFTED)" in source
+    assert "return VIBE_STICK_EVENT_MOTION_START;" in router
 
 
 def test_deep_sleep_keeps_button_wake_and_guards_lift_mode() -> None:
@@ -958,6 +1102,7 @@ def test_recording_mode_preference_survives_deep_sleep_restart() -> None:
 
 def test_recording_trigger_is_independent_from_disabled_cyber_intents() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    controller = RECORDING_CONTROLLER_C.read_text(encoding="utf-8")
     board_profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
     toggle = source.split("static void toggle_recording_mode(void)", 1)[1]
     toggle = toggle.split("static void toggle_recording_intent(void)", 1)[0]
@@ -972,12 +1117,14 @@ def test_recording_trigger_is_independent_from_disabled_cyber_intents() -> None:
 
     assert "VIBE_STICK_ANIM_PREVIEW 0" in source
     assert board_profile.count("#define VIBE_BOARD_HAS_CYBER_INTENTS 0") == 4
-    assert "recording_intent_supported" in source
+    assert "vibe_recording_controller_intent_supported" in controller
     assert "sanitize_recording_intent();" in source
     assert "cyber intents unavailable" in intent_toggle
-    assert "s_recording_trigger_mode = RECORDING_TRIGGER_LIFT_TO_TALK;" in source
-    assert "s_recording_trigger_mode = RECORDING_TRIGGER_PUSH_TO_TALK;" in source
-    assert "s_recording_intent = RECORDING_INTENT_DICTATION;" in intent_toggle
+    assert ".data.trigger = RECORDING_TRIGGER_LIFT_TO_TALK" in source
+    assert ".data.trigger = RECORDING_TRIGGER_PUSH_TO_TALK" in source
+    assert ".data.intent = RECORDING_INTENT_DICTATION" in intent_toggle
+    assert "VIBE_RECORDING_COMMAND_CYCLE_INTENT" in intent_toggle
+    assert "controller->intent = RECORDING_INTENT_DICTATION;" in controller
     assert "RECORDING_INTENT_CYBER_FORTUNE" not in toggle
     assert "case RECORDING_MODE_CYBER_FORTUNE:" in migration
     assert "case RECORDING_MODE_CYBER_ALMANAC:" in migration
@@ -989,25 +1136,26 @@ def test_recording_trigger_is_independent_from_disabled_cyber_intents() -> None:
 
 def test_side_mode_switches_show_large_main_screen_visual_feedback() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    ui = UI_C.read_text(encoding="utf-8")
     toggle = source.split("static void toggle_recording_mode(void)", 1)[1]
     toggle = toggle.split("static void toggle_recording_intent(void)", 1)[0]
     intent_toggle = source.split("static void toggle_recording_intent(void)", 1)[1]
-    intent_toggle = intent_toggle.split("static void lvgl_lock", 1)[0]
-    update_pet = source.split("static void update_pet_visual(void)", 1)[1]
+    intent_toggle = intent_toggle.split("static void ui_brightness_changed", 1)[0]
+    update_pet = ui.split("static void update_pet(vibe_ui_impl_t *state)", 1)[1]
     update_pet = update_pet.split("#if VIBE_STICK_ANIM_PREVIEW", 1)[0]
 
-    assert "VIBE_STICK_MODE_SWITCH_VISUAL_MS 1800" in source
-    assert "s_mode_switch_layer = lv_obj_create(screen);" in source
-    assert 'make_label(s_mode_switch_layer, "DICTATION",' in source
+    assert "VIBE_UI_MODE_VISUAL_MS 1800" in ui
+    assert "state->mode_switch_layer = lv_obj_create(screen);" in ui
+    assert 'state->mode_switch_layer, "DICTATION"' in ui
     assert '"PUSH TO TALK"' in source
     assert '"LIFT TO TALK"' in source
     assert '"FORTUNE"' in source
     assert '"ALMANAC"' in source
     assert "show_trigger_mode_switch_visual();" in toggle
     assert "show_recording_intent_switch_visual();" in intent_toggle
-    assert "mode_switch_visual_active(now_ms)" in update_pet
-    assert "set_pet_frame(s_mode_switch_frames[s_mode_switch_frame_index])" in update_pet
-    assert "finish_mode_switch_visual();" in update_pet
+    assert "visual_active(state, now_ms)" in update_pet
+    assert "state->mode_frames[state->mode_frame_index]" in update_pet
+    assert "finish_visual_locked(state);" in update_pet
 
 
 def test_deep_sleep_button_wake_restores_ptt_hold() -> None:
@@ -1026,18 +1174,20 @@ def test_deep_sleep_button_wake_restores_ptt_hold() -> None:
 
 def test_deep_sleep_wake_defers_pet_animation_until_state_restores() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    ui = UI_C.read_text(encoding="utf-8")
 
     assert "VIBE_STICK_PET_FAST_RESUME_MAX_MS 15000" in source
     assert "s_pet_fast_resume_pending = true;" in source
     assert "static void complete_pet_fast_resume(void)" in source
-    assert "if (s_pet_fast_resume_pending)" in source
+    assert "view.pet_fast_resume_pending" in ui
+    assert "view.pet_animation_resume_ms" in ui
     assert "complete_pet_fast_resume();" in source
     assert "VIBE_STICK_DEEP_SLEEP_FAST_RESUME_MS" not in source
 
 
 def test_wifi_start_overlaps_display_setup_during_wake() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
-    app_main = source.split("void app_main(void)", 1)[1]
+    app_main = source.split("void vibe_app_runtime_start(void)", 1)[1]
 
     assert "static bool s_ui_ready;" in source
     assert "if (!s_ui_ready)" in source
@@ -1049,13 +1199,17 @@ def test_wifi_start_overlaps_display_setup_during_wake() -> None:
 
 def test_wifi_profiles_are_persisted_and_rotated() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    wifi_source = WIFI_RUNTIME_C.read_text(encoding="utf-8")
 
-    assert "WIFI_PROFILE_NAMESPACE" in source
-    assert "wifi_profiles_load_nvs" in source
-    assert "wifi_profiles_save_nvs" in source
-    assert "wifi_profiles_merge_configured" in source
+    assert "WIFI_PROFILE_NAMESPACE" in wifi_source
+    assert "profiles_load" in wifi_source
+    assert "profiles_save" in wifi_source
+    assert "configured_profile_count" in wifi_source
     assert "VIBE_STICK_WIFI_PROFILES" in source
-    assert "s_wifi_profile_index = (s_wifi_profile_index + 1) % s_wifi_profile_count" in source
+    assert (
+        "runtime->profile_index + 1) % runtime->profile_count"
+        in wifi_source
+    )
 
 
 def test_deep_sleep_validates_wake_gpio_before_wifi_shutdown() -> None:
@@ -1063,9 +1217,10 @@ def test_deep_sleep_validates_wake_gpio_before_wifi_shutdown() -> None:
     sleep = source.split("static bool enter_deep_sleep(void)", 1)[1]
     sleep = sleep.split("static void maybe_enter_deep_sleep", 1)[0]
 
-    assert sleep.index("sleep_wake_gpio_is_active(ext0_gpio)") < sleep.index("esp_wifi_stop()")
+    wifi_stop = "vibe_wifi_runtime_stop_for_sleep(&s_wifi)"
+    assert sleep.index("sleep_wake_gpio_is_active(ext0_gpio)") < sleep.index(wifi_stop)
     assert "ext0_gpio = VIBE_BOARD_PIN_IMU_INT;" not in sleep
-    assert sleep.index("esp_wifi_stop()") < sleep.index(
+    assert sleep.index(wifi_stop) < sleep.index(
         "esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL)"
     )
     assert sleep.index("esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL)") < sleep.index(
@@ -1075,7 +1230,11 @@ def test_deep_sleep_validates_wake_gpio_before_wifi_shutdown() -> None:
         "esp_deep_sleep_start()"
     )
     assert "atomic_store(&s_deep_sleep_committed, true)" in sleep
-    assert "esp_timer_stop(s_wifi_reconnect_timer)" in sleep
+    wifi_source = WIFI_RUNTIME_C.read_text(encoding="utf-8")
+    stop_for_sleep = wifi_source.split(
+        "esp_err_t vibe_wifi_runtime_stop_for_sleep", 1
+    )[1]
+    assert "esp_timer_stop(runtime->reconnect_timer)" in stop_for_sleep
 
 
 def test_deep_sleep_retry_uses_delayed_backoff_after_active_wake_gpio() -> None:
@@ -1201,6 +1360,7 @@ def test_ptt_recording_suspends_motion_and_lift_mode_resumes_it() -> None:
 
 def test_motion_calibration_has_finite_timeout_and_fallback_baseline() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    controller = MOTION_CONTROLLER_C.read_text(encoding="utf-8")
     begin = source.split("static esp_err_t begin_motion_calibration", 1)[1]
     begin = begin.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[0]
     timeout = source.split("static void maybe_timeout_motion_calibration", 1)[1]
@@ -1208,7 +1368,8 @@ def test_motion_calibration_has_finite_timeout_and_fallback_baseline() -> None:
 
     assert "VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS 15000" in source
     assert "s_motion_calibration_deadline_ms" in source
-    assert "VIBE_STICK_MOTION_CALIBRATION_TIMEOUT_MS" in begin
+    assert "VIBE_MOTION_COMMAND_BEGIN_CALIBRATION" in begin
+    assert "controller->config.calibration_timeout_ms" in controller
     assert "s_motion_calibration_had_previous" in timeout
     assert "vibe_motion_apply_calibration(&s_motion_previous_calibration)" in timeout
     assert "restored previous calibration" in timeout
@@ -1223,7 +1384,7 @@ def test_motion_calibration_is_persisted_and_reused_without_boot_recalibration()
     motion_source = MOTION_C.read_text(encoding="utf-8")
     lift_mode = source.split("static esp_err_t set_lift_to_talk_trigger_mode", 1)[1]
     lift_mode = lift_mode.split("static void start_manual_motion_calibration", 1)[0]
-    app_main = source.split("void app_main(void)", 1)[1]
+    app_main = source.split("void vibe_app_runtime_start(void)", 1)[1]
 
     assert 'DEVICE_PREF_MOTION_CALIBRATION_KEY "motion_cal_v1"' in source
     assert "nvs_get_blob(handle, DEVICE_PREF_MOTION_CALIBRATION_KEY" in source
@@ -1247,6 +1408,7 @@ def test_motion_calibration_is_persisted_and_reused_without_boot_recalibration()
 
 def test_side_button_defers_three_second_toggle_and_uses_six_seconds_for_manual_calibration() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    router = INPUT_ROUTER_C.read_text(encoding="utf-8")
     three_second = source.split("static void side_button_long_start_cb", 1)[1]
     three_second = three_second.split(
         "static void side_button_calibration_long_start_cb", 1
@@ -1260,8 +1422,10 @@ def test_side_button_defers_three_second_toggle_and_uses_six_seconds_for_manual_
     assert "queue_event(" not in three_second
     assert "s_side_button_mode_hold_reached = true;" in three_second
     assert "s_side_button_calibration_hold_reached" in release
-    assert "VIBE_STICK_EVENT_MOTION_CALIBRATE" in release
-    assert "VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE" in release
+    assert "VIBE_INPUT_SIGNAL_SIDE_CALIBRATE" in release
+    assert "VIBE_INPUT_SIGNAL_SIDE_MODE" in release
+    assert "return VIBE_STICK_EVENT_MOTION_CALIBRATE;" in router
+    assert "return VIBE_STICK_EVENT_RECORDING_MODE_TOGGLE;" in router
     assert ".side_mode_ms = SIDE_MODE_TOGGLE_HOLD_MS" in source
     assert ".side_calibration_ms = SIDE_MANUAL_CALIBRATION_HOLD_MS" in source
     assert ".press_time = config->side_mode_ms" in input_source
@@ -1270,6 +1434,7 @@ def test_side_button_defers_three_second_toggle_and_uses_six_seconds_for_manual_
 
 def test_motion_wake_is_confirmed_before_recording_and_false_wake_returns_to_sleep() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    controller = MOTION_CONTROLLER_C.read_text(encoding="utf-8")
     capture = source.split("static void capture_deep_sleep_motion_intent", 1)[1]
     capture = capture.split("static void handle_deep_sleep_front_button_intent", 1)[0]
     app_task = source.split("static void app_task(void *arg)", 1)[1]
@@ -1278,7 +1443,9 @@ def test_motion_wake_is_confirmed_before_recording_and_false_wake_returns_to_sle
     assert "VIBE_STICK_MOTION_WAKE_CONFIRM_MS 500" in source
     assert "VIBE_STICK_MOTION_FALSE_WAKE_DISPLAY_MS 3000" in source
     assert "ESP_SLEEP_WAKEUP_EXT1" in capture
-    assert "s_motion_wake_confirm_pending = true;" in capture
+    assert "VIBE_MOTION_COMMAND_BEGIN_WAKE_CONFIRM" in capture
+    assert "state->wake_confirm_pending = true;" in controller
+    assert "controller->config.wake_confirm_ms" in controller
     assert "vibe_motion_is_lifted()" in app_task
     assert "motion wake confirmed lifted; starting recording" in app_task
     assert "motion wake rejected; display remains on for %dms" in app_task
@@ -1305,8 +1472,8 @@ def test_audio_stop_unblocks_bounded_recording_reads_before_waiting_for_task_exi
 def test_release_firmware_can_disable_serial_debug_input_task() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     serial_task = source.split("#if VIBE_STICK_SERIAL_DEBUG_ENABLED", 1)[1]
-    serial_task = serial_task.split("void app_main", 1)[0]
-    app_main = source.split("void app_main(void)", 1)[1]
+    serial_task = serial_task.split("void vibe_app_runtime_start", 1)[0]
+    app_main = source.split("void vibe_app_runtime_start(void)", 1)[1]
 
     assert "VIBE_STICK_SERIAL_DEBUG_ENABLED" in source
     assert "static void serial_debug_task" in serial_task
@@ -1316,23 +1483,26 @@ def test_release_firmware_can_disable_serial_debug_input_task() -> None:
 
 def test_display_off_suspends_panel_output_and_lvgl_timer_work() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    ui = UI_C.read_text(encoding="utf-8")
     power = source.split("static void update_power_saving", 1)[1]
     power = power.split("static void request_motion_recording_start", 1)[0]
     register_activity = source.split("static void register_activity(void)\n{", 1)[1]
     register_activity = register_activity.split("static void update_power_saving", 1)[0]
     display_suspend = source.split("static void set_display_rendering_suspended", 1)[1]
     display_suspend = display_suspend.split("static void fade_backlight_toward", 1)[0]
+    ui_suspend = ui.split("esp_err_t vibe_ui_set_rendering_suspended", 1)[1]
+    ui_suspend = ui_suspend.split("bool vibe_ui_rendering_suspended", 1)[0]
 
     assert "set_display_rendering_suspended(true)" in power
     assert "set_display_rendering_suspended(false)" in register_activity
-    assert "esp_lcd_panel_disp_on_off(s_panel, false)" in display_suspend
-    assert "lv_timer_pause(s_pet_timer)" in display_suspend
-    assert "lv_timer_resume(s_pet_timer)" in display_suspend
-    assert "esp_lcd_panel_disp_on_off(s_panel, true)" in display_suspend
-    panel_off_index = display_suspend.index(
-        "esp_lcd_panel_disp_on_off(s_panel, false)"
+    assert "esp_lcd_panel_disp_on_off(state->panel, false)" in ui_suspend
+    assert "lv_timer_pause(state->pet_timer)" in ui_suspend
+    assert "lv_timer_resume(state->pet_timer)" in ui_suspend
+    assert "esp_lcd_panel_disp_on_off(state->panel, true)" in ui_suspend
+    panel_off_index = ui_suspend.index(
+        "esp_lcd_panel_disp_on_off(state->panel, false)"
     )
-    assert "#if VIBE_BOARD_HAS_GPIO_BACKLIGHT" not in display_suspend[
+    assert "#if VIBE_BOARD_HAS_GPIO_BACKLIGHT" not in ui_suspend[
         max(0, panel_off_index - 80) : panel_off_index
     ]
     assert "update_display_light_sleep_lock(true)" in display_suspend
@@ -1342,14 +1512,18 @@ def test_display_off_suspends_panel_output_and_lvgl_timer_work() -> None:
 def test_s3_blocks_automatic_light_sleep_while_the_display_is_active() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     power_init = source.split("static esp_err_t init_power_management", 1)[1]
-    power_init = power_init.split("void app_main", 1)[0]
+    power_init = power_init.split("void vibe_app_runtime_start", 1)[0]
 
     assert "ESP_PM_NO_LIGHT_SLEEP" in power_init
     assert '"display_active"' in power_init
     assert "esp_pm_lock_acquire(s_display_no_light_sleep_lock)" in source
     assert "static bool board_requires_light_sleep_lock(void)" in source
     assert "#if defined(VIBE_BOARD_STICKS3)" in source
-    assert "board_requires_light_sleep_lock() || display_active || external_powered()" in source
+    assert re.search(
+        r"board_requires_light_sleep_lock\(\)\s*\|\|\s*display_active\s*\|\|\s*"
+        r"external_powered\(\)",
+        source,
+    )
     assert "#if VIBE_BOARD_HAS_GPIO_BACKLIGHT" in power_init
     assert "automatic light sleep blocked while display is active" in power_init
 
@@ -1371,7 +1545,10 @@ def test_external_power_does_not_prevent_s3_deep_sleep() -> None:
     assert "return active_work;" in display_guard
     assert "return false;" in external_power_guard
     assert "external_power_blocks_deep_sleep() ||" in sleep_guard
-    assert "display_active || external_powered()" in lock_policy
+    assert re.search(
+        r"display_active\s*\|\|\s*external_powered\(\)",
+        lock_policy,
+    )
     assert "update_display_light_sleep_lock(" in power_refresh
     removed = power_refresh.split(
         "was_external_powered && !external_powered()", 1
@@ -1381,9 +1558,9 @@ def test_external_power_does_not_prevent_s3_deep_sleep() -> None:
 
 
 def test_s3_backlight_pwm_uses_a_clock_stable_across_cpu_frequency_changes() -> None:
-    source = MAIN_C.read_text(encoding="utf-8")
-    backlight = source.split("static void init_backlight(void)", 1)[1]
-    backlight = backlight.split("static esp_err_t init_display", 1)[0]
+    ui = UI_C.read_text(encoding="utf-8")
+    backlight = ui.split("static void init_backlight(vibe_ui_t *ui)", 1)[1]
+    backlight = backlight.split("esp_err_t vibe_ui_init", 1)[0]
 
     assert ".clk_cfg = LEDC_USE_XTAL_CLK" in backlight
     assert "LEDC_AUTO_CLK" not in backlight
@@ -1395,15 +1572,41 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.65"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.39"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.67"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.40"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.1"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.59"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
+    assert (
+        '"stickc_plus_se": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE"'
+        in publisher
+    )
+    assert (
+        '"cardputer_adv": "VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV"'
+        in publisher
+    )
+
+
+def test_cardputer_keyboard_restores_display_and_wakes_from_deep_sleep() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    card_activity = source.split("static void card_message_activity(void)", 1)[1]
+    card_activity = card_activity.split("static esp_err_t card_message_set_landscape", 1)[0]
+    sleep = source.split("static bool enter_deep_sleep(void)", 1)[1]
+    sleep = sleep.split("static void maybe_enter_deep_sleep", 1)[0]
+
+    assert "set_display_rendering_suspended(false)" in card_activity
+    assert "vibe_ui_register_activity(&s_ui)" in card_activity
+    assert "cardputer_keyboard_wake_mask" in sleep
+    assert "VIBE_BOARD_PIN_KEYBOARD_INT" in sleep
+    assert "ext1_wake_mask" in sleep
+    assert "ESP_EXT1_WAKEUP_ANY_LOW" in sleep
 
 
 def test_sticks3_settings_menu_preserves_normal_button_roles() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    router = INPUT_ROUTER_C.read_text(encoding="utf-8")
 
     assert "VIBE_SETTINGS_PAGE_MODE" in source
     assert "VIBE_SETTINGS_PAGE_SLEEP" in source
@@ -1421,8 +1624,10 @@ def test_sticks3_settings_menu_preserves_normal_button_roles() -> None:
     assert "queue_event(VIBE_STICK_EVENT_SETTINGS_VALUE_NEXT)" in source
     assert "queue_event(VIBE_STICK_EVENT_SETTINGS_CONFIRM)" in source
     assert "SIDE_MANUAL_CALIBRATION_HOLD_MS 6000" in source
-    assert "queue_event(VIBE_STICK_EVENT_MOTION_CALIBRATE)" in source
-    assert "queue_event(VIBE_STICK_EVENT_BRIDGE_SCAN_FULL)" in source
+    assert "queue_input_signal(VIBE_INPUT_SIGNAL_SIDE_CALIBRATE)" in source
+    assert "queue_input_signal(VIBE_INPUT_SIGNAL_SIDE_SCAN)" in source
+    assert "return VIBE_STICK_EVENT_MOTION_CALIBRATE;" in router
+    assert "return VIBE_STICK_EVENT_BRIDGE_SCAN_FULL;" in router
 
 
 def test_sticks3_status_led_tracks_button_recording_and_deep_sleep() -> None:
@@ -1449,15 +1654,15 @@ def test_ota_publisher_strips_null_padding_from_image_metadata() -> None:
 
 
 def test_wifi_reconnect_uses_delayed_backoff_instead_of_immediate_retry() -> None:
-    source = MAIN_C.read_text(encoding="utf-8")
+    source = WIFI_RUNTIME_C.read_text(encoding="utf-8")
     handler = source.split("static void wifi_event_handler", 1)[1]
-    handler = handler.split("static esp_err_t init_wifi", 1)[0]
+    handler = handler.split("esp_err_t vibe_wifi_runtime_init", 1)[0]
     disconnect = handler.split("WIFI_EVENT_STA_DISCONNECTED", 1)[1]
-    disconnect = disconnect.split("} else if (event_base == IP_EVENT", 1)[0]
+    disconnect = disconnect.split("event_base == IP_EVENT", 1)[0]
 
     assert "vibe_wifi_reconnect_delay_ms" in source
-    assert "s_wifi_reconnect_timer" in source
-    assert "schedule_wifi_reconnect();" in disconnect
+    assert "runtime->reconnect_timer" in source
+    assert "schedule_reconnect(runtime);" in disconnect
     assert "ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect())" not in disconnect
 
 
@@ -1474,32 +1679,42 @@ def test_power_management_and_tickless_idle_are_enabled_by_default() -> None:
 
 def test_s3_limits_wifi_tx_power_before_connecting() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    wifi_source = WIFI_RUNTIME_C.read_text(encoding="utf-8")
     profile = BOARD_PROFILE_H.read_text(encoding="utf-8")
     init_wifi = source.split("static esp_err_t init_wifi(void)", 1)[1].split(
         "#if VIBE_STICK_ANIM_PREVIEW", 1
     )[0]
-    sta_start = source.split(
-        "event_id == WIFI_EVENT_STA_START", 1
+    runtime_init = wifi_source.split(
+        "esp_err_t vibe_wifi_runtime_init", 1
     )[1].split(
-        "event_id == WIFI_EVENT_STA_DISCONNECTED", 1
+        "bool vibe_wifi_runtime_connected", 1
     )[0]
 
     assert "#define VIBE_BOARD_WIFI_MAX_TX_POWER 0" in profile
     assert "#define VIBE_BOARD_WIFI_MAX_TX_POWER 52" in profile
-    assert "esp_wifi_set_max_tx_power(VIBE_BOARD_WIFI_MAX_TX_POWER)" in init_wifi
-    assert init_wifi.index("esp_wifi_start()") < init_wifi.index(
-        "esp_wifi_set_max_tx_power"
+    assert ".max_tx_power = VIBE_BOARD_WIFI_MAX_TX_POWER" in init_wifi
+    assert "esp_wifi_set_max_tx_power(runtime->config.max_tx_power)" in wifi_source
+    assert runtime_init.index("esp_wifi_start()") < runtime_init.index(
+        "configure_started_radio(runtime)"
     )
-    assert init_wifi.index("esp_wifi_set_max_tx_power") < init_wifi.index(
+    assert runtime_init.index("configure_started_radio(runtime)") < runtime_init.index(
         "esp_wifi_connect()"
     )
+    sta_start = wifi_source.split(
+        "event_id == WIFI_EVENT_STA_START", 1
+    )[1].split(
+        "event_id == WIFI_EVENT_STA_DISCONNECTED", 1
+    )[0]
     assert "esp_wifi_connect()" not in sta_start
 
 
 def test_tts_playback_probe_reports_device_result() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
+    state_json = STATE_JSON_C.read_text(encoding="utf-8")
 
-    assert "tts_playback_request_id" in source
+    assert "tts_playback_request_id" in state_json
+    assert "update->tts_requested = true;" in state_json
+    assert "if (update.tts_requested)" in source
     assert "VIBE_STICK_EVENT_TTS_PROBE" in source
     assert "tts_probe_played" in source
     assert "tts_probe_failed" in source

@@ -1,6 +1,7 @@
 # Protocol
 
-VibeStick v0.1.2 uses HTTP over Wi-Fi between the device firmware and the local Mac bridge.
+VibeStick uses HTTP over Wi-Fi between device firmware and the CapsWriter M5
+bridge.
 
 Default bridge URL:
 
@@ -14,10 +15,14 @@ Firmware requests include:
 
 ```text
 X-Vibe-Stick-Firmware-Name: vibestick
-X-Vibe-Stick-Firmware-Version: 0.1.2
+X-Vibe-Stick-Firmware-Version: <board-specific-semantic-version>
 X-Vibe-Stick-Firmware-Transport: HTTP
-X-Vibe-Stick-Firmware-Build-Date: <compile date>
+X-Vibe-Stick-Firmware-Build-Date: <board>-v<semantic-version>
 ```
+
+`X-Vibe-Stick-Firmware-Build-Date` is a legacy header name. Its value is now a
+deterministic board-scoped build ID so release identity does not depend on the
+compiler host clock.
 
 Audio upload requests additionally include:
 
@@ -145,7 +150,12 @@ Returns the latest firmware update manifest for the requested board:
 GET /ota/manifest?board=stickc_plus
 ```
 
-Supported board names are `sticks3` and `stickc_plus`.
+Supported board names are:
+
+- `sticks3`
+- `stickc_plus`
+- `stickc_plus_se`
+- `cardputer_adv`
 
 No update:
 
@@ -163,7 +173,7 @@ Update available:
   "available": true,
   "board": "stickc_plus",
   "version": "v0.1.4-3-gdirty",
-  "build_id": "Jul  5 2026 18:17:38 05bab9f8ded0",
+  "build_id": "stickc_plus-v0.1.40",
   "size": 1468000,
   "sha256": "<bin-sha256>",
   "elf_sha256": "<elf-sha256>",
@@ -172,8 +182,11 @@ Update available:
 }
 ```
 
-The firmware compares `elf_sha256` first. If it matches the currently running
-app, the device skips the update.
+The firmware first requires `manifest.version` to be a valid semantic version
+strictly higher than the running firmware version. Equal or lower versions are
+rejected even when `sha256`, `elf_sha256`, or `build_id` differs. For an
+accepted higher version, matching image/ELF hashes can still be used to skip a
+redundant transfer.
 
 ## GET /ota/bin
 
@@ -203,7 +216,9 @@ Manual `DONE`, `ERROR`, and `APPROVAL` statuses produce alert fields for local t
 
 ## POST /quota/refresh
 
-Requests a quota refresh for the active provider. Codex refreshes from local session events. Claude refreshes the cached usage snapshot only when `VIBE_STICK_CLAUDE_USAGE` is enabled; failures keep the provider quota fields `null` so the firmware shows `--%`.
+Requests a quota refresh for the active provider. CapsWriter owns provider
+observation and quota refresh policy; failures keep unknown provider quota
+fields `null` so the firmware shows `--%`.
 
 ```json
 {
