@@ -732,7 +732,30 @@ def test_cardputer_opt_queue_ownership_covers_dispatch_window() -> None:
     assert "VIBE_STICK_EVENT_CARD_OPT_DOUBLE" not in opt_gestures
     assert "VIBE_STICK_EVENT_CARD_OPT_HOLD_START" not in opt_gestures
     assert "VIBE_STICK_EVENT_CARD_OPT_HOLD_STOP" not in opt_gestures
-    assert opt_gestures.count("queue_opt_command(") == 4
+    assert opt_gestures.count("queue_opt_command(") == 5
+
+
+def test_cardputer_default_opt_tap_bypasses_double_click_delay() -> None:
+    profile = (
+        ROOT
+        / "firmware"
+        / "sticks3"
+        / "src"
+        / "vibe_cardputer_input_profile.c"
+    ).read_text(encoding="utf-8")
+    runtime = CARDPUTER_RUNTIME_C.read_text(encoding="utf-8")
+    release = runtime.split(
+        "void vibe_cardputer_runtime_opt_release", 1
+    )[1].split("bool vibe_cardputer_runtime_opt_mark_chord", 1)[0]
+
+    assert ".revision = 2," in profile
+    assert ".opt_double = VIBE_CARD_ROUTE_NONE," in profile
+    assert "profile_is_legacy_default" in runtime
+    assert "runtime->input_profile.opt_double = VIBE_CARD_ROUTE_NONE;" in runtime
+    immediate_tap = release.split(
+        "if (atomic_load(&runtime->opt_double_route) == VIBE_CARD_ROUTE_NONE)", 1
+    )[1].split("const int clicks =", 1)[0]
+    assert "VIBE_INPUT_SIGNAL_CARD_OPT_TAP" in immediate_tap
 
 
 def test_remote_audio_commands_reuse_sessions_and_ack_after_upload() -> None:
@@ -1588,7 +1611,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.68"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.42"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.2"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.61"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.62"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher

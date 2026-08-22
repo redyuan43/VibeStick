@@ -35,6 +35,16 @@ static esp_timer_handle_t opt_timer(void *timer)
     return (esp_timer_handle_t)timer;
 }
 
+static bool profile_is_legacy_default(
+    const vibe_card_input_profile_t *profile)
+{
+    return profile &&
+           profile->revision == 1 &&
+           profile->opt_tap == VIBE_CARD_ROUTE_DEVICE_RECORDING_TOGGLE &&
+           profile->opt_double == VIBE_CARD_ROUTE_DEVICE_LEGACY_DOUBLE &&
+           profile->opt_hold == VIBE_CARD_ROUTE_DEVICE_RECORDING_HOLD;
+}
+
 static void stop_opt_timer(void *timer)
 {
     if (timer) {
@@ -197,6 +207,16 @@ esp_err_t vibe_cardputer_runtime_init(
             TAG, "input profile load skipped: %s",
             esp_err_to_name(profile_err));
         vibe_card_input_profile_default(&runtime->input_profile);
+    }
+    if (profile_is_legacy_default(&runtime->input_profile)) {
+        runtime->input_profile.revision = 2;
+        runtime->input_profile.opt_double = VIBE_CARD_ROUTE_NONE;
+        esp_err_t save_err =
+            vibe_card_input_profile_save(&runtime->input_profile);
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "default Opt profile migration not persisted: %s",
+                     esp_err_to_name(save_err));
+        }
     }
     atomic_init(
         &runtime->profile_revision,
@@ -375,6 +395,13 @@ void vibe_cardputer_runtime_opt_release(
     }
     if (runtime->config.front_up) {
         runtime->config.front_up(runtime->config.context);
+    }
+    if (atomic_load(&runtime->opt_double_route) == VIBE_CARD_ROUTE_NONE) {
+        (void)queue_opt_command(
+            runtime,
+            vibe_input_router_command(
+                VIBE_INPUT_SIGNAL_CARD_OPT_TAP));
+        return;
     }
     const int clicks =
         atomic_fetch_add(

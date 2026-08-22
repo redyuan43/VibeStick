@@ -21,9 +21,9 @@ void vibe_card_input_profile_default(vibe_card_input_profile_t *profile)
 {
     if (!profile) return;
     *profile = (vibe_card_input_profile_t){
-        .revision = 1,
+        .revision = 2,
         .opt_tap = VIBE_CARD_ROUTE_DEVICE_RECORDING_TOGGLE,
-        .opt_double = VIBE_CARD_ROUTE_DEVICE_LEGACY_DOUBLE,
+        .opt_double = VIBE_CARD_ROUTE_NONE,
         .opt_hold = VIBE_CARD_ROUTE_DEVICE_RECORDING_HOLD,
         .air_mouse = {
             .pointer_speed = 1.0f,
