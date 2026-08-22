@@ -1321,7 +1321,7 @@ esp_err_t vibe_cardputer_messages_init(
 esp_err_t vibe_cardputer_messages_start(void)
 {
     BaseType_t sync_result = xTaskCreatePinnedToCore(
-        sync_task, "card_messages", MESSAGE_TASK_STACK_BYTES, NULL, 2, NULL, 0);
+        sync_task, "card_messages", MESSAGE_TASK_STACK_BYTES, NULL, 2, NULL, 1);
     return sync_result == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -1407,8 +1407,7 @@ bool vibe_cardputer_messages_active(void)
 bool vibe_cardputer_messages_busy(void)
 {
     return atomic_load(&s_active) ||
-           atomic_load(&s_ui_transition) ||
-           atomic_load(&s_sync_in_progress);
+           atomic_load(&s_ui_transition);
 }
 
 bool vibe_cardputer_messages_storage_ready(void)

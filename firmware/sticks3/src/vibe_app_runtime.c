@@ -4307,11 +4307,11 @@ static bool handle_recording_start_internal(const char *event_name, const char *
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
+    vibe_cardputer_runtime_release_display_resources(&s_card_runtime);
     if (vibe_cardputer_runtime_messages_busy(&s_card_runtime)) {
         ESP_LOGI(TAG, "recording start ignored while message center is busy");
         return false;
     }
-    vibe_cardputer_runtime_release_display_resources(&s_card_runtime);
     recording_http_client_cleanup();
 #endif
     register_activity();
@@ -5805,8 +5805,7 @@ static void card_keyboard_event(const vibe_key_event_t *event, void *context)
      * StickC Plus. Setup keeps its existing local handling below. */
     if (!s_card_setup_active && event->key == VIBE_KEY_OPT) {
         if (vibe_cardputer_runtime_messages_busy(&s_card_runtime)) {
-            card_keyboard_release_host_state();
-            return;
+            vibe_cardputer_runtime_release_display_resources(&s_card_runtime);
         }
         if (event->pressed) {
             vibe_cardputer_runtime_opt_press(&s_card_runtime);

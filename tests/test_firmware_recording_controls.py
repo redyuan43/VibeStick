@@ -1575,7 +1575,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.67"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.41"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.1"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.59"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.60"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
@@ -1602,6 +1602,28 @@ def test_cardputer_keyboard_restores_display_and_wakes_from_deep_sleep() -> None
     assert "VIBE_BOARD_PIN_KEYBOARD_INT" in sleep
     assert "ext1_wake_mask" in sleep
     assert "ESP_EXT1_WAKEUP_ANY_LOW" in sleep
+
+
+def test_cardputer_opt_preempts_message_sync_without_blocking_the_app_core() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    messages = (
+        ROOT / "firmware" / "sticks3" / "src" / "vibe_cardputer_messages.c"
+    ).read_text(encoding="utf-8")
+    recording_start = source.split(
+        "static bool handle_recording_start_internal", 1
+    )[1].split("static bool handle_recording_start(", 1)[0]
+    opt = source.split("if (!s_card_setup_active && event->key == VIBE_KEY_OPT)", 1)[1]
+    opt = opt.split("const vibe_cardputer_key_result_t", 1)[0]
+
+    assert 'sync_task, "card_messages"' in messages
+    assert "NULL, 2, NULL, 1)" in messages
+    messages_busy = messages.split("bool vibe_cardputer_messages_busy(void)", 1)[1]
+    messages_busy = messages_busy.split("bool vibe_cardputer_messages_storage_ready", 1)[0]
+    assert "s_sync_in_progress" not in messages_busy
+    assert recording_start.index(
+        "vibe_cardputer_runtime_release_display_resources(&s_card_runtime)"
+    ) < recording_start.index("vibe_cardputer_runtime_messages_busy")
+    assert "vibe_cardputer_runtime_release_display_resources(&s_card_runtime)" in opt
 
 
 def test_sticks3_settings_menu_preserves_normal_button_roles() -> None:
