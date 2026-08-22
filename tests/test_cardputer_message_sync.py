@@ -46,5 +46,5 @@ def test_cardputer_message_mode_tracks_transitions_and_blocks_conflicting_input(
     assert "atomic_store(&s_ui_transition, false);" in handle_key
     assert "atomic_load(&s_active)" in busy
     assert "atomic_load(&s_ui_transition)" in busy
-    assert "atomic_load(&s_sync_in_progress)" in busy
+    assert "atomic_load(&s_sync_in_progress)" not in busy
     assert actions.count("atomic_store(&s_ui_transition, false);") >= 2

@@ -1509,6 +1509,19 @@ def test_display_off_suspends_panel_output_and_lvgl_timer_work() -> None:
     assert "update_display_light_sleep_lock(false)" in display_suspend
 
 
+def test_display_off_keeps_wifi_running_until_deep_sleep() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    power = source.split("static void update_power_saving", 1)[1]
+    power = power.split("static void request_motion_recording_start", 1)[0]
+    sleep = source.split("static bool enter_deep_sleep(void)", 1)[1]
+    sleep = sleep.split("static void maybe_enter_deep_sleep", 1)[0]
+
+    assert "#define VIBE_STICK_WIFI_IDLE_PS WIFI_PS_NONE" in source
+    assert "WIFI_PS_MIN_MODEM" not in source
+    assert "vibe_wifi_runtime_stop_for_sleep(&s_wifi)" not in power
+    assert "vibe_wifi_runtime_stop_for_sleep(&s_wifi)" in sleep
+
+
 def test_s3_blocks_automatic_light_sleep_while_the_display_is_active() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     power_init = source.split("static esp_err_t init_power_management", 1)[1]
@@ -1572,10 +1585,10 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.67"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.41"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.1"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.60"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.68"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.42"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.2"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.61"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
