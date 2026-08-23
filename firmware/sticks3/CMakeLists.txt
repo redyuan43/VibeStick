@@ -9,6 +9,8 @@ if(NOT DEFINED VIBE_BOARD)
 endif()
 set(VIBE_BOARD "${VIBE_BOARD}" CACHE STRING "VibeStick board target")
 option(VIBE_SERIAL_DEBUG "Enable serial commands that simulate hardware buttons" OFF)
+option(VIBE_RECORDING_DIAGNOSTICS
+       "Persist the most recent recording transport summary for diagnosis" OFF)
 
 if(VIBE_BOARD STREQUAL "stickc_plus" OR VIBE_BOARD STREQUAL "stickc_plus_se")
     set(IDF_TARGET "esp32")
@@ -19,6 +21,28 @@ elseif(VIBE_BOARD STREQUAL "sticks3" OR VIBE_BOARD STREQUAL "cardputer_adv")
 else()
     message(FATAL_ERROR "Unsupported VIBE_BOARD: ${VIBE_BOARD}")
 endif()
+
+if(VIBE_BOARD STREQUAL "sticks3")
+    set(VIBE_FIRMWARE_VERSION_MACRO "VIBE_STICK_FIRMWARE_VERSION_STICKS3")
+elseif(VIBE_BOARD STREQUAL "cardputer_adv")
+    set(VIBE_FIRMWARE_VERSION_MACRO "VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV")
+elseif(VIBE_BOARD STREQUAL "stickc_plus")
+    set(VIBE_FIRMWARE_VERSION_MACRO "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS")
+else()
+    set(VIBE_FIRMWARE_VERSION_MACRO "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE")
+endif()
+set(VIBE_STICK_CONFIG_HEADER_PATH
+    "${CMAKE_CURRENT_LIST_DIR}/include/vibe_stick_config.h")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${VIBE_STICK_CONFIG_HEADER_PATH}")
+file(READ "${VIBE_STICK_CONFIG_HEADER_PATH}" VIBE_STICK_CONFIG_HEADER)
+string(REGEX MATCH
+       "#define[ \t]+${VIBE_FIRMWARE_VERSION_MACRO}[ \t]+\"([^\"]+)\""
+       VIBE_FIRMWARE_VERSION_MATCH "${VIBE_STICK_CONFIG_HEADER}")
+if(NOT VIBE_FIRMWARE_VERSION_MATCH)
+    message(FATAL_ERROR "Could not read ${VIBE_FIRMWARE_VERSION_MACRO} from vibe_stick_config.h")
+endif()
+set(PROJECT_VER "${CMAKE_MATCH_1}")
 
 set(EXTRA_COMPONENT_DIRS src)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

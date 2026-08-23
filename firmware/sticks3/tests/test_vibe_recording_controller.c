@@ -46,6 +46,14 @@ int main(void)
     assert(snapshot.uploaded_bytes == 640);
     assert(snapshot.bridge_stop_required);
 
+    command.type = VIBE_RECORDING_COMMAND_SET_UPLOAD_TOTALS;
+    command.data.upload_totals.chunk_count = 3;
+    command.data.upload_totals.uploaded_bytes = 1920;
+    assert(vibe_recording_controller_handle(&controller, &command));
+    vibe_recording_controller_snapshot(&controller, &snapshot);
+    assert(snapshot.chunk_id == 3);
+    assert(snapshot.uploaded_bytes == 1920);
+
     command.type = VIBE_RECORDING_COMMAND_RESET_SESSION;
     assert(vibe_recording_controller_handle(&controller, &command));
     vibe_recording_controller_snapshot(&controller, &snapshot);

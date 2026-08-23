@@ -24,7 +24,10 @@ def test_cardputer_message_http_runs_only_in_message_mode() -> None:
     assert "atomic_store(&s_sync_in_progress, false);" in sync_wrapper
     assert "if (action == MESSAGE_ACTION_OPEN)" in sync_task
     assert "next_sync_ms = 0;" in sync_task
-    assert "if (atomic_load(&s_active) && now_ms >= next_sync_ms)" in sync_task
+    assert "if (now_ms >= next_sync_ms)" in sync_task
+    assert "if (atomic_load(&s_active)) {" in sync_task
+    assert "sync_once();" in sync_task
+    assert "next_sync_ms = message_now_ms() + MESSAGE_SYNC_INTERVAL_MS;" in sync_task
     assert "if (!atomic_load(&s_active)) sync_once();" not in sync_task
 
 

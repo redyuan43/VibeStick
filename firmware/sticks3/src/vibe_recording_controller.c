@@ -103,6 +103,11 @@ bool vibe_recording_controller_handle(
         controller->chunk_id++;
         controller->uploaded_bytes += command->data.chunk_bytes;
         return true;
+    case VIBE_RECORDING_COMMAND_SET_UPLOAD_TOTALS:
+        controller->chunk_id = command->data.upload_totals.chunk_count;
+        controller->uploaded_bytes =
+            command->data.upload_totals.uploaded_bytes;
+        return true;
     case VIBE_RECORDING_COMMAND_RESET_SESSION:
         controller->session_id[0] = '\0';
         controller->local_capture = false;

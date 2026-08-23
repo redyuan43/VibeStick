@@ -40,6 +40,8 @@ typedef struct {
     vibe_cardputer_action_fn front_up;
     vibe_cardputer_action_fn front_confirm;
     vibe_cardputer_action_fn activity;
+    bool enable_air_mouse;
+    bool enable_messages;
     uint32_t opt_click_window_ms;
     uint32_t opt_long_press_ms;
     uint32_t opt_confirm_hold_ms;

@@ -54,6 +54,13 @@ cc -std=c11 -Wall -Wextra -Werror \
   -o build-host-tests/test_vibe_power_runtime
 ./build-host-tests/test_vibe_power_runtime
 
+cc -std=c11 -Wall -Wextra -Werror \
+  -I include \
+  tests/test_vibe_capture_profile.c \
+  src/vibe_capture_profile.c \
+  -o build-host-tests/test_vibe_capture_profile
+./build-host-tests/test_vibe_capture_profile
+
 CJSON_DIR="${IDF_PATH:-$HOME/esp/esp-idf}/components/json/cJSON"
 if [ -f "$CJSON_DIR/cJSON.c" ]; then
   cc -std=c11 -Wall -Wextra -Werror \

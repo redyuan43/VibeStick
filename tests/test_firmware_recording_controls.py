@@ -194,7 +194,8 @@ def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
 
     assert "start_recording_upload_task()" in source
     assert ".post_chunk = upload_recording_chunk" in source
-    assert "s_config.post_chunk(buffer, audio_len, s_config.context)" in upload_source
+    assert "s_config.post_chunk(" in upload_source
+    assert "buffer, audio_len, chunk_id, s_config.context" in upload_source
     assert "VIBE_STICK_RECORDING_AUDIO_PATH" in source
     assert '\\"session_id\\":\\"%s\\",\\"intent\\":\\"%s\\",\\"mode\\":\\"%s\\"' in source
 
@@ -643,9 +644,9 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     assert '\\"total_bytes\\":%lu' in source
     assert "recording stopped automatically after audio upload failure" in source
     controller = RECORDING_CONTROLLER_C.read_text(encoding="utf-8")
-    assert "VIBE_RECORDING_COMMAND_NOTE_CHUNK" in source
-    assert "controller->chunk_id++;" in controller
-    assert "controller->uploaded_bytes +=" in controller
+    assert "VIBE_RECORDING_COMMAND_SET_UPLOAD_TOTALS" in source
+    assert "controller->chunk_id = command->data.upload_totals.chunk_count;" in controller
+    assert "controller->uploaded_bytes =" in controller
     assert "RECORDING_UPLOAD_HTTP_TIMEOUT_MS 5000" in source
     assert ".timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS" in source
     assert "RECORDING_UPLOAD_RETRY_COUNT 3" in upload_source
@@ -655,6 +656,12 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     assert "vibe_wifi_runtime_rssi(&s_wifi)" in source
     assert "post_ms_min" in upload_source
     assert "vibe_recording_upload_log_diagnostics" in source
+    assert "recording upload worker=%u chunk=%u bytes=%u" in upload_source
+    assert "recording http timing bytes=%u init_ms=%lld connect_ms=%lld" in source
+    assert "s_upload_buffers[RECORDING_UPLOAD_MAX_PARALLEL]" in upload_source
+    assert "RECORDING_UPLOAD_MAX_PARALLEL 1" in upload_source
+    assert "atomic_fetch_add(&s_next_chunk_id, 1)" in upload_source
+    assert "heap_caps_malloc" not in upload_source
 
 
 def test_cardputer_recording_reuses_http_client_and_reports_profile_revision() -> None:
@@ -669,12 +676,24 @@ def test_cardputer_recording_reuses_http_client_and_reports_profile_revision() -
     assert '"X-Vibe-Stick-Firmware-Transport"' in card_headers
     assert '"X-Vibe-Stick-Firmware-Build-Date"' in card_headers
     assert '"X-Vibe-Stick-Input-Profile-Revision"' in card_headers
+    assert "#define RECORDING_UPLOAD_BATCH_CHUNKS 4" in source
+    assert "#define RECORDING_UPLOAD_BUFFER_BYTES 8192" in source
+    assert "#define RECORDING_UPLOAD_PARALLEL_WORKERS 1" in source
+    assert "#define HTTP_CLIENT_RX_BUFFER_SIZE 2048" in source
+    assert "#define HTTP_CLIENT_TX_BUFFER_SIZE 2048" in source
+    assert "static esp_http_client_handle_t s_recording_http_client;" in source
     assert ".keep_alive_enable = true" in post_binary
+    assert ".buffer_size = 512" in post_binary
+    assert ".buffer_size_tx = 512" in post_binary
     assert '"Connection", "keep-alive"' in post_binary
     assert "esp_http_client_set_url(s_recording_http_client, url)" in post_binary
     assert "esp_http_client_set_user_data(client, NULL)" in post_binary
     assert "s_recording_http_client = NULL" in source
     assert "recording_http_client_cleanup();" in source
+    assert "set_recording_http_headers" not in source
+    assert "set_common_http_headers(client" in post_binary
+    assert "esp_http_client_cleanup(client);" in post_binary
+    assert "recording_stream_" not in source
 
 
 def test_cardputer_opt_and_message_center_are_mutually_exclusive() -> None:
@@ -1608,10 +1627,10 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.68"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.42"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.2"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.62"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.70"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.44"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.4"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.66"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
@@ -1623,6 +1642,18 @@ def test_board_firmware_versions_remain_independent() -> None:
         '"cardputer_adv": "VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV"'
         in publisher
     )
+
+
+def test_cardputer_message_sync_waits_when_message_center_is_inactive() -> None:
+    source = (
+        ROOT / "firmware" / "sticks3" / "src" / "vibe_cardputer_messages.c"
+    ).read_text(encoding="utf-8")
+    sync_loop = source.split("while (true) {", 1)[1]
+    sync_loop = sync_loop.split("static const lv_font_t *message_font", 1)[0]
+
+    assert "if (now_ms >= next_sync_ms) {" in sync_loop
+    assert "if (atomic_load(&s_active)) {" in sync_loop
+    assert "next_sync_ms = message_now_ms() + MESSAGE_SYNC_INTERVAL_MS;" in sync_loop
 
 
 def test_cardputer_keyboard_restores_display_and_wakes_from_deep_sleep() -> None:
@@ -1803,3 +1834,31 @@ def test_firmware_runtime_ui_uses_ascii_only() -> None:
     assert re.search(r"[\u4e00-\u9fff]", source) is None
     assert "FONT_CN" not in source
     assert "vibe_stick_cn_16" not in cmake
+
+
+def test_recording_diagnostics_are_persisted_only_after_upload_completion() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    root_cmake = (ROOT / "firmware" / "sticks3" / "CMakeLists.txt").read_text(
+        encoding="utf-8"
+    )
+    component_cmake = (
+        ROOT / "firmware" / "sticks3" / "src" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+    upload_header = (
+        ROOT / "firmware" / "sticks3" / "include" / "vibe_recording_upload.h"
+    ).read_text(encoding="utf-8")
+    upload_source = RECORDING_UPLOAD_C.read_text(encoding="utf-8")
+    finish_stop = source.split("static void finish_recording_stop", 1)[1].split(
+        "static void recording_finalize_task", 1
+    )[0]
+
+    assert "option(VIBE_RECORDING_DIAGNOSTICS" in root_cmake
+    assert "VIBE_STICK_RECORDING_DIAGNOSTICS_ENABLED=1" in component_cmake
+    assert "vibe_recording_upload_diagnostics_t" in upload_header
+    assert "void vibe_recording_upload_diagnostics(" in upload_source
+    assert "DEVICE_PREF_RECORDING_DIAGNOSTIC_KEY" in source
+    assert "nvs_set_blob(handle, DEVICE_PREF_RECORDING_DIAGNOSTIC_KEY" in source
+    assert "log_persisted_recording_diagnostic();" in source
+    assert finish_stop.index("vibe_recording_upload_wait();") < finish_stop.index(
+        "persist_recording_diagnostic();"
+    )

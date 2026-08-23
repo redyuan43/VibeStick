@@ -194,9 +194,11 @@ esp_err_t vibe_cardputer_runtime_init(
     atomic_init(&runtime->opt_pending_clicks, 0);
     atomic_init(&runtime->opt_actions_pending, 0);
 
-    ESP_RETURN_ON_ERROR(
-        vibe_cardputer_air_mouse_init(&config->air_mouse),
-        TAG, "initialize air mouse");
+    if (config->enable_air_mouse) {
+        ESP_RETURN_ON_ERROR(
+            vibe_cardputer_air_mouse_init(&config->air_mouse),
+            TAG, "initialize air mouse");
+    }
 
     vibe_card_input_profile_default(&runtime->input_profile);
     esp_err_t profile_err =
@@ -233,10 +235,12 @@ esp_err_t vibe_cardputer_runtime_init(
     atomic_init(
         &runtime->opt_active_hold_route,
         VIBE_CARD_ROUTE_NONE);
-    ESP_RETURN_ON_FALSE(
-        vibe_cardputer_air_mouse_apply_settings(
-            &runtime->input_profile.air_mouse),
-        ESP_ERR_INVALID_ARG, TAG, "apply air mouse profile");
+    if (config->enable_air_mouse) {
+        ESP_RETURN_ON_FALSE(
+            vibe_cardputer_air_mouse_apply_settings(
+                &runtime->input_profile.air_mouse),
+            ESP_ERR_INVALID_ARG, TAG, "apply air mouse profile");
+    }
     ESP_RETURN_ON_ERROR(
         vibe_cardputer_volume_init(&config->volume),
         TAG, "initialize volume");
@@ -259,6 +263,9 @@ esp_err_t vibe_cardputer_runtime_start_messages(
     ESP_RETURN_ON_FALSE(
         runtime && runtime->initialized,
         ESP_ERR_INVALID_STATE, TAG, "runtime not initialized");
+    if (!runtime->config.enable_messages) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     if (runtime->messages_started) {
         return ESP_OK;
     }
@@ -280,10 +287,12 @@ vibe_cardputer_key_result_t vibe_cardputer_runtime_handle_feature_key(
         return VIBE_CARDPUTER_KEY_NOT_HANDLED;
     }
     if (vibe_cardputer_volume_handle_key(event) ||
-        vibe_cardputer_messages_handle_key(event)) {
+        (runtime->config.enable_messages &&
+         vibe_cardputer_messages_handle_key(event))) {
         return VIBE_CARDPUTER_KEY_CONSUMED_RELEASE_KEYBOARD;
     }
-    if (vibe_cardputer_air_mouse_handle_key(event)) {
+    if (runtime->config.enable_air_mouse &&
+        vibe_cardputer_air_mouse_handle_key(event)) {
         return VIBE_CARDPUTER_KEY_CONSUMED;
     }
     return VIBE_CARDPUTER_KEY_NOT_HANDLED;
@@ -297,9 +306,11 @@ esp_err_t vibe_cardputer_runtime_apply_profile(
         runtime && runtime->initialized && profile &&
             vibe_card_input_profile_valid(profile),
         ESP_ERR_INVALID_ARG, TAG, "invalid input profile");
-    ESP_RETURN_ON_FALSE(
-        vibe_cardputer_air_mouse_apply_settings(&profile->air_mouse),
-        ESP_ERR_INVALID_ARG, TAG, "apply air mouse settings");
+    if (runtime->config.enable_air_mouse) {
+        ESP_RETURN_ON_FALSE(
+            vibe_cardputer_air_mouse_apply_settings(&profile->air_mouse),
+            ESP_ERR_INVALID_ARG, TAG, "apply air mouse settings");
+    }
     ESP_RETURN_ON_ERROR(
         vibe_card_input_profile_save(profile),
         TAG, "save input profile");
@@ -325,6 +336,7 @@ void vibe_cardputer_runtime_tick(
     int64_t now_ms)
 {
     if (runtime && runtime->initialized &&
+        runtime->config.enable_air_mouse &&
         vibe_cardputer_air_mouse_enabled()) {
         vibe_cardputer_air_mouse_poll(now_ms);
     }
@@ -333,7 +345,8 @@ void vibe_cardputer_runtime_tick(
 void vibe_cardputer_runtime_stop_interactive(
     vibe_cardputer_runtime_t *runtime)
 {
-    if (runtime && runtime->initialized) {
+    if (runtime && runtime->initialized &&
+        runtime->config.enable_air_mouse) {
         vibe_cardputer_air_mouse_stop();
     }
 }
@@ -341,7 +354,8 @@ void vibe_cardputer_runtime_stop_interactive(
 void vibe_cardputer_runtime_release_display_resources(
     vibe_cardputer_runtime_t *runtime)
 {
-    if (runtime && runtime->messages_started) {
+    if (runtime && runtime->config.enable_messages &&
+        runtime->messages_started) {
         vibe_cardputer_messages_release_display_resources();
     }
 }
@@ -479,7 +493,8 @@ vibe_cardputer_runtime_opt_active_hold_route(
 bool vibe_cardputer_runtime_messages_busy(
     const vibe_cardputer_runtime_t *runtime)
 {
-    return runtime && runtime->messages_started &&
+    return runtime && runtime->config.enable_messages &&
+           runtime->messages_started &&
            vibe_cardputer_messages_busy();
 }
 
@@ -487,6 +502,7 @@ bool vibe_cardputer_runtime_air_mouse_enabled(
     const vibe_cardputer_runtime_t *runtime)
 {
     return runtime && runtime->initialized &&
+           runtime->config.enable_air_mouse &&
            vibe_cardputer_air_mouse_enabled();
 }
 

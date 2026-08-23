@@ -6,6 +6,7 @@
 
 #include "vibe_board.h"
 #include "vibe_board_profile.h"
+#include "vibe_capture_profile.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "driver/ledc.h"
@@ -29,7 +30,13 @@
 #define AUDIO_FRAME_SAMPLES ((VIBE_STICK_AUDIO_SAMPLE_RATE * AUDIO_FRAME_MS) / 1000)
 #define AUDIO_CHUNK_BYTES (AUDIO_FRAME_SAMPLES * VIBE_STICK_AUDIO_CHANNELS * \
                            (VIBE_STICK_AUDIO_BITS_PER_SAMPLE / 8))
+#define AUDIO_CAPTURE_MAX_OVERSAMPLING 2
+#define AUDIO_CAPTURE_MAX_SAMPLES (AUDIO_FRAME_SAMPLES * AUDIO_CAPTURE_MAX_OVERSAMPLING)
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+#define AUDIO_QUEUE_DEPTH 24
+#else
 #define AUDIO_QUEUE_DEPTH 12
+#endif
 #define AUDIO_READ_WAIT_MS (AUDIO_FRAME_MS + 50)
 #define TASK_EXIT_WAIT_MS 1200
 #define VIBE_STICK_SOUND_FRAME_SAMPLES 160
@@ -102,6 +109,9 @@ static i2s_chan_handle_t s_tx_handle;
 static i2s_chan_handle_t s_rx_handle;
 static bool s_tx_enabled;
 static bool s_rx_enabled;
+static const vibe_capture_profile_t *s_capture_profile;
+static vibe_capture_processor_t s_capture_processor;
+static int16_t s_capture_buffer[AUDIO_CAPTURE_MAX_SAMPLES];
 #if !VIBE_BOARD_HAS_GPIO_TONE_SPEAKER
 static bool s_streaming;
 #endif
@@ -134,15 +144,27 @@ static esp_err_t apply_output_volume(void)
 #endif
 
 #if VIBE_BOARD_HAS_ES8311
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-typedef struct {
-    uint8_t reg;
-    uint8_t value;
-} cardputer_codec_register_t;
-
-static esp_err_t apply_cardputer_codec_profile(esp_codec_dev_type_t dev_type)
+static esp_err_t apply_capture_es8311_profile(const vibe_capture_profile_t *profile)
 {
-    static const cardputer_codec_register_t speaker_profile[] = {
+    ESP_RETURN_ON_FALSE(profile != NULL, ESP_ERR_INVALID_ARG, TAG, "capture profile");
+    ESP_RETURN_ON_FALSE(profile->es8311_registers != NULL &&
+                            profile->es8311_register_count > 0,
+                        ESP_ERR_INVALID_STATE, TAG, "es8311 capture profile");
+    for (size_t i = 0; i < profile->es8311_register_count; ++i) {
+        ESP_RETURN_ON_FALSE(
+            esp_codec_dev_write_reg(s_codec, profile->es8311_registers[i].reg,
+                                    profile->es8311_registers[i].value) ==
+                ESP_CODEC_DEV_OK,
+            ESP_FAIL, TAG, "capture codec register 0x%02x",
+            profile->es8311_registers[i].reg);
+    }
+    return ESP_OK;
+}
+
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+static esp_err_t apply_cardputer_speaker_profile(void)
+{
+    static const vibe_capture_es8311_register_t speaker_profile[] = {
         {0x00, 0x80},
         {0x01, 0xB5},
         {0x02, 0x18},
@@ -152,42 +174,23 @@ static esp_err_t apply_cardputer_codec_profile(esp_codec_dev_type_t dev_type)
         {0x32, 0xBF},
         {0x37, 0x08},
     };
-    static const cardputer_codec_register_t microphone_profile[] = {
-        {0x00, 0x80},
-        {0x01, 0xBA},
-        {0x02, 0x18},
-        {0x0D, 0x01},
-        {0x0E, 0x02},
-        {0x14, 0x10},
-        {0x17, 0xBF},
-        {0x1C, 0x6A},
-    };
-
-    const cardputer_codec_register_t *profile = NULL;
-    size_t profile_count = 0;
-    if (dev_type == ESP_CODEC_DEV_TYPE_OUT) {
-        profile = speaker_profile;
-        profile_count = sizeof(speaker_profile) / sizeof(speaker_profile[0]);
-    } else if (dev_type == ESP_CODEC_DEV_TYPE_IN) {
-        profile = microphone_profile;
-        profile_count = sizeof(microphone_profile) / sizeof(microphone_profile[0]);
-    } else {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    for (size_t i = 0; i < profile_count; ++i) {
+    for (size_t i = 0; i < sizeof(speaker_profile) / sizeof(speaker_profile[0]); ++i) {
         ESP_RETURN_ON_FALSE(
-            esp_codec_dev_write_reg(s_codec, profile[i].reg, profile[i].value) ==
+            esp_codec_dev_write_reg(s_codec, speaker_profile[i].reg,
+                                    speaker_profile[i].value) ==
                 ESP_CODEC_DEV_OK,
             ESP_FAIL, TAG, "cardputer codec register 0x%02x",
-            profile[i].reg);
+            speaker_profile[i].reg);
     }
     return ESP_OK;
 }
 #endif
 
-static esp_err_t init_i2s_std(bool enable_tx, bool enable_rx)
+static esp_err_t init_i2s_std(bool enable_tx, bool enable_rx, uint32_t sample_rate,
+                              bool input_only_right)
 {
+    const vibe_capture_profile_t *profile = vibe_capture_profile_current();
+    ESP_RETURN_ON_FALSE(profile != NULL, ESP_ERR_INVALID_STATE, TAG, "capture profile");
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(VIBE_BOARD_I2S_PORT, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg,
@@ -196,15 +199,15 @@ static esp_err_t init_i2s_std(bool enable_tx, bool enable_rx)
                         TAG, "create i2s");
 
     i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(VIBE_STICK_AUDIO_SAMPLE_RATE),
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
                                                         I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .mclk = VIBE_BOARD_PIN_ES8311_MCLK,
-            .bclk = VIBE_BOARD_PIN_ES8311_BCLK,
-            .ws = VIBE_BOARD_PIN_ES8311_LRCK,
-            .dout = VIBE_BOARD_PIN_ES8311_DIN,
-            .din = VIBE_BOARD_PIN_ES8311_DOUT,
+            .mclk = (gpio_num_t)profile->mclk_pin,
+            .bclk = (gpio_num_t)profile->bclk_pin,
+            .ws = (gpio_num_t)profile->lrck_pin,
+            .dout = (gpio_num_t)profile->data_out_pin,
+            .din = (gpio_num_t)profile->data_in_pin,
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
@@ -213,6 +216,9 @@ static esp_err_t init_i2s_std(bool enable_tx, bool enable_rx)
         },
     };
     std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    if (enable_rx && input_only_right) {
+        std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT;
+    }
 
     if (s_tx_handle) {
         ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx_handle, &std_cfg), TAG, "init i2s tx");
@@ -227,7 +233,8 @@ static esp_err_t init_i2s_std(bool enable_tx, bool enable_rx)
     return ESP_OK;
 }
 
-static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mode_t work_mode)
+static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mode_t work_mode,
+                            uint32_t sample_rate, bool input_only_right)
 {
     i2c_master_bus_handle_t i2c_bus = vibe_board_i2c_bus();
     ESP_RETURN_ON_FALSE(i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG, "i2c unavailable");
@@ -281,19 +288,27 @@ static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mo
     esp_codec_dev_sample_info_t sample_cfg = {
         .bits_per_sample = I2S_DATA_BIT_WIDTH_16BIT,
         .channel = VIBE_STICK_AUDIO_CHANNELS,
-        .channel_mask = I2S_STD_SLOT_LEFT,
-        .sample_rate = VIBE_STICK_AUDIO_SAMPLE_RATE,
+        .channel_mask = input_only_right ? I2S_STD_SLOT_RIGHT : I2S_STD_SLOT_LEFT,
+        .sample_rate = sample_rate,
         .mclk_multiple = 0,
     };
     ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_codec, &sample_cfg) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "open codec");
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    ESP_RETURN_ON_ERROR(apply_cardputer_codec_profile(dev_type), TAG,
-                        "cardputer codec profile");
-#endif
     if (dev_type & ESP_CODEC_DEV_TYPE_IN) {
-        ESP_RETURN_ON_FALSE(esp_codec_dev_set_in_gain(s_codec, 36.0) == ESP_CODEC_DEV_OK,
-                            ESP_FAIL, TAG, "mic gain");
+        ESP_RETURN_ON_ERROR(apply_capture_es8311_profile(s_capture_profile), TAG,
+                            "capture codec profile");
+        if (s_capture_profile->input_gain_db != 0) {
+            ESP_RETURN_ON_FALSE(
+                esp_codec_dev_set_in_gain(
+                    s_codec, (float)s_capture_profile->input_gain_db) ==
+                    ESP_CODEC_DEV_OK,
+                ESP_FAIL, TAG, "capture input gain");
+        }
+#if defined(VIBE_BOARD_CARDPUTER_ADV)
+    } else if (dev_type & ESP_CODEC_DEV_TYPE_OUT) {
+        ESP_RETURN_ON_ERROR(apply_cardputer_speaker_profile(), TAG,
+                            "cardputer speaker profile");
+#endif
     }
     if (dev_type & ESP_CODEC_DEV_TYPE_OUT) {
         s_applied_output_volume = -1;
@@ -304,23 +319,27 @@ static esp_err_t init_codec(esp_codec_dev_type_t dev_type, esp_codec_dec_work_mo
 #endif
 
 #if VIBE_BOARD_HAS_PDM_MIC
-static esp_err_t init_i2s_pdm_rx(void)
+static esp_err_t init_i2s_pdm_rx(const vibe_capture_profile_t *profile)
 {
+    ESP_RETURN_ON_FALSE(profile != NULL, ESP_ERR_INVALID_ARG, TAG, "capture profile");
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(VIBE_BOARD_I2S_PORT, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &s_rx_handle), TAG, "create pdm rx");
 
     i2s_pdm_rx_config_t pdm_cfg = {
-        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(VIBE_STICK_AUDIO_SAMPLE_RATE),
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(vibe_capture_input_sample_rate(profile)),
         .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .clk = VIBE_BOARD_PIN_PDM_CLK,
-            .din = VIBE_BOARD_PIN_PDM_DATA,
+            .clk = (gpio_num_t)profile->pdm_clk_pin,
+            .din = (gpio_num_t)profile->pdm_data_pin,
             .invert_flags = {
                 .clk_inv = false,
             },
         },
     };
+    if (profile->input_only_right) {
+        pdm_cfg.slot_cfg.slot_mask = I2S_PDM_SLOT_RIGHT;
+    }
     ESP_RETURN_ON_ERROR(i2s_channel_init_pdm_rx_mode(s_rx_handle, &pdm_cfg), TAG, "init pdm rx");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx_handle), TAG, "enable pdm rx");
     s_rx_enabled = true;
@@ -627,9 +646,17 @@ static const sound_segment_t *sound_segments_for(agent_sound_t sound, size_t *co
 
 static esp_err_t read_audio_chunk(audio_chunk_t *chunk)
 {
+    ESP_RETURN_ON_FALSE(chunk != NULL && s_capture_profile != NULL,
+                        ESP_ERR_INVALID_STATE, TAG, "capture unavailable");
+    const size_t capture_samples =
+        AUDIO_FRAME_SAMPLES * s_capture_profile->oversampling;
+    ESP_RETURN_ON_FALSE(capture_samples <= AUDIO_CAPTURE_MAX_SAMPLES,
+                        ESP_ERR_INVALID_SIZE, TAG, "capture profile too large");
+    const size_t capture_bytes = capture_samples * sizeof(s_capture_buffer[0]);
+    size_t bytes_read = 0;
+
 #if VIBE_BOARD_HAS_ES8311
-    chunk->len = AUDIO_CHUNK_BYTES;
-    if (esp_codec_dev_read(s_codec, chunk->data, (int)chunk->len) !=
+    if (esp_codec_dev_read(s_codec, s_capture_buffer, (int)capture_bytes) !=
         ESP_CODEC_DEV_OK) {
         if (!atomic_load(&s_running)) {
             chunk->len = 0;
@@ -637,19 +664,31 @@ static esp_err_t read_audio_chunk(audio_chunk_t *chunk)
         }
         return ESP_FAIL;
     }
-    return ESP_OK;
+    bytes_read = capture_bytes;
 #else
-    size_t bytes_read = 0;
-    esp_err_t err = i2s_channel_read(s_rx_handle, chunk->data, sizeof(chunk->data),
+    esp_err_t err = i2s_channel_read(s_rx_handle, s_capture_buffer, capture_bytes,
                                      &bytes_read, pdMS_TO_TICKS(AUDIO_READ_WAIT_MS));
     if (err == ESP_ERR_TIMEOUT) {
         chunk->len = 0;
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(err, TAG, "audio read");
-    chunk->len = bytes_read;
-    return ESP_OK;
 #endif
+
+    if (!s_capture_profile->process_samples) {
+        ESP_RETURN_ON_FALSE(bytes_read <= sizeof(chunk->data), ESP_ERR_INVALID_SIZE, TAG,
+                            "direct capture too large");
+        memcpy(chunk->data, s_capture_buffer, bytes_read);
+        chunk->len = bytes_read;
+        return ESP_OK;
+    }
+
+    const size_t output_samples = vibe_capture_process_pcm16_mono(
+        &s_capture_processor, s_capture_profile, s_capture_buffer,
+        bytes_read / sizeof(s_capture_buffer[0]), (int16_t *)chunk->data,
+        AUDIO_FRAME_SAMPLES);
+    chunk->len = output_samples * sizeof(int16_t);
+    return ESP_OK;
 }
 
 static void audio_task(void *arg)
@@ -753,15 +792,27 @@ esp_err_t vibe_audio_start(void)
 
     vibe_audio_clear();
     memset(&s_audio_stats, 0, sizeof(s_audio_stats));
+    s_capture_profile = vibe_capture_profile_current();
+    ESP_RETURN_ON_FALSE(s_capture_profile != NULL &&
+                            s_capture_profile->output_sample_rate ==
+                                VIBE_STICK_AUDIO_SAMPLE_RATE &&
+                            s_capture_profile->oversampling <=
+                                AUDIO_CAPTURE_MAX_OVERSAMPLING,
+                        ESP_ERR_INVALID_STATE, TAG, "invalid capture profile");
+    vibe_capture_processor_reset(&s_capture_processor);
 
     esp_err_t err = ESP_OK;
 #if VIBE_BOARD_HAS_ES8311
-    err = init_i2s_std(false, true);
+    err = init_i2s_std(false, true,
+                       vibe_capture_input_sample_rate(s_capture_profile),
+                       s_capture_profile->input_only_right);
     if (err == ESP_OK) {
-        err = init_codec(ESP_CODEC_DEV_TYPE_IN, ESP_CODEC_DEV_WORK_MODE_ADC);
+        err = init_codec(ESP_CODEC_DEV_TYPE_IN, ESP_CODEC_DEV_WORK_MODE_ADC,
+                         vibe_capture_input_sample_rate(s_capture_profile),
+                         s_capture_profile->input_only_right);
     }
 #else
-    err = init_i2s_pdm_rx();
+    err = init_i2s_pdm_rx(s_capture_profile);
 #endif
     if (err != ESP_OK) {
         release_session_resources();
@@ -779,7 +830,17 @@ esp_err_t vibe_audio_start(void)
         return ESP_ERR_NO_MEM;
     }
     xSemaphoreGive(s_audio_mutex);
-    ESP_LOGI(TAG, "recording started");
+    ESP_LOGI(TAG,
+             "recording started board=%s input_hz=%u output_hz=%u oversampling=%u "
+             "gain=%u filter=%u input_gain=%u direct=%u",
+             s_capture_profile->board_name,
+             (unsigned)vibe_capture_input_sample_rate(s_capture_profile),
+             (unsigned)s_capture_profile->output_sample_rate,
+             (unsigned)s_capture_profile->oversampling,
+             (unsigned)s_capture_profile->magnification,
+             (unsigned)s_capture_profile->noise_filter_level,
+             (unsigned)s_capture_profile->input_gain_db,
+             s_capture_profile->process_samples ? 0U : 1U);
     return ESP_OK;
 }
 
@@ -858,10 +919,11 @@ esp_err_t vibe_audio_play_sound(agent_sound_t sound)
     esp_err_t err = vibe_board_speaker_set_enabled(true);
 #if VIBE_BOARD_HAS_ES8311
     if (err == ESP_OK) {
-        err = init_i2s_std(true, false);
+        err = init_i2s_std(true, false, VIBE_STICK_AUDIO_SAMPLE_RATE, false);
     }
     if (err == ESP_OK) {
-        err = init_codec(ESP_CODEC_DEV_TYPE_OUT, ESP_CODEC_DEV_WORK_MODE_DAC);
+        err = init_codec(ESP_CODEC_DEV_TYPE_OUT, ESP_CODEC_DEV_WORK_MODE_DAC,
+                         VIBE_STICK_AUDIO_SAMPLE_RATE, false);
     }
     if (err == ESP_OK) {
         err = play_sound_segments(segments, segment_count);
@@ -904,10 +966,11 @@ esp_err_t vibe_audio_play_stream_begin(void)
     esp_err_t err = vibe_board_speaker_set_enabled(true);
 #if VIBE_BOARD_HAS_ES8311
     if (err == ESP_OK) {
-        err = init_i2s_std(true, false);
+        err = init_i2s_std(true, false, VIBE_STICK_AUDIO_SAMPLE_RATE, false);
     }
     if (err == ESP_OK) {
-        err = init_codec(ESP_CODEC_DEV_TYPE_OUT, ESP_CODEC_DEV_WORK_MODE_DAC);
+        err = init_codec(ESP_CODEC_DEV_TYPE_OUT, ESP_CODEC_DEV_WORK_MODE_DAC,
+                         VIBE_STICK_AUDIO_SAMPLE_RATE, false);
     }
 #else
     err = ESP_ERR_NOT_SUPPORTED;
@@ -993,10 +1056,11 @@ esp_err_t vibe_audio_play_pcm16_mono(const uint8_t *pcm, size_t len)
     esp_err_t err = vibe_board_speaker_set_enabled(true);
 #if VIBE_BOARD_HAS_ES8311
     if (err == ESP_OK) {
-        err = init_i2s_std(true, false);
+        err = init_i2s_std(true, false, VIBE_STICK_AUDIO_SAMPLE_RATE, false);
     }
     if (err == ESP_OK) {
-        err = init_codec(ESP_CODEC_DEV_TYPE_OUT, ESP_CODEC_DEV_WORK_MODE_DAC);
+        err = init_codec(ESP_CODEC_DEV_TYPE_OUT, ESP_CODEC_DEV_WORK_MODE_DAC,
+                         VIBE_STICK_AUDIO_SAMPLE_RATE, false);
     }
     if (err == ESP_OK) {
         size_t offset = 0;

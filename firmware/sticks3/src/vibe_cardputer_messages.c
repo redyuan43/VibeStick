@@ -865,8 +865,10 @@ static void sync_task(void *argument)
             }
         }
         now_ms = message_now_ms();
-        if (atomic_load(&s_active) && now_ms >= next_sync_ms) {
-            sync_once();
+        if (now_ms >= next_sync_ms) {
+            if (atomic_load(&s_active)) {
+                sync_once();
+            }
             next_sync_ms = message_now_ms() + MESSAGE_SYNC_INTERVAL_MS;
         }
     }

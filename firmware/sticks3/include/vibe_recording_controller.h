@@ -33,6 +33,7 @@ typedef enum {
     VIBE_RECORDING_COMMAND_SET_SESSION_ID,
     VIBE_RECORDING_COMMAND_SET_CAPTURE_MODE,
     VIBE_RECORDING_COMMAND_NOTE_CHUNK,
+    VIBE_RECORDING_COMMAND_SET_UPLOAD_TOTALS,
     VIBE_RECORDING_COMMAND_RESET_SESSION,
     VIBE_RECORDING_COMMAND_SET_TAP_ACTIVE,
     VIBE_RECORDING_COMMAND_SET_MOTION_ACTIVE,
@@ -53,6 +54,10 @@ typedef struct {
         const char *session_id;
         bool flag;
         uint32_t chunk_bytes;
+        struct {
+            uint32_t chunk_count;
+            uint32_t uploaded_bytes;
+        } upload_totals;
     } data;
 } vibe_recording_command_t;
 
