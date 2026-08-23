@@ -7,6 +7,7 @@
 #include "vibe_cardputer_asr_board.h"
 #include "vibe_cardputer_capture.h"
 #include "vibe_cardputer_opt.h"
+#include "vibe_cardputer_status.h"
 #include "vibe_cardputer_upload.h"
 #include "vibe_stick_config.h"
 #include "vibe_wifi_runtime.h"
@@ -46,6 +47,17 @@ static char s_session_id[40];
 static bool wifi_is_connected(void)
 {
     return vibe_wifi_runtime_connected(&s_wifi);
+}
+
+static void wifi_status_changed(bool connected, const char *ip, void *context)
+{
+    (void)ip;
+    (void)context;
+    if (!s_recording) {
+        vibe_cardputer_status_show(
+            connected ? VIBE_CARDPUTER_STATUS_READY
+                      : VIBE_CARDPUTER_STATUS_WIFI);
+    }
 }
 
 static esp_err_t capture_response(esp_http_client_event_t *event)
@@ -185,10 +197,12 @@ static void make_session_id(void)
 static void start_recording(void)
 {
     if (s_recording || !wifi_is_connected()) {
+        vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_WIFI);
         ESP_LOGW(TAG, "start rejected recording=%d wifi=%d",
                  s_recording ? 1 : 0, wifi_is_connected() ? 1 : 0);
         return;
     }
+    vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_SENDING);
     make_session_id();
     char id[18] = {0};
     device_id(id, sizeof(id));
@@ -209,6 +223,7 @@ static void start_recording(void)
                             MINIMAL_RECORDING_START_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "recording start failed: %s", esp_err_to_name(err));
+        vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_ERROR);
         s_session_id[0] = '\0';
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             vibe_wifi_runtime_set_performance(&s_wifi, false));
@@ -217,6 +232,7 @@ static void start_recording(void)
     err = vibe_cardputer_capture_start();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "microphone start failed: %s", esp_err_to_name(err));
+        vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_ERROR);
         s_session_id[0] = '\0';
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             vibe_wifi_runtime_set_performance(&s_wifi, false));
@@ -224,6 +240,7 @@ static void start_recording(void)
     }
     if (!vibe_cardputer_upload_start(upload_audio, NULL)) {
         ESP_LOGW(TAG, "upload task start failed");
+        vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_ERROR);
         (void)vibe_cardputer_capture_stop();
         vibe_cardputer_capture_clear();
         s_session_id[0] = '\0';
@@ -232,6 +249,7 @@ static void start_recording(void)
         return;
     }
     s_recording = true;
+    vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_RECORDING);
     ESP_LOGI(TAG, "recording started session=%s", s_session_id);
 }
 
@@ -240,6 +258,7 @@ static void stop_recording(void)
     if (!s_recording) {
         return;
     }
+    vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_SENDING);
     (void)vibe_cardputer_capture_stop();
     vibe_cardputer_upload_wait();
     size_t posts = 0;
@@ -265,6 +284,9 @@ static void stop_recording(void)
     vibe_cardputer_capture_clear();
     s_session_id[0] = '\0';
     s_recording = false;
+    vibe_cardputer_status_show(
+        !failed && err == ESP_OK ? VIBE_CARDPUTER_STATUS_DONE
+                                 : VIBE_CARDPUTER_STATUS_ERROR);
     ESP_ERROR_CHECK_WITHOUT_ABORT(
         vibe_wifi_runtime_set_performance(&s_wifi, false));
 }
@@ -308,6 +330,7 @@ void vibe_cardputer_asr_minimal_start(void)
     }
     ESP_ERROR_CHECK(nvs_err);
     ESP_ERROR_CHECK(vibe_cardputer_asr_board_init());
+    ESP_ERROR_CHECK(vibe_cardputer_status_init());
     ESP_ERROR_CHECK(vibe_cardputer_capture_init());
     ESP_ERROR_CHECK(vibe_cardputer_upload_init());
     s_commands = xQueueCreate(4, sizeof(minimal_command_t));
@@ -317,6 +340,7 @@ void vibe_cardputer_asr_minimal_start(void)
     const vibe_wifi_runtime_config_t wifi = {
         .idle_power_save = WIFI_PS_MIN_MODEM,
         .max_tx_power = VIBE_CARDPUTER_WIFI_MAX_TX_POWER,
+        .status_changed = wifi_status_changed,
     };
     ESP_ERROR_CHECK(vibe_wifi_runtime_init(&s_wifi, &wifi));
     BaseType_t started = xTaskCreatePinnedToCore(
