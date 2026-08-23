@@ -7,6 +7,7 @@
 #define VIBE_STICK_RECORDING_START_PATH "/recording/start"
 #define VIBE_STICK_RECORDING_AUDIO_PATH "/recording/audio"
 #define VIBE_STICK_RECORDING_STOP_PATH "/recording/stop"
+#define VIBE_STICK_DEVICE_KEYBOARD_REPORT_PATH "/device/keyboard/report"
 
 #define VIBE_CARDPUTER_BOARD_NAME "cardputer_adv"
 #define VIBE_CARDPUTER_EVENT_SOURCE "cardputer_adv"

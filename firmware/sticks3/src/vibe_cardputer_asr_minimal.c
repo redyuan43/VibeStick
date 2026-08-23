@@ -5,7 +5,9 @@
 #include <string.h>
 
 #include "vibe_cardputer_asr_board.h"
+#include "vibe_cardputer_battery.h"
 #include "vibe_cardputer_capture.h"
+#include "vibe_cardputer_keyboard_bridge.h"
 #include "vibe_cardputer_opt.h"
 #include "vibe_cardputer_status.h"
 #include "vibe_cardputer_upload.h"
@@ -27,6 +29,7 @@
 #define MINIMAL_RECORDING_START_TIMEOUT_MS 1500
 #define MINIMAL_RECORDING_STOP_TIMEOUT_MS 30000
 #define MINIMAL_RECORDING_UPLOAD_TIMEOUT_MS 5000
+#define MINIMAL_KEYBOARD_REPORT_TIMEOUT_MS 1000
 static const char *TAG = "card_asr_min";
 
 typedef struct {
@@ -44,6 +47,11 @@ static QueueHandle_t s_commands;
 static bool s_recording;
 static char s_session_id[40];
 
+static esp_err_t request(const char *method, const char *path,
+                         const uint8_t *body, size_t body_len,
+                         const char *content_type, char *response,
+                         size_t response_len, int timeout_ms);
+
 static bool wifi_is_connected(void)
 {
     return vibe_wifi_runtime_connected(&s_wifi);
@@ -58,6 +66,28 @@ static void wifi_status_changed(bool connected, const char *ip, void *context)
             connected ? VIBE_CARDPUTER_STATUS_READY
                       : VIBE_CARDPUTER_STATUS_WIFI);
     }
+}
+
+static void refresh_battery_level(void)
+{
+    int level = 0;
+    if (vibe_cardputer_battery_level(&level) == ESP_OK) {
+        vibe_cardputer_status_set_battery_level(level);
+    }
+}
+
+static bool keyboard_online(void *context)
+{
+    (void)context;
+    return !s_recording && wifi_is_connected();
+}
+
+static esp_err_t post_keyboard_report(const char *body, void *context)
+{
+    (void)context;
+    return request("POST", VIBE_STICK_DEVICE_KEYBOARD_REPORT_PATH,
+                   (const uint8_t *)body, strlen(body), "application/json",
+                   NULL, 0, MINIMAL_KEYBOARD_REPORT_TIMEOUT_MS);
 }
 
 static esp_err_t capture_response(esp_http_client_event_t *event)
@@ -202,6 +232,7 @@ static void start_recording(void)
                  s_recording ? 1 : 0, wifi_is_connected() ? 1 : 0);
         return;
     }
+    vibe_cardputer_keyboard_bridge_suspend();
     vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_SENDING);
     make_session_id();
     char id[18] = {0};
@@ -225,6 +256,7 @@ static void start_recording(void)
         ESP_LOGW(TAG, "recording start failed: %s", esp_err_to_name(err));
         vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_ERROR);
         s_session_id[0] = '\0';
+        vibe_cardputer_keyboard_bridge_resume();
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             vibe_wifi_runtime_set_performance(&s_wifi, false));
         return;
@@ -234,6 +266,7 @@ static void start_recording(void)
         ESP_LOGW(TAG, "microphone start failed: %s", esp_err_to_name(err));
         vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_ERROR);
         s_session_id[0] = '\0';
+        vibe_cardputer_keyboard_bridge_resume();
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             vibe_wifi_runtime_set_performance(&s_wifi, false));
         return;
@@ -244,12 +277,14 @@ static void start_recording(void)
         (void)vibe_cardputer_capture_stop();
         vibe_cardputer_capture_clear();
         s_session_id[0] = '\0';
+        vibe_cardputer_keyboard_bridge_resume();
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             vibe_wifi_runtime_set_performance(&s_wifi, false));
         return;
     }
     s_recording = true;
     vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_RECORDING);
+    vibe_cardputer_status_set_recording_animation(true);
     ESP_LOGI(TAG, "recording started session=%s", s_session_id);
 }
 
@@ -258,6 +293,7 @@ static void stop_recording(void)
     if (!s_recording) {
         return;
     }
+    vibe_cardputer_status_set_recording_animation(false);
     vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_SENDING);
     (void)vibe_cardputer_capture_stop();
     vibe_cardputer_upload_wait();
@@ -284,6 +320,8 @@ static void stop_recording(void)
     vibe_cardputer_capture_clear();
     s_session_id[0] = '\0';
     s_recording = false;
+    vibe_cardputer_keyboard_bridge_resume();
+    refresh_battery_level();
     vibe_cardputer_status_show(
         !failed && err == ESP_OK ? VIBE_CARDPUTER_STATUS_DONE
                                  : VIBE_CARDPUTER_STATUS_ERROR);
@@ -291,14 +329,23 @@ static void stop_recording(void)
         vibe_wifi_runtime_set_performance(&s_wifi, false));
 }
 
-static void opt_pressed(void *context)
+static void keyboard_event(const vibe_cardputer_key_event_t *event,
+                           void *context)
 {
     (void)context;
-    if (!s_commands) {
+    if (!event) {
         return;
     }
-    const minimal_command_t command = MINIMAL_COMMAND_TOGGLE_RECORDING;
-    (void)xQueueSend(s_commands, &command, 0);
+    if (event->key == VIBE_CARDPUTER_KEY_OPT) {
+        if (event->pressed && s_commands) {
+            const minimal_command_t command = MINIMAL_COMMAND_TOGGLE_RECORDING;
+            (void)xQueueSend(s_commands, &command, 0);
+        }
+        return;
+    }
+    if (!s_recording) {
+        vibe_cardputer_keyboard_bridge_handle(event);
+    }
 }
 
 static void command_task(void *arg)
@@ -331,11 +378,12 @@ void vibe_cardputer_asr_minimal_start(void)
     ESP_ERROR_CHECK(nvs_err);
     ESP_ERROR_CHECK(vibe_cardputer_asr_board_init());
     ESP_ERROR_CHECK(vibe_cardputer_status_init());
+    ESP_ERROR_CHECK(vibe_cardputer_battery_init());
+    refresh_battery_level();
     ESP_ERROR_CHECK(vibe_cardputer_capture_init());
     ESP_ERROR_CHECK(vibe_cardputer_upload_init());
     s_commands = xQueueCreate(4, sizeof(minimal_command_t));
     ESP_ERROR_CHECK(s_commands ? ESP_OK : ESP_ERR_NO_MEM);
-    ESP_ERROR_CHECK(vibe_cardputer_opt_init(opt_pressed, NULL));
 
     const vibe_wifi_runtime_config_t wifi = {
         .idle_power_save = WIFI_PS_MIN_MODEM,
@@ -343,6 +391,12 @@ void vibe_cardputer_asr_minimal_start(void)
         .status_changed = wifi_status_changed,
     };
     ESP_ERROR_CHECK(vibe_wifi_runtime_init(&s_wifi, &wifi));
+    const vibe_cardputer_keyboard_bridge_config_t keyboard = {
+        .post = post_keyboard_report,
+        .online = keyboard_online,
+    };
+    ESP_ERROR_CHECK(vibe_cardputer_keyboard_bridge_init(&keyboard));
+    ESP_ERROR_CHECK(vibe_cardputer_opt_init(keyboard_event, NULL));
     BaseType_t started = xTaskCreatePinnedToCore(
         command_task, "asr_commands", 4096, NULL, 4, NULL, 0);
     ESP_ERROR_CHECK(started == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);

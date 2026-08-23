@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 typedef enum {
@@ -13,3 +15,5 @@ typedef enum {
 
 esp_err_t vibe_cardputer_status_init(void);
 void vibe_cardputer_status_show(vibe_cardputer_status_t status);
+void vibe_cardputer_status_set_battery_level(int level_percent);
+void vibe_cardputer_status_set_recording_animation(bool enabled);
