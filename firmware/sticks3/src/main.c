@@ -1,6 +1,6 @@
-#include "vibe_app_runtime.h"
+#include "vibe_cardputer_asr_minimal.h"
 
 void app_main(void)
 {
-    vibe_app_runtime_start();
+    vibe_cardputer_asr_minimal_start();
 }
