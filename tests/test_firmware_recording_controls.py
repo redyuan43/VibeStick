@@ -658,13 +658,17 @@ def test_recording_upload_keeps_append_chunks_and_logs_diagnostics() -> None:
     assert "vibe_recording_upload_log_diagnostics" in source
     assert "recording upload worker=%u chunk=%u bytes=%u" in upload_source
     assert "recording http timing bytes=%u init_ms=%lld connect_ms=%lld" in source
+    assert "recording_http_phase_stats_t" in source
+    assert "http_samples=%u target_ms=%lld/%lld init_ms=%lld/%lld" in source
+    assert "connect_ms=%lld/%lld headers_ms=%lld/%lld response_ms=%lld/%lld" in source
+    assert "memset(&s_recording_http_stats, 0, sizeof(s_recording_http_stats));" in source
     assert "s_upload_buffers[RECORDING_UPLOAD_MAX_PARALLEL]" in upload_source
     assert "RECORDING_UPLOAD_MAX_PARALLEL 1" in upload_source
     assert "atomic_fetch_add(&s_next_chunk_id, 1)" in upload_source
     assert "heap_caps_malloc" not in upload_source
 
 
-def test_cardputer_recording_reuses_http_client_and_reports_profile_revision() -> None:
+def test_cardputer_recording_uses_common_http_client_and_reports_profile_revision() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     card_headers = source.split(
         "static void set_common_http_headers", 1
@@ -676,20 +680,18 @@ def test_cardputer_recording_reuses_http_client_and_reports_profile_revision() -
     assert '"X-Vibe-Stick-Firmware-Transport"' in card_headers
     assert '"X-Vibe-Stick-Firmware-Build-Date"' in card_headers
     assert '"X-Vibe-Stick-Input-Profile-Revision"' in card_headers
-    assert "#define RECORDING_UPLOAD_BATCH_CHUNKS 4" in source
-    assert "#define RECORDING_UPLOAD_BUFFER_BYTES 8192" in source
+    assert "#define RECORDING_UPLOAD_BATCH_CHUNKS 2" in source
+    assert "#define RECORDING_UPLOAD_BUFFER_BYTES 4096" in source
+    assert "#if defined(VIBE_BOARD_CARDPUTER_ADV)\n#define RECORDING_UPLOAD_BATCH_CHUNKS" not in source
     assert "#define RECORDING_UPLOAD_PARALLEL_WORKERS 1" in source
     assert "#define HTTP_CLIENT_RX_BUFFER_SIZE 2048" in source
     assert "#define HTTP_CLIENT_TX_BUFFER_SIZE 2048" in source
-    assert "static esp_http_client_handle_t s_recording_http_client;" in source
-    assert ".keep_alive_enable = true" in post_binary
-    assert ".buffer_size = 512" in post_binary
-    assert ".buffer_size_tx = 512" in post_binary
-    assert '"Connection", "keep-alive"' in post_binary
-    assert "esp_http_client_set_url(s_recording_http_client, url)" in post_binary
-    assert "esp_http_client_set_user_data(client, NULL)" in post_binary
-    assert "s_recording_http_client = NULL" in source
-    assert "recording_http_client_cleanup();" in source
+    assert "s_recording_http_client" not in source
+    assert ".keep_alive_enable = true" not in post_binary
+    assert ".buffer_size = 512" not in post_binary
+    assert ".buffer_size_tx = 512" not in post_binary
+    assert '"Connection", "keep-alive"' not in post_binary
+    assert "recording_http_client_cleanup" not in source
     assert "set_recording_http_headers" not in source
     assert "set_common_http_headers(client" in post_binary
     assert "esp_http_client_cleanup(client);" in post_binary
@@ -1630,7 +1632,7 @@ def test_board_firmware_versions_remain_independent() -> None:
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.70"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.44"' in config
     assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.4"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.66"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.68"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
@@ -1858,6 +1860,8 @@ def test_recording_diagnostics_are_persisted_only_after_upload_completion() -> N
     assert "void vibe_recording_upload_diagnostics(" in upload_source
     assert "DEVICE_PREF_RECORDING_DIAGNOSTIC_KEY" in source
     assert "nvs_set_blob(handle, DEVICE_PREF_RECORDING_DIAGNOSTIC_KEY" in source
+    assert "RECORDING_DIAGNOSTIC_STORE_VERSION 2u" in source
+    assert ".http = s_recording_http_stats" in source
     assert "log_persisted_recording_diagnostic();" in source
     assert finish_stop.index("vibe_recording_upload_wait();") < finish_stop.index(
         "persist_recording_diagnostic();"

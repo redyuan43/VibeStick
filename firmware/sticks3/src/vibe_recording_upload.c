@@ -15,7 +15,7 @@
 static const char *TAG = "vibe_stick";
 #define RECORDING_UPLOAD_RETRY_COUNT 3
 #define RECORDING_UPLOAD_RETRY_DELAY_MS 120
-#define RECORDING_UPLOAD_BUFFER_CAPACITY 8192
+#define RECORDING_UPLOAD_BUFFER_CAPACITY 4096
 #define RECORDING_UPLOAD_MAX_PARALLEL 1
 
 static vibe_recording_upload_config_t s_config;

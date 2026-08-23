@@ -69,13 +69,8 @@
 #define LCD_BACKLIGHT_DEFAULT VIBE_BOARD_LCD_BACKLIGHT_DEFAULT
 #define LCD_BACKLIGHT_IDLE VIBE_BOARD_LCD_BACKLIGHT_IDLE
 #define LCD_BACKLIGHT_OFF VIBE_BOARD_LCD_BACKLIGHT_OFF
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-#define RECORDING_UPLOAD_BATCH_CHUNKS 4
-#define RECORDING_UPLOAD_BUFFER_BYTES 8192
-#else
 #define RECORDING_UPLOAD_BATCH_CHUNKS 2
 #define RECORDING_UPLOAD_BUFFER_BYTES 4096
-#endif
 #define RECORDING_UPLOAD_PARALLEL_WORKERS 1
 #define RECORDING_UPLOAD_HTTP_TIMEOUT_MS 5000
 #define RECORDING_START_TIMEOUT_MS 1200
@@ -163,7 +158,7 @@
 #define DEVICE_PREF_SLEEP_MINUTES_KEY "sleep_min"
 #define DEVICE_PREF_RECORDING_DIAGNOSTIC_KEY "rec_diag"
 #define RECORDING_DIAGNOSTIC_MAGIC 0x56444244u
-#define RECORDING_DIAGNOSTIC_STORE_VERSION 1u
+#define RECORDING_DIAGNOSTIC_STORE_VERSION 2u
 #define DEVICE_PREF_MOTION_CALIBRATION_KEY "motion_cal_v1"
 #define MOTION_CALIBRATION_MAGIC 0x564d4341u
 #define MOTION_CALIBRATION_STORE_VERSION 1
@@ -256,11 +251,26 @@ typedef struct {
 } motion_calibration_store_t;
 
 typedef struct {
+    uint32_t samples;
+    int64_t target_total_ms;
+    int64_t target_max_ms;
+    int64_t init_total_ms;
+    int64_t init_max_ms;
+    int64_t connect_total_ms;
+    int64_t connect_max_ms;
+    int64_t headers_total_ms;
+    int64_t headers_max_ms;
+    int64_t response_total_ms;
+    int64_t response_max_ms;
+} recording_http_phase_stats_t;
+
+typedef struct {
     uint32_t magic;
     uint16_t version;
     uint16_t size;
     char board[16];
     vibe_recording_upload_diagnostics_t diagnostics;
+    recording_http_phase_stats_t http;
 } recording_diagnostic_store_t;
 
 typedef enum {
@@ -335,9 +345,7 @@ static vibe_bridge_registry_t s_bridge_registry;
 static vibe_bridge_client_t s_bridge_client;
 static vibe_ui_t s_ui;
 static atomic_bool s_deep_sleep_committed;
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-static esp_http_client_handle_t s_recording_http_client;
-#endif
+static recording_http_phase_stats_t s_recording_http_stats;
 static bridge_discovered_profile_t
     s_bridge_scan_profiles[VIBE_STICK_BRIDGE_PROFILE_MAX_COUNT];
 static size_t s_bridge_scan_profile_count;
@@ -744,6 +752,7 @@ static void persist_recording_diagnostic(void)
         .magic = RECORDING_DIAGNOSTIC_MAGIC,
         .version = RECORDING_DIAGNOSTIC_STORE_VERSION,
         .size = sizeof(recording_diagnostic_store_t),
+        .http = s_recording_http_stats,
     };
     snprintf(store.board, sizeof(store.board), "%s", VIBE_BOARD_NAME);
     vibe_recording_upload_diagnostics(&store.diagnostics);
@@ -789,10 +798,14 @@ static void log_persisted_recording_diagnostic(void)
 
     const vibe_audio_stats_t *audio = &store.diagnostics.audio;
     const vibe_recording_upload_stats_t *upload = &store.diagnostics.upload;
+    const recording_http_phase_stats_t *http = &store.http;
+    const int64_t samples = http->samples > 0 ? http->samples : 1;
     ESP_LOGI(TAG,
              "saved recording diagnostic board=%s read=%u queued=%u dropped=%u "
              "drop_bytes=%u posts=%u uploaded=%u upload_fail=%u max_pending=%u "
-             "post_ms_avg=%lld post_ms_max=%lld rssi=%d/%d",
+             "post_ms_avg=%lld post_ms_max=%lld rssi=%d/%d "
+             "http_samples=%u target_ms=%lld/%lld init_ms=%lld/%lld "
+             "connect_ms=%lld/%lld headers_ms=%lld/%lld response_ms=%lld/%lld",
              store.board,
              (unsigned)audio->chunks_read,
              (unsigned)audio->chunks_queued,
@@ -805,7 +818,18 @@ static void log_persisted_recording_diagnostic(void)
              (long long)vibe_recording_upload_stats_average_post_ms(upload),
              (long long)upload->post_duration_max_ms,
              upload->start_rssi,
-             upload->stop_rssi);
+             upload->stop_rssi,
+             (unsigned)http->samples,
+             (long long)(http->target_total_ms / samples),
+             (long long)http->target_max_ms,
+             (long long)(http->init_total_ms / samples),
+             (long long)http->init_max_ms,
+             (long long)(http->connect_total_ms / samples),
+             (long long)http->connect_max_ms,
+             (long long)(http->headers_total_ms / samples),
+             (long long)http->headers_max_ms,
+             (long long)(http->response_total_ms / samples),
+             (long long)http->response_max_ms);
 }
 #else
 static void persist_recording_diagnostic(void)
@@ -3372,6 +3396,7 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     char url[256];
     bridge_target_t target;
     ESP_RETURN_ON_ERROR(bridge_prepare_active_target(&target), TAG, "prepare bridge target");
+    const int64_t target_ready_ms = esp_timer_get_time() / 1000;
     snprintf(url, sizeof(url), "http://%s:%d%s", target.host, target.port, path);
     http_response_capture_t capture = {
         .data = response,
@@ -3381,33 +3406,6 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     if (response && response_len > 0) {
         response[0] = '\0';
     }
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    /*
-     * Cardputer has no PSRAM. Keep one HTTP connection for the active
-     * recording session rather than allocating and connecting every 120 ms.
-     */
-    vibe_bridge_client_lock(&s_bridge_client);
-    if (!s_recording_http_client) {
-        const esp_http_client_config_t config = {
-            .url = url,
-            .timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS,
-            .buffer_size = 512,
-            .buffer_size_tx = 512,
-            .event_handler = http_event_handler,
-            .keep_alive_enable = true,
-        };
-        s_recording_http_client = esp_http_client_init(&config);
-    } else {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            esp_http_client_set_url(s_recording_http_client, url));
-    }
-    esp_http_client_handle_t client = s_recording_http_client;
-    if (!client) {
-        vibe_bridge_client_unlock(&s_bridge_client);
-        ESP_LOGE(TAG, "recording http init");
-        return ESP_ERR_NO_MEM;
-    }
-#else
     const esp_http_client_config_t config = {
         .url = url,
         .timeout_ms = RECORDING_UPLOAD_HTTP_TIMEOUT_MS,
@@ -3418,7 +3416,6 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     ESP_RETURN_ON_FALSE(client != NULL, ESP_ERR_NO_MEM, TAG, "http init");
-#endif
     const int64_t client_ready_ms = esp_timer_get_time() / 1000;
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     bridge_profile_snapshot_t profile;
@@ -3430,10 +3427,6 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     esp_http_client_set_header(client, "X-Vibe-Stick-Sample-Rate", "16000");
     esp_http_client_set_header(client, "X-Vibe-Stick-Channels", "1");
     esp_http_client_set_header(client, "X-Vibe-Stick-Bits-Per-Sample", "16");
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    esp_http_client_set_header(client, "Connection", "keep-alive");
-    esp_http_client_set_user_data(client, &capture);
-#endif
     esp_http_client_set_post_field(client, (const char *)body, body_len);
     esp_err_t err = esp_http_client_perform(client);
     int status_code = esp_http_client_get_status_code(client);
@@ -3456,6 +3449,24 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
         capture.first_response_ms > 0 && capture.headers_sent_ms > 0
             ? capture.first_response_ms - capture.headers_sent_ms
             : -1;
+    const int64_t target_wait_ms = target_ready_ms - request_start_ms;
+    const int64_t init_wait_ms = client_ready_ms - target_ready_ms;
+    recording_http_phase_stats_t *http_stats = &s_recording_http_stats;
+    http_stats->samples++;
+#define NOTE_HTTP_PHASE(name, value)                         \
+    do {                                                     \
+        const int64_t phase_ms = (value) >= 0 ? (value) : 0; \
+        http_stats->name##_total_ms += phase_ms;             \
+        if (phase_ms > http_stats->name##_max_ms) {          \
+            http_stats->name##_max_ms = phase_ms;            \
+        }                                                    \
+    } while (0)
+    NOTE_HTTP_PHASE(target, target_wait_ms);
+    NOTE_HTTP_PHASE(init, init_wait_ms);
+    NOTE_HTTP_PHASE(connect, connected_wait_ms);
+    NOTE_HTTP_PHASE(headers, request_wait_ms);
+    NOTE_HTTP_PHASE(response, response_wait_ms);
+#undef NOTE_HTTP_PHASE
 #if VIBE_STICK_SERIAL_DEBUG_ENABLED
     ESP_LOGI(TAG,
              "recording http timing bytes=%u init_ms=%lld connect_ms=%lld "
@@ -3475,32 +3486,10 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
     (void)response_wait_ms;
     (void)finished_ms;
 #endif
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-    esp_http_client_set_user_data(client, NULL);
-    esp_http_client_set_post_field(client, "", 0);
-    if (err != ESP_OK) {
-        esp_http_client_cleanup(client);
-        s_recording_http_client = NULL;
-    }
-    vibe_bridge_client_unlock(&s_bridge_client);
-#else
     esp_http_client_cleanup(client);
-#endif
     bridge_target_note_result(target.profile_id, err);
     return err;
 }
-
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-static void recording_http_client_cleanup(void)
-{
-    vibe_bridge_client_lock(&s_bridge_client);
-    if (s_recording_http_client) {
-        esp_http_client_cleanup(s_recording_http_client);
-        s_recording_http_client = NULL;
-    }
-    vibe_bridge_client_unlock(&s_bridge_client);
-}
-#endif
 
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
 typedef struct {
@@ -4420,6 +4409,7 @@ static esp_err_t upload_recording_chunk(const uint8_t *audio, size_t audio_len,
 
 static bool start_recording_upload_task(void)
 {
+    memset(&s_recording_http_stats, 0, sizeof(s_recording_http_stats));
     const vibe_recording_upload_config_t config = {
         .buffer_bytes = RECORDING_UPLOAD_BUFFER_BYTES,
         .batch_chunks = RECORDING_UPLOAD_BATCH_CHUNKS,
@@ -4448,7 +4438,6 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         ESP_LOGI(TAG, "recording start ignored while message center is busy");
         return false;
     }
-    recording_http_client_cleanup();
 #endif
     register_activity();
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
@@ -4558,9 +4547,6 @@ static bool handle_recording_start_internal(const char *event_name, const char *
     if (!start_recording_upload_task()) {
         (void)vibe_audio_stop();
         vibe_audio_clear();
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-        recording_http_client_cleanup();
-#endif
         show_recording_overlay("SEND FAILED", "", true);
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
@@ -4588,9 +4574,6 @@ static void finish_recording_stop(const char *event_name)
                      esp_err_to_name(audio_err));
         }
         vibe_recording_upload_wait();
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-        recording_http_client_cleanup();
-#endif
         upload_failed = vibe_recording_upload_failed();
         size_t uploaded_posts = 0;
         size_t uploaded_bytes = 0;
@@ -4712,9 +4695,6 @@ static void handle_recording_stop(const char *event_name)
     if (s_recording_session_id[0] == '\0') {
         (void)vibe_audio_stop();
         vibe_audio_clear();
-#if defined(VIBE_BOARD_CARDPUTER_ADV)
-        recording_http_client_cleanup();
-#endif
         clear_ptt_followup_enter_window();
         poll_state();
         show_recording_overlay(NULL, NULL, false);
@@ -4739,7 +4719,6 @@ static void handle_recording_stop(const char *event_name)
     if (s_recording_local_capture) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(vibe_audio_stop());
         vibe_recording_upload_wait();
-        recording_http_client_cleanup();
     }
 #endif
     BaseType_t ok = xTaskCreatePinnedToCore(recording_finalize_task, "recording_finalize", 8192,
