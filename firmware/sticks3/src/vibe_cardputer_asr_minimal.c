@@ -24,12 +24,16 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-#define MINIMAL_HTTP_RX_BYTES 512
+#define MINIMAL_HTTP_RX_BYTES 2048
 #define MINIMAL_HTTP_TX_BYTES 2048
 #define MINIMAL_RECORDING_START_TIMEOUT_MS 1500
 #define MINIMAL_RECORDING_STOP_TIMEOUT_MS 30000
 #define MINIMAL_RECORDING_UPLOAD_TIMEOUT_MS 5000
 #define MINIMAL_KEYBOARD_REPORT_TIMEOUT_MS 1000
+#define MINIMAL_OPT_LONG_PRESS_MS 600
+#define MINIMAL_DISPLAY_IDLE_MS 60000
+#define MINIMAL_BATTERY_REFRESH_MS 30000
+#define MINIMAL_MAINTENANCE_POLL_MS 250
 static const char *TAG = "card_asr_min";
 
 typedef struct {
@@ -39,13 +43,22 @@ typedef struct {
 } response_capture_t;
 
 typedef enum {
-    MINIMAL_COMMAND_TOGGLE_RECORDING = 1,
+    MINIMAL_COMMAND_OPT_PRESS = 1,
+    MINIMAL_COMMAND_OPT_RELEASE,
+} minimal_command_type_t;
+
+typedef struct {
+    minimal_command_type_t type;
+    TickType_t tick;
 } minimal_command_t;
 
 static vibe_wifi_runtime_t s_wifi;
 static QueueHandle_t s_commands;
 static bool s_recording;
+static bool s_display_on = true;
+static TickType_t s_last_activity_tick;
 static char s_session_id[40];
+static char s_start_response[MINIMAL_HTTP_RX_BYTES];
 
 static esp_err_t request(const char *method, const char *path,
                          const uint8_t *body, size_t body_len,
@@ -74,6 +87,28 @@ static void refresh_battery_level(void)
     if (vibe_cardputer_battery_level(&level) == ESP_OK) {
         vibe_cardputer_status_set_battery_level(level);
     }
+}
+
+static void note_display_activity(void)
+{
+    s_last_activity_tick = xTaskGetTickCount();
+    if (!s_display_on) {
+        vibe_cardputer_status_set_display_enabled(true);
+        s_display_on = true;
+        ESP_LOGI(TAG, "display restored");
+    }
+}
+
+static void maybe_turn_display_off(void)
+{
+    if (!s_display_on || s_recording ||
+        xTaskGetTickCount() - s_last_activity_tick <
+            pdMS_TO_TICKS(MINIMAL_DISPLAY_IDLE_MS)) {
+        return;
+    }
+    vibe_cardputer_status_set_display_enabled(false);
+    s_display_on = false;
+    ESP_LOGI(TAG, "display off after idle");
 }
 
 static bool keyboard_online(void *context)
@@ -175,6 +210,17 @@ static esp_err_t request(const char *method, const char *path,
     if (content_type) {
         esp_http_client_set_header(client, "Content-Type", content_type);
     }
+    if (content_type &&
+        strcmp(content_type, VIBE_CARDPUTER_CAPTURE_CONTENT_TYPE) == 0) {
+        esp_http_client_set_header(
+            client, "X-Vibe-Stick-Audio-Encoding",
+            VIBE_CARDPUTER_CAPTURE_AUDIO_ENCODING);
+        esp_http_client_set_header(client, "X-Vibe-Stick-Audio-Sample-Rate",
+                                   "16000");
+        esp_http_client_set_header(client, "X-Vibe-Stick-Audio-Channels", "1");
+        esp_http_client_set_header(client,
+                                   "X-Vibe-Stick-Audio-Block-Samples", "960");
+    }
     if (body && body_len > 0) {
         esp_http_client_set_post_field(client, (const char *)body, body_len);
     }
@@ -214,7 +260,7 @@ static esp_err_t upload_audio(const uint8_t *audio, size_t audio_len,
              s_session_id, (unsigned long)chunk_id,
              (unsigned long)crc32(audio, audio_len));
     return request("POST", path, audio, audio_len,
-                   "application/octet-stream", NULL, 0,
+                   VIBE_CARDPUTER_CAPTURE_CONTENT_TYPE, NULL, 0,
                    MINIMAL_RECORDING_UPLOAD_TIMEOUT_MS);
 }
 
@@ -242,18 +288,24 @@ static void start_recording(void)
              "{\"event\":\"cardputer_opt\",\"source\":\"%s\","
              "\"audio_source\":\"%s\",\"session_id\":\"%s\","
              "\"device_id\":\"%s\",\"intent\":\"dictation\","
-             "\"mode\":\"PTT\",\"protocol_version\":2}",
+             "\"mode\":\"PTT\",\"protocol_version\":2,"
+             "\"transport_encoding\":\"%s\"}",
              VIBE_CARDPUTER_EVENT_SOURCE, VIBE_CARDPUTER_AUDIO_SOURCE,
-             s_session_id, id);
-    char response[MINIMAL_HTTP_RX_BYTES] = {0};
+             s_session_id, id, VIBE_CARDPUTER_CAPTURE_AUDIO_ENCODING);
+    memset(s_start_response, 0, sizeof(s_start_response));
     ESP_ERROR_CHECK_WITHOUT_ABORT(
         vibe_wifi_runtime_set_performance(&s_wifi, true));
     esp_err_t err = request("POST", VIBE_STICK_RECORDING_START_PATH,
                             (const uint8_t *)body, strlen(body),
-                            "application/json", response, sizeof(response),
+                            "application/json", s_start_response,
+                            sizeof(s_start_response),
                             MINIMAL_RECORDING_START_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "recording start failed: %s", esp_err_to_name(err));
+    const bool transport_accepted =
+        strstr(s_start_response,
+               "\"accepted_transport_encoding\":\"ima-adpcm-v1\"") != NULL;
+    if (err != ESP_OK || !transport_accepted) {
+        ESP_LOGW(TAG, "recording start failed: %s transport_accepted=%d",
+                 esp_err_to_name(err), transport_accepted ? 1 : 0);
         vibe_cardputer_status_show(VIBE_CARDPUTER_STATUS_ERROR);
         s_session_id[0] = '\0';
         vibe_cardputer_keyboard_bridge_resume();
@@ -300,23 +352,37 @@ static void stop_recording(void)
     size_t posts = 0;
     size_t bytes = 0;
     vibe_cardputer_upload_totals(&posts, &bytes);
+    size_t wire_bytes = vibe_cardputer_upload_wire_bytes();
     bool failed = vibe_cardputer_upload_failed();
-    char body[320];
+    vibe_cardputer_capture_stats_t capture_stats = {0};
+    vibe_cardputer_capture_stats(&capture_stats);
+    if (capture_stats.chunks_dropped > 0) {
+        failed = true;
+    }
+    char body[384];
     snprintf(body, sizeof(body),
              "{\"event\":\"cardputer_opt\",\"source\":\"%s\","
              "\"session_id\":\"%s\",\"intent\":\"dictation\",\"mode\":\"PTT\","
              "\"paste\":true,\"protocol_version\":2,\"total_chunks\":%u,"
-             "\"total_bytes\":%u,\"upload_failed\":%s}",
+             "\"total_bytes\":%u,\"total_wire_bytes\":%u,"
+             "\"transport_encoding\":\"%s\",\"dropped_chunks\":%u,"
+             "\"dropped_bytes\":%u,\"upload_failed\":%s}",
              VIBE_CARDPUTER_EVENT_SOURCE, s_session_id,
-             (unsigned)posts, (unsigned)bytes, failed ? "true" : "false");
-    char response[MINIMAL_HTTP_RX_BYTES] = {0};
+             (unsigned)posts, (unsigned)bytes, (unsigned)wire_bytes,
+             VIBE_CARDPUTER_CAPTURE_AUDIO_ENCODING,
+             (unsigned)capture_stats.chunks_dropped,
+             (unsigned)capture_stats.bytes_dropped,
+             failed ? "true" : "false");
     esp_err_t err = request("POST", VIBE_STICK_RECORDING_STOP_PATH,
                             (const uint8_t *)body, strlen(body),
-                            "application/json", response, sizeof(response),
+                            "application/json", NULL, 0,
                             MINIMAL_RECORDING_STOP_TIMEOUT_MS);
-    ESP_LOGI(TAG, "recording stopped posts=%u bytes=%u upload_failed=%d stop=%s",
-             (unsigned)posts, (unsigned)bytes, failed ? 1 : 0,
-             esp_err_to_name(err));
+    ESP_LOGI(TAG,
+             "recording stopped posts=%u pcm_bytes=%u wire_bytes=%u "
+             "dropped=%u upload_failed=%d stop=%s",
+             (unsigned)posts, (unsigned)bytes, (unsigned)wire_bytes,
+             (unsigned)capture_stats.chunks_dropped,
+             failed ? 1 : 0, esp_err_to_name(err));
     vibe_cardputer_capture_clear();
     s_session_id[0] = '\0';
     s_recording = false;
@@ -336,9 +402,14 @@ static void keyboard_event(const vibe_cardputer_key_event_t *event,
     if (!event) {
         return;
     }
+    note_display_activity();
     if (event->key == VIBE_CARDPUTER_KEY_OPT) {
-        if (event->pressed && s_commands) {
-            const minimal_command_t command = MINIMAL_COMMAND_TOGGLE_RECORDING;
+        if (s_commands) {
+            const minimal_command_t command = {
+                .type = event->pressed ? MINIMAL_COMMAND_OPT_PRESS
+                                       : MINIMAL_COMMAND_OPT_RELEASE,
+                .tick = xTaskGetTickCount(),
+            };
             (void)xQueueSend(s_commands, &command, 0);
         }
         return;
@@ -351,18 +422,50 @@ static void keyboard_event(const vibe_cardputer_key_event_t *event,
 static void command_task(void *arg)
 {
     (void)arg;
+    TickType_t opt_press_tick = 0;
+    bool opt_started_recording = false;
     while (true) {
-        minimal_command_t command = 0;
+        minimal_command_t command = {0};
         if (xQueueReceive(s_commands, &command, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (command == MINIMAL_COMMAND_TOGGLE_RECORDING) {
+        if (command.type == MINIMAL_COMMAND_OPT_PRESS) {
+            opt_press_tick = command.tick;
+            opt_started_recording = false;
             if (s_recording) {
                 stop_recording();
             } else {
                 start_recording();
+                opt_started_recording = s_recording;
             }
+            continue;
         }
+        if (command.type == MINIMAL_COMMAND_OPT_RELEASE) {
+            TickType_t held_ticks = command.tick - opt_press_tick;
+            if (opt_started_recording && s_recording &&
+                held_ticks >= pdMS_TO_TICKS(MINIMAL_OPT_LONG_PRESS_MS)) {
+                ESP_LOGI(TAG, "long OPT press released, sending");
+                stop_recording();
+            }
+            opt_started_recording = false;
+        }
+    }
+}
+
+static void maintenance_task(void *arg)
+{
+    (void)arg;
+    TickType_t last_battery_tick = xTaskGetTickCount();
+    while (true) {
+        maybe_turn_display_off();
+        TickType_t now = xTaskGetTickCount();
+        if (!s_recording &&
+            now - last_battery_tick >=
+                pdMS_TO_TICKS(MINIMAL_BATTERY_REFRESH_MS)) {
+            refresh_battery_level();
+            last_battery_tick = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(MINIMAL_MAINTENANCE_POLL_MS));
     }
 }
 
@@ -379,14 +482,15 @@ void vibe_cardputer_asr_minimal_start(void)
     ESP_ERROR_CHECK(vibe_cardputer_asr_board_init());
     ESP_ERROR_CHECK(vibe_cardputer_status_init());
     ESP_ERROR_CHECK(vibe_cardputer_battery_init());
+    s_last_activity_tick = xTaskGetTickCount();
     refresh_battery_level();
     ESP_ERROR_CHECK(vibe_cardputer_capture_init());
     ESP_ERROR_CHECK(vibe_cardputer_upload_init());
-    s_commands = xQueueCreate(4, sizeof(minimal_command_t));
+    s_commands = xQueueCreate(8, sizeof(minimal_command_t));
     ESP_ERROR_CHECK(s_commands ? ESP_OK : ESP_ERR_NO_MEM);
 
     const vibe_wifi_runtime_config_t wifi = {
-        .idle_power_save = WIFI_PS_MIN_MODEM,
+        .idle_power_save = WIFI_PS_NONE,
         .max_tx_power = VIBE_CARDPUTER_WIFI_MAX_TX_POWER,
         .status_changed = wifi_status_changed,
     };
@@ -398,6 +502,9 @@ void vibe_cardputer_asr_minimal_start(void)
     ESP_ERROR_CHECK(vibe_cardputer_keyboard_bridge_init(&keyboard));
     ESP_ERROR_CHECK(vibe_cardputer_opt_init(keyboard_event, NULL));
     BaseType_t started = xTaskCreatePinnedToCore(
-        command_task, "asr_commands", 4096, NULL, 4, NULL, 0);
+        command_task, "asr_commands", 5120, NULL, 4, NULL, 0);
+    ESP_ERROR_CHECK(started == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    started = xTaskCreatePinnedToCore(
+        maintenance_task, "asr_maintenance", 4096, NULL, 1, NULL, 0);
     ESP_ERROR_CHECK(started == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }

@@ -208,10 +208,15 @@ static void wifi_event_handler(void *arg,
         }
         if (runtime->profile_count > 1) {
             runtime->profile_retry_count++;
-            if (runtime->profile_retry_count >= WIFI_PROFILE_RETRY_LIMIT) {
+            bool no_ap =
+                disconnected &&
+                disconnected->reason == WIFI_REASON_NO_AP_FOUND;
+            if (no_ap ||
+                runtime->profile_retry_count >= WIFI_PROFILE_RETRY_LIMIT) {
                 runtime->profile_index =
                     (runtime->profile_index + 1) % runtime->profile_count;
                 runtime->profile_retry_count = 0;
+                runtime->reconnect_attempt = 0;
                 ESP_ERROR_CHECK_WITHOUT_ABORT(
                     apply_profile(runtime, runtime->profile_index));
             }
@@ -479,4 +484,3 @@ esp_err_t vibe_wifi_runtime_stop_for_sleep(vibe_wifi_runtime_t *runtime)
     runtime->ip[0] = '\0';
     return runtime->started ? esp_wifi_stop() : ESP_OK;
 }
-

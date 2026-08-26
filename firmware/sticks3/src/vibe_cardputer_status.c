@@ -32,6 +32,8 @@
 #define LCD_BACKLIGHT_CHANNEL LEDC_CHANNEL_7
 #define LCD_BACKLIGHT_RESOLUTION LEDC_TIMER_9_BIT
 #define LCD_BACKLIGHT_HZ 256
+#define LCD_BACKLIGHT_DEFAULT 150
+#define LCD_BACKLIGHT_OFF 0
 #define TEXT_SCALE 4
 #define RECORDING_WAVE_GROUP_WIDTH 82
 #define RECORDING_WAVE_GROUP_HEIGHT 58
@@ -358,9 +360,12 @@ static void render(vibe_cardputer_status_t status)
 
 static void set_backlight(uint8_t brightness)
 {
-    const uint32_t offset = (16U * 259U) >> 8;
-    uint32_t duty = brightness * (257U - offset) + offset * 255U;
-    duty = (duty + (1U << 6)) >> 7;
+    uint32_t duty = 0;
+    if (brightness > 0) {
+        const uint32_t offset = (16U * 259U) >> 8;
+        duty = brightness * (257U - offset) + offset * 255U;
+        duty = (duty + (1U << 6)) >> 7;
+    }
     ESP_ERROR_CHECK_WITHOUT_ABORT(
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LCD_BACKLIGHT_CHANNEL, duty));
     ESP_ERROR_CHECK_WITHOUT_ABORT(
@@ -425,7 +430,7 @@ static void init_backlight(void)
         .hpoint = 0,
     };
     ESP_ERROR_CHECK(ledc_channel_config(&channel));
-    set_backlight(150);
+    set_backlight(LCD_BACKLIGHT_DEFAULT);
 }
 
 esp_err_t vibe_cardputer_status_init(void)
@@ -533,6 +538,14 @@ void vibe_cardputer_status_set_battery_level(int level_percent)
     s_battery_percent = level_percent;
     render(s_status);
     xSemaphoreGive(s_lock);
+}
+
+void vibe_cardputer_status_set_display_enabled(bool enabled)
+{
+    if (!s_ready) {
+        return;
+    }
+    set_backlight(enabled ? LCD_BACKLIGHT_DEFAULT : LCD_BACKLIGHT_OFF);
 }
 
 void vibe_cardputer_status_set_recording_animation(bool enabled)

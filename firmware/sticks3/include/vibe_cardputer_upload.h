@@ -17,3 +17,4 @@ bool vibe_cardputer_upload_start(vibe_cardputer_upload_post_fn post_chunk,
 void vibe_cardputer_upload_wait(void);
 bool vibe_cardputer_upload_failed(void);
 void vibe_cardputer_upload_totals(size_t *posts, size_t *bytes);
+size_t vibe_cardputer_upload_wire_bytes(void);

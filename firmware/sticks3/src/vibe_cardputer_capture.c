@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "vibe_cardputer_asr_board.h"
+#include "vibe_ima_adpcm.h"
 
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
@@ -17,7 +18,7 @@
 #include "freertos/task.h"
 
 #define CAPTURE_FRAME_MS 60
-#define CAPTURE_QUEUE_DEPTH 24
+#define CAPTURE_QUEUE_DEPTH 96
 #define CAPTURE_STOP_TIMEOUT_MS 1200
 #define CARDPUTER_I2S_PORT I2S_NUM_1
 #define CARDPUTER_I2S_BCLK GPIO_NUM_41
@@ -27,7 +28,7 @@
 
 typedef struct {
     size_t len;
-    uint8_t data[VIBE_CARDPUTER_CAPTURE_FRAME_BYTES];
+    uint8_t data[VIBE_CARDPUTER_CAPTURE_ENCODED_FRAME_BYTES];
 } capture_chunk_t;
 
 static const char *TAG = "card_capture";
@@ -217,20 +218,28 @@ static void capture_task(void *arg)
 {
     (void)arg;
     capture_chunk_t chunk = {0};
+    int16_t pcm[VIBE_CARDPUTER_CAPTURE_FRAME_SAMPLES] = {0};
+    vibe_ima_adpcm_state_t encoder = {0};
+    vibe_ima_adpcm_reset(&encoder);
     while (atomic_load(&s_running)) {
-        if (esp_codec_dev_read(s_codec, chunk.data, sizeof(chunk.data)) !=
+        if (esp_codec_dev_read(s_codec, pcm, sizeof(pcm)) !=
             ESP_CODEC_DEV_OK) {
             if (atomic_load(&s_running)) {
                 ESP_LOGW(TAG, "microphone read failed");
             }
             continue;
         }
-        chunk.len = sizeof(chunk.data);
+        if (!vibe_ima_adpcm_encode_block(
+                &encoder, pcm, VIBE_CARDPUTER_CAPTURE_FRAME_SAMPLES,
+                chunk.data, sizeof(chunk.data), &chunk.len)) {
+            ESP_LOGW(TAG, "ADPCM encode failed");
+            continue;
+        }
         s_stats.chunks_read++;
-        s_stats.bytes_read += chunk.len;
+        s_stats.bytes_read += sizeof(pcm);
         if (xQueueSend(s_queue, &chunk, 0) != pdTRUE) {
             s_stats.chunks_dropped++;
-            s_stats.bytes_dropped += chunk.len;
+            s_stats.bytes_dropped += sizeof(pcm);
         } else {
             s_stats.chunks_queued++;
         }
@@ -297,8 +306,9 @@ esp_err_t vibe_cardputer_capture_start(void)
         return ESP_ERR_NO_MEM;
     }
     xSemaphoreGive(s_mutex);
-    ESP_LOGI(TAG, "microphone started 16kHz pcm16 queue=%u",
-             CAPTURE_QUEUE_DEPTH);
+    ESP_LOGI(TAG,
+             "microphone started 16kHz ima-adpcm queue=%u buffer_ms=%u",
+             CAPTURE_QUEUE_DEPTH, CAPTURE_QUEUE_DEPTH * CAPTURE_FRAME_MS);
     return ESP_OK;
 }
 
@@ -340,7 +350,8 @@ esp_err_t vibe_cardputer_capture_read_batch(uint8_t *buffer, size_t capacity,
                                             uint32_t timeout_ms)
 {
     ESP_RETURN_ON_FALSE(buffer && len &&
-                            capacity >= VIBE_CARDPUTER_CAPTURE_FRAME_BYTES,
+                            capacity >=
+                                VIBE_CARDPUTER_CAPTURE_ENCODED_FRAME_BYTES,
                         ESP_ERR_INVALID_ARG, TAG, "invalid read buffer");
     if (max_chunks == 0) {
         max_chunks = 1;
@@ -354,7 +365,8 @@ esp_err_t vibe_cardputer_capture_read_batch(uint8_t *buffer, size_t capacity,
     *len = chunk.len;
 
     for (size_t count = 1; count < max_chunks; ++count) {
-        if (capacity - *len < VIBE_CARDPUTER_CAPTURE_FRAME_BYTES) {
+        if (capacity - *len <
+            VIBE_CARDPUTER_CAPTURE_ENCODED_FRAME_BYTES) {
             break;
         }
         TickType_t wait = atomic_load(&s_running)

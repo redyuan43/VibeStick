@@ -10,8 +10,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#define UPLOAD_BUFFER_BYTES 4096
-#define UPLOAD_BATCH_CHUNKS 2
+#define UPLOAD_BUFFER_BYTES 8192
+#define UPLOAD_BATCH_CHUNKS 4
 #define UPLOAD_READ_TIMEOUT_MS 250
 #define UPLOAD_RETRY_COUNT 3
 #define UPLOAD_RETRY_DELAY_MS 120
@@ -27,6 +27,7 @@ static atomic_bool s_failed;
 static uint32_t s_next_chunk_id;
 static size_t s_posts;
 static size_t s_bytes;
+static size_t s_wire_bytes;
 
 static void upload_task(void *arg)
 {
@@ -67,7 +68,10 @@ static void upload_task(void *arg)
                 break;
             }
             s_posts++;
-            s_bytes += audio_len;
+            s_wire_bytes += audio_len;
+            s_bytes +=
+                (audio_len / VIBE_CARDPUTER_CAPTURE_ENCODED_FRAME_BYTES) *
+                VIBE_CARDPUTER_CAPTURE_FRAME_BYTES;
         }
         atomic_store(&s_active, false);
         xSemaphoreGive(s_completion);
@@ -102,6 +106,7 @@ bool vibe_cardputer_upload_start(vibe_cardputer_upload_post_fn post_chunk,
     s_next_chunk_id = 0;
     s_posts = 0;
     s_bytes = 0;
+    s_wire_bytes = 0;
     atomic_store(&s_failed, false);
     xTaskNotifyGive(s_task);
     return true;
@@ -127,4 +132,9 @@ void vibe_cardputer_upload_totals(size_t *posts, size_t *bytes)
     if (bytes) {
         *bytes = s_bytes;
     }
+}
+
+size_t vibe_cardputer_upload_wire_bytes(void)
+{
+    return s_wire_bytes;
 }

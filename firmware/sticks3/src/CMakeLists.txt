@@ -5,6 +5,7 @@ idf_component_register(
          "vibe_cardputer_keyboard_bridge.c" "vibe_cardputer_opt.c"
          "vibe_cardputer_status.c"
          "vibe_cardputer_upload.c"
+         "vibe_ima_adpcm.c"
          "vibe_wifi_runtime.c" "vibe_wifi_policy.c"
     INCLUDE_DIRS "../include"
     REQUIRES esp_wifi esp_http_client esp_event esp_netif nvs_flash
