@@ -22,12 +22,13 @@ jobs:
 
       - name: Run unit tests
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
           python3 -m pip install pytest
           python3 -m pytest -q
 
       - name: Run firmware host tests
         run: |
-          sudo apt-get update
           sudo apt-get install -y libcjson-dev
           firmware/telemetry/tests/run-host-tests.sh
           firmware/sticks3/tests/run-host-tests.sh
@@ -51,7 +52,9 @@ jobs:
 
       - name: Build isolated telemetry firmware
         shell: bash
-        run: scripts/battery-firmware.sh build "${{ matrix.board }}"
+        run: |
+          . "$IDF_PATH/export.sh"
+          scripts/battery-firmware.sh build "${{ matrix.board }}"
 
       - name: Upload firmware image
         uses: actions/upload-artifact@v4
@@ -73,6 +76,7 @@ jobs:
       - name: Build VibeStick firmware
         shell: bash
         run: |
+          . "$IDF_PATH/export.sh"
           scripts/firmware.sh "${{ matrix.board }}" build
           python3 scripts/check-firmware-size.py "${{ matrix.board }}"
 
