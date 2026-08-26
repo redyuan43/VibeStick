@@ -39,7 +39,17 @@
 #else
 #define AUDIO_PCM_QUEUE_DEPTH 12
 #endif
+#if defined(VIBE_BOARD_STICKS3)
 #define AUDIO_ADPCM_QUEUE_DEPTH 96
+#else
+/*
+ * Full no-PSRAM builds cannot reliably replace the boot-time PCM queue with
+ * a 96-frame ADPCM queue after Wi-Fi and UI initialization. Keep the
+ * compressed queue close to the existing PCM allocation while still
+ * buffering 2.88 seconds of audio.
+ */
+#define AUDIO_ADPCM_QUEUE_DEPTH 48
+#endif
 #define AUDIO_READ_WAIT_MS (AUDIO_FRAME_MS + 50)
 #define TASK_EXIT_WAIT_MS 1200
 #define VIBE_STICK_SOUND_FRAME_SAMPLES 160

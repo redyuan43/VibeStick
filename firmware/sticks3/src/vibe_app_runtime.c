@@ -4462,6 +4462,38 @@ static bool start_recording_upload_task(void)
         &config, current_wifi_rssi(), RECORDING_RSSI_UNKNOWN);
 }
 
+static void notify_bridge_recording_start_failed(const char *event_name,
+                                                 const char *reason)
+{
+    if (!s_recording_bridge_stop_required ||
+        s_recording_session_id[0] == '\0') {
+        return;
+    }
+    char body[512];
+    snprintf(body, sizeof(body),
+             "{\"event\":\"%s\",\"source\":\"%s\",\"paste\":false,"
+             "\"session_id\":\"%s\",\"intent\":\"%s\",\"mode\":\"%s\","
+             "\"protocol_version\":2,\"total_chunks\":0,\"total_bytes\":0,"
+             "\"total_wire_bytes\":0,\"transport_encoding\":\"%s\","
+             "\"dropped_chunks\":0,\"dropped_bytes\":0,"
+             "\"upload_failed\":true,\"error\":\"%s\"}",
+             event_name,
+             VIBE_BOARD_EVENT_SOURCE,
+             s_recording_session_id,
+             recording_mode_intent(),
+             recording_mode_label(),
+             vibe_audio_transport_encoding(),
+             reason);
+    char response[256] = {0};
+    esp_err_t err = http_request_timeout(
+        "POST", VIBE_STICK_RECORDING_STOP_PATH, body, response,
+        sizeof(response), RECORDING_START_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "recording start failure cleanup failed: %s",
+                 esp_err_to_name(err));
+    }
+}
+
 static bool handle_recording_start_internal(const char *event_name, const char *hint,
                                             const char *provided_session_id,
                                             bool notify_bridge)
@@ -4501,6 +4533,29 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         vibe_wifi_runtime_set_performance(&s_wifi, true));
     show_recording_overlay("CONNECTING", "", true);
     char negotiated_transport[24] = {0};
+    const char *offered_transport = "pcm16";
+
+    if (notify_bridge) {
+        esp_err_t transport_err =
+            vibe_audio_set_transport(VIBE_AUDIO_TRANSPORT_IMA_ADPCM);
+        if (transport_err != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "ADPCM preflight failed, offering PCM instead: %s",
+                     esp_err_to_name(transport_err));
+            transport_err =
+                vibe_audio_set_transport(VIBE_AUDIO_TRANSPORT_PCM16);
+        }
+        if (transport_err != ESP_OK) {
+            ESP_LOGW(TAG, "audio transport preflight failed: %s",
+                     esp_err_to_name(transport_err));
+            show_recording_overlay("MIC FAILED", "", true);
+            recording_reset_session();
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                vibe_wifi_runtime_set_performance(&s_wifi, false));
+            return false;
+        }
+        offered_transport = vibe_audio_transport_encoding();
+    }
 
     ESP_LOGI(TAG, "recording start event=%s mode=%s intent=%s session=%s",
              event_name,
@@ -4520,7 +4575,7 @@ static bool handle_recording_start_internal(const char *event_name, const char *
                  s_recording_session_id,
                  recording_mode_intent(),
                  recording_mode_label(),
-                 VIBE_STICK_AUDIO_ADPCM_ENCODING);
+                 offered_transport);
         char response[1024] = {0};
         esp_err_t err = http_request_timeout(
             "POST", VIBE_STICK_RECORDING_START_PATH, body, response,
@@ -4575,6 +4630,8 @@ static bool handle_recording_start_internal(const char *event_name, const char *
         if (transport_err != ESP_OK) {
             ESP_LOGW(TAG, "audio transport setup failed: %s",
                      esp_err_to_name(transport_err));
+            notify_bridge_recording_start_failed(
+                "device_capture_start_failed", "audio_transport_setup");
             show_recording_overlay("MIC FAILED", "", true);
             recording_reset_session();
             ESP_ERROR_CHECK_WITHOUT_ABORT(
@@ -4596,6 +4653,8 @@ static bool handle_recording_start_internal(const char *event_name, const char *
     esp_err_t audio_err = vibe_audio_start();
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "hardware recording start failed: %s", esp_err_to_name(audio_err));
+        notify_bridge_recording_start_failed(
+            "device_capture_start_failed", "hardware_recording_start");
         show_recording_overlay("MIC FAILED", "", true);
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
@@ -4607,6 +4666,8 @@ static bool handle_recording_start_internal(const char *event_name, const char *
     if (!start_recording_upload_task()) {
         (void)vibe_audio_stop();
         vibe_audio_clear();
+        notify_bridge_recording_start_failed(
+            "device_capture_start_failed", "upload_task_start");
         show_recording_overlay("SEND FAILED", "", true);
         vTaskDelay(pdMS_TO_TICKS(700));
         show_recording_overlay(NULL, NULL, false);
