@@ -200,6 +200,41 @@ def test_tap_recording_uses_existing_external_pcm_upload_path() -> None:
     assert '\\"session_id\\":\\"%s\\",\\"intent\\":\\"%s\\",\\"mode\\":\\"%s\\"' in source
 
 
+def test_recording_transport_is_preflighted_before_bridge_start() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    start = source.split("static bool handle_recording_start_internal", 1)[1]
+    start = start.split("static bool handle_recording_start(", 1)[0]
+
+    preflight = "vibe_audio_set_transport(VIBE_AUDIO_TRANSPORT_IMA_ADPCM)"
+    request = '"POST", VIBE_STICK_RECORDING_START_PATH'
+    assert preflight in start
+    assert start.index(preflight) < start.index(request)
+    assert "offered_transport = vibe_audio_transport_encoding();" in start
+    assert '"ADPCM preflight failed, offering PCM instead: %s"' in start
+    assert "VIBE_STICK_AUDIO_ADPCM_ENCODING);" not in start
+
+
+def test_failed_local_recording_start_closes_the_bridge_session() -> None:
+    source = MAIN_C.read_text(encoding="utf-8")
+    helper = source.split(
+        "static void notify_bridge_recording_start_failed", 1
+    )[1].split("static bool handle_recording_start_internal", 1)[0]
+    start = source.split("static bool handle_recording_start_internal", 1)[1]
+    start = start.split("static bool handle_recording_start(", 1)[0]
+
+    assert "VIBE_STICK_RECORDING_STOP_PATH" in helper
+    assert '\\"upload_failed\\":true' in helper
+    assert start.count("notify_bridge_recording_start_failed(") == 3
+
+
+def test_no_psram_boards_use_a_bounded_adpcm_queue() -> None:
+    source = AUDIO_C.read_text(encoding="utf-8")
+
+    assert "#if defined(VIBE_BOARD_STICKS3)" in source
+    assert "#define AUDIO_ADPCM_QUEUE_DEPTH 96" in source
+    assert "#define AUDIO_ADPCM_QUEUE_DEPTH 48" in source
+
+
 def test_side_button_discovers_and_persists_multiple_lan_bridges() -> None:
     source = MAIN_C.read_text(encoding="utf-8")
     registry = BRIDGE_REGISTRY_C.read_text(encoding="utf-8")
@@ -1629,10 +1664,10 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.75"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.50"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.6"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.75"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.76"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.51"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.7"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.76"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher
