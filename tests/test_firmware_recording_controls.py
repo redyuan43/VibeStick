@@ -680,8 +680,8 @@ def test_cardputer_recording_uses_common_http_client_and_reports_profile_revisio
     assert '"X-Vibe-Stick-Firmware-Transport"' in card_headers
     assert '"X-Vibe-Stick-Firmware-Build-Date"' in card_headers
     assert '"X-Vibe-Stick-Input-Profile-Revision"' in card_headers
-    assert "#define RECORDING_UPLOAD_BATCH_CHUNKS 2" in source
-    assert "#define RECORDING_UPLOAD_BUFFER_BYTES 4096" in source
+    assert "#define RECORDING_UPLOAD_BATCH_CHUNKS 4" in source
+    assert "#define RECORDING_UPLOAD_BUFFER_BYTES 8192" in source
     assert "#if defined(VIBE_BOARD_CARDPUTER_ADV)\n#define RECORDING_UPLOAD_BATCH_CHUNKS" not in source
     assert "#define RECORDING_UPLOAD_PARALLEL_WORKERS 1" in source
     assert "#define HTTP_CLIENT_RX_BUFFER_SIZE 2048" in source
@@ -1629,10 +1629,10 @@ def test_board_firmware_versions_remain_independent() -> None:
     ).read_text(encoding="utf-8")
     publisher = (ROOT / "scripts" / "ota_publish.py").read_text(encoding="utf-8")
 
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.70"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.44"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.4"' in config
-    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.68"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKS3 "0.1.75"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS "0.1.50"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE "0.1.6"' in config
+    assert 'VIBE_STICK_FIRMWARE_VERSION_CARDPUTER_ADV "0.1.75"' in config
     assert 'firmware_version(board)' in publisher
     assert '"sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3"' in publisher
     assert '"stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS"' in publisher

@@ -69,8 +69,8 @@
 #define LCD_BACKLIGHT_DEFAULT VIBE_BOARD_LCD_BACKLIGHT_DEFAULT
 #define LCD_BACKLIGHT_IDLE VIBE_BOARD_LCD_BACKLIGHT_IDLE
 #define LCD_BACKLIGHT_OFF VIBE_BOARD_LCD_BACKLIGHT_OFF
-#define RECORDING_UPLOAD_BATCH_CHUNKS 2
-#define RECORDING_UPLOAD_BUFFER_BYTES 4096
+#define RECORDING_UPLOAD_BATCH_CHUNKS 4
+#define RECORDING_UPLOAD_BUFFER_BYTES 8192
 #define RECORDING_UPLOAD_PARALLEL_WORKERS 1
 #define RECORDING_UPLOAD_HTTP_TIMEOUT_MS 5000
 #define RECORDING_START_TIMEOUT_MS 1200
@@ -3423,7 +3423,17 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
                             bridge_target_profile_snapshot(&target, &profile)
                                 ? profile.token
                                 : VIBE_STICK_BRIDGE_TOKEN);
-    esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+    esp_http_client_set_header(client, "Content-Type",
+                               vibe_audio_transport_content_type());
+    esp_http_client_set_header(client, "X-Vibe-Stick-Audio-Encoding",
+                               vibe_audio_transport_encoding());
+    esp_http_client_set_header(client, "X-Vibe-Stick-Audio-Sample-Rate",
+                               "16000");
+    esp_http_client_set_header(client, "X-Vibe-Stick-Audio-Channels", "1");
+    if (vibe_audio_transport() == VIBE_AUDIO_TRANSPORT_IMA_ADPCM) {
+        esp_http_client_set_header(client,
+                                   "X-Vibe-Stick-Audio-Block-Samples", "960");
+    }
     esp_http_client_set_header(client, "X-Vibe-Stick-Sample-Rate", "16000");
     esp_http_client_set_header(client, "X-Vibe-Stick-Channels", "1");
     esp_http_client_set_header(client, "X-Vibe-Stick-Bits-Per-Sample", "16");
@@ -4261,6 +4271,33 @@ static bool parse_recording_capture_mode(const char *json, char *capture_mode,
     return ok;
 }
 
+static bool parse_recording_transport_encoding(const char *json,
+                                               char *encoding,
+                                               size_t encoding_len)
+{
+    if (!encoding || encoding_len == 0) {
+        return false;
+    }
+    encoding[0] = '\0';
+    cJSON *root = cJSON_Parse(json);
+    if (!root) {
+        return false;
+    }
+    cJSON *recording = cJSON_GetObjectItemCaseSensitive(root, "recording");
+    cJSON *item =
+        cJSON_IsObject(recording)
+            ? cJSON_GetObjectItemCaseSensitive(
+                  recording, "accepted_transport_encoding")
+            : NULL;
+    const bool ok = cJSON_IsString(item) && item->valuestring &&
+                    item->valuestring[0] != '\0';
+    if (ok) {
+        strlcpy(encoding, item->valuestring, encoding_len);
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
 static bool is_recording_failure_status(const char *status)
 {
     return strcmp(status, "transcription_failed") == 0 ||
@@ -4463,6 +4500,7 @@ static bool handle_recording_start_internal(const char *event_name, const char *
     ESP_ERROR_CHECK_WITHOUT_ABORT(
         vibe_wifi_runtime_set_performance(&s_wifi, true));
     show_recording_overlay("CONNECTING", "", true);
+    char negotiated_transport[24] = {0};
 
     ESP_LOGI(TAG, "recording start event=%s mode=%s intent=%s session=%s",
              event_name,
@@ -4470,17 +4508,19 @@ static bool handle_recording_start_internal(const char *event_name, const char *
              recording_mode_intent(),
              s_recording_session_id);
     if (notify_bridge) {
-        char body[288];
+        char body[384];
         snprintf(body, sizeof(body),
                  "{\"event\":\"%s\",\"source\":\"%s\","
                  "\"audio_source\":\"%s\",\"session_id\":\"%s\","
-                 "\"intent\":\"%s\",\"mode\":\"%s\",\"protocol_version\":2}",
+                 "\"intent\":\"%s\",\"mode\":\"%s\",\"protocol_version\":2,"
+                 "\"transport_encoding\":\"%s\"}",
                  event_name,
                  VIBE_BOARD_EVENT_SOURCE,
                  VIBE_BOARD_AUDIO_SOURCE,
                  s_recording_session_id,
                  recording_mode_intent(),
-                 recording_mode_label());
+                 recording_mode_label(),
+                 VIBE_STICK_AUDIO_ADPCM_ENCODING);
         char response[1024] = {0};
         esp_err_t err = http_request_timeout(
             "POST", VIBE_STICK_RECORDING_START_PATH, body, response,
@@ -4492,6 +4532,8 @@ static bool handle_recording_start_internal(const char *event_name, const char *
                                        sizeof(response_session_id));
             parse_recording_capture_mode(response, capture_mode,
                                          sizeof(capture_mode));
+            parse_recording_transport_encoding(
+                response, negotiated_transport, sizeof(negotiated_transport));
             if (response_session_id[0] != '\0' &&
                 strcmp(response_session_id, s_recording_session_id) != 0) {
                 ESP_LOGW(TAG, "bridge returned a different recording session id");
@@ -4516,6 +4558,24 @@ static bool handle_recording_start_internal(const char *event_name, const char *
             show_recording_overlay("CONNECT FAILED", "", true);
             vTaskDelay(pdMS_TO_TICKS(700));
             show_recording_overlay(NULL, NULL, false);
+            recording_reset_session();
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                vibe_wifi_runtime_set_performance(&s_wifi, false));
+            return false;
+        }
+    }
+
+    if (s_recording_local_capture) {
+        vibe_audio_transport_t transport = VIBE_AUDIO_TRANSPORT_PCM16;
+        if (strcmp(negotiated_transport,
+                   VIBE_STICK_AUDIO_ADPCM_ENCODING) == 0) {
+            transport = VIBE_AUDIO_TRANSPORT_IMA_ADPCM;
+        }
+        esp_err_t transport_err = vibe_audio_set_transport(transport);
+        if (transport_err != ESP_OK) {
+            ESP_LOGW(TAG, "audio transport setup failed: %s",
+                     esp_err_to_name(transport_err));
+            show_recording_overlay("MIC FAILED", "", true);
             recording_reset_session();
             ESP_ERROR_CHECK_WITHOUT_ABORT(
                 vibe_wifi_runtime_set_performance(&s_wifi, false));
@@ -4567,6 +4627,8 @@ static bool handle_recording_start(const char *event_name, const char *hint)
 static void finish_recording_stop(const char *event_name)
 {
     bool upload_failed = vibe_recording_upload_failed();
+    vibe_audio_stats_t final_audio_stats = {0};
+    vibe_recording_upload_diagnostics_t upload_diagnostics = {0};
     if (s_recording_local_capture) {
         esp_err_t audio_err = vibe_audio_stop();
         if (audio_err != ESP_OK) {
@@ -4575,6 +4637,16 @@ static void finish_recording_stop(const char *event_name)
         }
         vibe_recording_upload_wait();
         upload_failed = vibe_recording_upload_failed();
+        vibe_audio_stats(&final_audio_stats);
+        vibe_recording_upload_diagnostics(&upload_diagnostics);
+        if (final_audio_stats.chunks_dropped > 0) {
+            upload_failed = true;
+            ESP_LOGW(TAG,
+                     "recording marked failed after capture drops chunks=%u "
+                     "bytes=%u",
+                     (unsigned)final_audio_stats.chunks_dropped,
+                     (unsigned)final_audio_stats.bytes_dropped);
+        }
         size_t uploaded_posts = 0;
         size_t uploaded_bytes = 0;
         vibe_recording_upload_totals(&uploaded_posts, &uploaded_bytes);
@@ -4615,11 +4687,13 @@ static void finish_recording_stop(const char *event_name)
              recording_mode_intent(),
              s_recording_session_id,
              paste_result ? 1 : 0);
-    char body[384];
+    char body[512];
     snprintf(body, sizeof(body),
              "{\"event\":\"%s\",\"source\":\"%s\",\"paste\":%s,"
              "\"session_id\":\"%s\",\"intent\":\"%s\",\"mode\":\"%s\","
              "\"protocol_version\":2,\"total_chunks\":%lu,\"total_bytes\":%lu,"
+             "\"total_wire_bytes\":%lu,\"transport_encoding\":\"%s\","
+             "\"dropped_chunks\":%lu,\"dropped_bytes\":%lu,"
              "\"upload_failed\":%s}",
              event_name,
              VIBE_BOARD_EVENT_SOURCE,
@@ -4629,6 +4703,10 @@ static void finish_recording_stop(const char *event_name)
              recording_mode_label(),
              (unsigned long)s_recording_chunk_id,
              (unsigned long)s_recording_uploaded_bytes,
+             (unsigned long)upload_diagnostics.upload.uploaded_wire_bytes,
+             vibe_audio_transport_encoding(),
+             (unsigned long)final_audio_stats.chunks_dropped,
+             (unsigned long)final_audio_stats.bytes_dropped,
              upload_failed ? "true" : "false");
     char response[1024] = {0};
     esp_err_t err = http_request_timeout("POST", VIBE_STICK_RECORDING_STOP_PATH, body, response,

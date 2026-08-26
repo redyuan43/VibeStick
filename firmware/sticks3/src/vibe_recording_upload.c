@@ -15,7 +15,7 @@
 static const char *TAG = "vibe_stick";
 #define RECORDING_UPLOAD_RETRY_COUNT 3
 #define RECORDING_UPLOAD_RETRY_DELAY_MS 120
-#define RECORDING_UPLOAD_BUFFER_CAPACITY 4096
+#define RECORDING_UPLOAD_BUFFER_CAPACITY 8192
 #define RECORDING_UPLOAD_MAX_PARALLEL 1
 
 static vibe_recording_upload_config_t s_config;
@@ -48,11 +48,15 @@ static void note_read(bool timed_out)
     xSemaphoreGive(s_stats_mutex);
 }
 
-static void note_post(int64_t duration_ms, size_t audio_len, bool succeeded)
+static void note_post(int64_t duration_ms, size_t pcm_len, size_t wire_len,
+                      bool succeeded)
 {
     xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
     vibe_recording_upload_stats_note_post(
-        &s_stats, duration_ms, audio_len, succeeded);
+        &s_stats, duration_ms, pcm_len, succeeded);
+    if (succeeded) {
+        s_stats.uploaded_wire_bytes += wire_len;
+    }
     xSemaphoreGive(s_stats_mutex);
 }
 
@@ -120,7 +124,13 @@ static void upload_task(void *arg)
         (void)worker_index;
         (void)read_duration_ms;
 #endif
-        note_post(post_duration_ms, audio_len, err == ESP_OK);
+        const size_t pcm_len = vibe_audio_pcm_bytes_for_wire(audio_len);
+        if (pcm_len == 0) {
+            ESP_LOGW(TAG, "invalid transport frame bytes=%u",
+                     (unsigned)audio_len);
+            err = ESP_ERR_INVALID_SIZE;
+        }
+        note_post(post_duration_ms, pcm_len, audio_len, err == ESP_OK);
         if (err != ESP_OK) {
             set_failed();
             break;
@@ -286,7 +296,7 @@ void vibe_recording_upload_log_diagnostics(const char *board_name, int stop_rssi
     ESP_LOGI(TAG,
              "recording diagnostics board=%s audio_read_chunks=%u audio_queued_chunks=%u "
              "audio_dropped_chunks=%u audio_dropped_bytes=%u upload_posts=%u "
-             "uploaded_bytes=%u upload_failures=%u read_failures=%u "
+             "uploaded_bytes=%u uploaded_wire_bytes=%u upload_failures=%u read_failures=%u "
              "read_timeouts=%u max_pending=%u post_ms_min=%lld "
              "post_ms_avg=%lld post_ms_max=%lld rssi_start=%d rssi_stop=%d",
              board_name ? board_name : "unknown",
@@ -296,6 +306,7 @@ void vibe_recording_upload_log_diagnostics(const char *board_name, int stop_rssi
              (unsigned)audio_stats->bytes_dropped,
              (unsigned)upload_stats->upload_posts,
              (unsigned)upload_stats->uploaded_bytes,
+             (unsigned)upload_stats->uploaded_wire_bytes,
              (unsigned)upload_stats->upload_failures,
              (unsigned)upload_stats->read_failures,
              (unsigned)upload_stats->read_timeouts,
