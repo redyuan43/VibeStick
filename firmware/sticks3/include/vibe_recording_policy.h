@@ -14,6 +14,7 @@ typedef struct {
 typedef struct {
     size_t upload_posts;
     size_t uploaded_bytes;
+    size_t uploaded_wire_bytes;
     size_t upload_failures;
     size_t read_failures;
     size_t read_timeouts;

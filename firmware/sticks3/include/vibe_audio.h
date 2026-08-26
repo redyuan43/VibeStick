@@ -9,6 +9,17 @@
 #define VIBE_STICK_AUDIO_SAMPLE_RATE 16000
 #define VIBE_STICK_AUDIO_CHANNELS 1
 #define VIBE_STICK_AUDIO_BITS_PER_SAMPLE 16
+#define VIBE_STICK_AUDIO_FRAME_SAMPLES 960
+#define VIBE_STICK_AUDIO_PCM_FRAME_BYTES 1920
+#define VIBE_STICK_AUDIO_ADPCM_FRAME_BYTES 484
+#define VIBE_STICK_AUDIO_ADPCM_ENCODING "ima-adpcm-v1"
+#define VIBE_STICK_AUDIO_ADPCM_CONTENT_TYPE \
+    "application/vnd.vibestick.ima-adpcm"
+
+typedef enum {
+    VIBE_AUDIO_TRANSPORT_PCM16 = 0,
+    VIBE_AUDIO_TRANSPORT_IMA_ADPCM,
+} vibe_audio_transport_t;
 
 typedef enum {
     VIBE_STICK_SOUND_DONE,
@@ -30,6 +41,12 @@ typedef struct {
 } vibe_audio_stats_t;
 
 esp_err_t vibe_audio_init(void);
+esp_err_t vibe_audio_set_transport(vibe_audio_transport_t transport);
+vibe_audio_transport_t vibe_audio_transport(void);
+const char *vibe_audio_transport_encoding(void);
+const char *vibe_audio_transport_content_type(void);
+size_t vibe_audio_wire_frame_bytes(void);
+size_t vibe_audio_pcm_bytes_for_wire(size_t wire_bytes);
 esp_err_t vibe_audio_prepare_deep_sleep(void);
 esp_err_t vibe_audio_start(void);
 esp_err_t vibe_audio_stop(void);
