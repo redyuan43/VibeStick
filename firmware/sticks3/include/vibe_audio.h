@@ -35,6 +35,7 @@ typedef struct {
     size_t chunks_read;
     size_t chunks_queued;
     size_t chunks_dropped;
+    size_t peak_pending_chunks;
     size_t bytes_read;
     size_t bytes_queued;
     size_t bytes_dropped;
@@ -61,6 +62,7 @@ esp_err_t vibe_audio_read(uint8_t *buffer, size_t capacity, size_t *len, uint32_
 esp_err_t vibe_audio_read_batch(uint8_t *buffer, size_t capacity, size_t *len,
                                 size_t max_chunks, uint32_t timeout_ms);
 size_t vibe_audio_pending_chunks(void);
+size_t vibe_audio_buffer_ms(void);
 void vibe_audio_stats(vibe_audio_stats_t *stats);
 bool vibe_audio_is_recording(void);
 const uint8_t *vibe_audio_data(size_t *len);

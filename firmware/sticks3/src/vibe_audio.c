@@ -1,4 +1,5 @@
 #include "vibe_audio.h"
+#include "vibe_audio_buffer_policy.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -117,6 +118,11 @@ static atomic_uchar s_output_volume = VIBE_STICK_SOUND_OUTPUT_VOLUME;
 static bool s_initialized;
 static SemaphoreHandle_t s_audio_mutex;
 static QueueHandle_t s_audio_queue;
+#if VIBE_AUDIO_PSRAM_BUDGET_BYTES > 0 && defined(CONFIG_SPIRAM)
+/* Keep queue locks/control in internal RAM; only audio payload goes in PSRAM. */
+static StaticQueue_t s_audio_queue_control;
+static uint8_t *s_audio_queue_storage;
+#endif
 static vibe_audio_transport_t s_audio_transport = VIBE_AUDIO_TRANSPORT_PCM16;
 static size_t s_audio_queue_item_size;
 static size_t s_audio_queue_depth;
@@ -151,8 +157,32 @@ static esp_err_t create_audio_queue(vibe_audio_transport_t transport)
 {
     const size_t frame_bytes = audio_wire_frame_bytes(transport);
     const size_t item_size = offsetof(audio_chunk_t, data) + frame_bytes;
-    const size_t depth = audio_queue_depth(transport);
-    QueueHandle_t queue = xQueueCreate(depth, item_size);
+    size_t depth = audio_queue_depth(transport);
+    QueueHandle_t queue = NULL;
+#if VIBE_AUDIO_PSRAM_BUDGET_BYTES > 0 && defined(CONFIG_SPIRAM)
+    if (transport == VIBE_AUDIO_TRANSPORT_IMA_ADPCM) {
+        const uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+        const size_t budget = VIBE_AUDIO_PSRAM_BUDGET_BYTES;
+        if (heap_caps_get_free_size(caps) >= budget + VIBE_AUDIO_PSRAM_RESERVE_BYTES) {
+            s_audio_queue_storage = heap_caps_malloc(budget, caps);
+        }
+        if (s_audio_queue_storage) {
+            depth = budget / item_size;
+            queue = xQueueCreateStatic(depth, item_size, s_audio_queue_storage,
+                                       &s_audio_queue_control);
+            if (!queue) {
+                heap_caps_free(s_audio_queue_storage);
+                s_audio_queue_storage = NULL;
+                depth = audio_queue_depth(transport);
+            }
+        }
+        ESP_LOGI(TAG, "audio cache=%s bytes=%u buffer_ms=%u psram_free=%u",
+                 queue ? "psram" : "internal-fallback",
+                 (unsigned)(depth * item_size), (unsigned)(depth * AUDIO_FRAME_MS),
+                 (unsigned)heap_caps_get_free_size(caps));
+    }
+#endif
+    if (!queue) queue = xQueueCreate(depth, item_size);
     ESP_RETURN_ON_FALSE(queue != NULL, ESP_ERR_NO_MEM, TAG, "audio queue");
     s_audio_queue = queue;
     s_audio_queue_item_size = item_size;
@@ -776,6 +806,8 @@ static void audio_task(void *arg)
             s_audio_stats.bytes_dropped += pcm_chunk.len;
         } else {
             s_audio_stats.chunks_queued++;
+            size_t pending = uxQueueMessagesWaiting(s_audio_queue);
+            if (pending > s_audio_stats.peak_pending_chunks) s_audio_stats.peak_pending_chunks = pending;
             s_audio_stats.bytes_queued += pcm_chunk.len;
         }
     }
@@ -835,6 +867,10 @@ esp_err_t vibe_audio_set_transport(vibe_audio_transport_t transport)
     if (s_audio_queue) {
         vQueueDelete(s_audio_queue);
         s_audio_queue = NULL;
+#if VIBE_AUDIO_PSRAM_BUDGET_BYTES > 0 && defined(CONFIG_SPIRAM)
+        heap_caps_free(s_audio_queue_storage);
+        s_audio_queue_storage = NULL;
+#endif
     }
     esp_err_t err = create_audio_queue(transport);
     if (err != ESP_OK && transport != VIBE_AUDIO_TRANSPORT_PCM16) {
@@ -1320,4 +1356,9 @@ void vibe_audio_clear(void)
     audio_chunk_t chunk = {0};
     while (xQueueReceive(s_audio_queue, &chunk, 0) == pdTRUE) {
     }
+}
+
+size_t vibe_audio_buffer_ms(void)
+{
+    return s_audio_queue_depth * AUDIO_FRAME_MS;
 }

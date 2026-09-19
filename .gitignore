@@ -47,3 +47,4 @@ recordings/
 Recordings/
 bridge/recordings/
 .omx
+/firmware/sticks3/include/vibe_sticks3_asr_local.h
