@@ -202,18 +202,10 @@ static void handle_provision(const provision_context_t *context,
     ESP_LOGI(TAG, "stored Wi-Fi profile ssid=%s index=%u", ssid,
              (unsigned)profile_index);
 
-    bool bridge_written = false;
+    bool has_bridge_profile = false;
     bridge_discovered_profile_t bridge_profile;
     if (bridge_profile_from_json(bridge_item, &bridge_profile)) {
-        err = vibe_bridge_registry_upsert_manual(
-            context->registry, ssid, &bridge_profile, "serial");
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "bridge upsert failed: %s", esp_err_to_name(err));
-        } else {
-            bridge_written = true;
-            ESP_LOGI(TAG, "bridge profile upserted host=%s port=%d",
-                     bridge_profile.host, (int)bridge_profile.port);
-        }
+        has_bridge_profile = true;
     }
 
     bool apply = !cJSON_IsBool(apply_item) || cJSON_IsTrue(apply_item);
@@ -234,6 +226,33 @@ static void handle_provision(const provision_context_t *context,
             }
             vTaskDelay(pdMS_TO_TICKS(PROVISION_CONNECT_POLL_MS));
             waited_ms += PROVISION_CONNECT_POLL_MS;
+        }
+    }
+
+    bool bridge_written = false;
+    if (has_bridge_profile) {
+        // Key bridge profiles by the SSID the device is actually connected
+        // to: the registry loads/stores profiles per connected SSID inside
+        // ensure_target(), so keying by the requested SSID (e.g. the 5 GHz
+        // band name) gets ignored as soon as the radio lands on the 2.4 GHz
+        // SSID of the same router and the old target is restored.
+        char bridge_key[VIBE_WIFI_PROFILE_SSID_LEN] = {0};
+        if (vibe_wifi_runtime_connected(context->wifi)) {
+            vibe_wifi_runtime_ssid(context->wifi, bridge_key,
+                                   sizeof(bridge_key));
+        }
+        if (bridge_key[0] == '\0') {
+            snprintf(bridge_key, sizeof(bridge_key), "%s", ssid);
+        }
+        err = vibe_bridge_registry_upsert_manual(
+            context->registry, bridge_key, &bridge_profile, "serial");
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "bridge upsert failed: %s", esp_err_to_name(err));
+        } else {
+            bridge_written = true;
+            ESP_LOGI(TAG, "bridge profile upserted ssid=%s host=%s port=%d",
+                     bridge_key, bridge_profile.host,
+                     (int)bridge_profile.port);
         }
     }
 
