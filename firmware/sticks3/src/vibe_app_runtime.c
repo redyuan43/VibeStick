@@ -29,6 +29,7 @@
 #include "vibe_recording_policy.h"
 #include "vibe_recording_controller.h"
 #include "vibe_recording_upload.h"
+#include "vibe_serial_provision.h"
 #include "vibe_settings.h"
 #include "vibe_state_json.h"
 #include "vibe_stick_config.h"
@@ -6817,7 +6818,7 @@ void vibe_app_runtime_start(void)
     };
     ESP_ERROR_CHECK(vibe_ota_runtime_init(
         &s_ota, &ota_config, &ota_dependencies));
-#if VIBE_STICK_SERIAL_DEBUG_ENABLED
+#if VIBE_STICK_SERIAL_DEBUG_ENABLED && !defined(VIBE_SERIAL_PROVISION_ENABLED)
 #if defined(VIBE_BOARD_CARDPUTER_ADV)
     xTaskCreate(serial_debug_task, "serial_debug", 2048, NULL, 2, NULL);
 #else
@@ -6825,6 +6826,21 @@ void vibe_app_runtime_start(void)
 #endif
 #endif
     ESP_ERROR_CHECK(init_wifi());
+    // Serial provision listener owns the USB-JTAG RX (mutually exclusive with
+    // serial_debug_task above) and must start after init_wifi() because it
+    // drives the Wi-Fi runtime and the bridge registry directly.
+    {
+        const vibe_serial_provision_config_t provision_config = {
+            .wifi = &s_wifi,
+            .registry = &s_bridge_registry,
+        };
+        esp_err_t provision_err =
+            vibe_serial_provision_start(&provision_config);
+        if (provision_err != ESP_OK) {
+            ESP_LOGW(TAG, "serial provision listener not started: %s",
+                     esp_err_to_name(provision_err));
+        }
+    }
     ESP_ERROR_CHECK(init_display());
     create_ui();
     s_ui_ready = true;
