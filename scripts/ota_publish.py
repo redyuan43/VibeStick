@@ -12,7 +12,13 @@ import sys
 from pathlib import Path
 
 
-BOARDS = {"sticks3", "stickc_plus", "stickc_plus_se", "stickc_plus_minijoy_bt"}
+BOARDS = {
+    "sticks3",
+    "stickc_plus",
+    "stickc_plus_se",
+    "stickc_plus_minijoy_bt",
+    "stickc_plus_se_minijoy_bt",
+}
 
 
 def repo_root() -> Path:
@@ -94,7 +100,10 @@ def firmware_version(board: str) -> str:
         "sticks3": "VIBE_STICK_FIRMWARE_VERSION_STICKS3",
         "stickc_plus": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS",
         "stickc_plus_se": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_SE",
+        # The SE MiniJoy BT target shares the MiniJoy BT version macro, matching
+        # FIRMWARE_VERSION selection in firmware/sticks3/include/vibe_stick_config.h.
         "stickc_plus_minijoy_bt": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_MINIJOY_BT",
+        "stickc_plus_se_minijoy_bt": "VIBE_STICK_FIRMWARE_VERSION_STICKC_PLUS_MINIJOY_BT",
     }[board]
     match = re.search(rf'#define\s+{macro}\s+"([^"]+)"', text)
     return match.group(1) if match else ""

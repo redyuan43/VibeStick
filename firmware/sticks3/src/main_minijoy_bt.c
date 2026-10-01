@@ -75,6 +75,10 @@
 #define PTT_AUDIO_CONNECT_GRACE_MS 3000
 #define POWERED_BT_KEEPALIVE_MS 5000
 #define POWER_STATE_POLL_MS 1000
+/* Losing the external power reading starts (or stops) a ten minute deep sleep
+ * countdown.  A single noisy I2C sample must not be able to arm that timer, so
+ * a detected loss has to persist for this many 1 s polls before it counts. */
+#define EXTERNAL_POWER_RELEASE_POLLS 3
 #define WAKE_PTT_TIMEOUT_MS 15000
 #define WAKE_PTT_HANDOFF_TIMEOUT_MS 5000
 #define FRONT_BUTTON_DEBOUNCE_MS 30
@@ -186,6 +190,7 @@ static int64_t s_wake_ptt_handoff_deadline_ms;
 static int64_t s_next_power_state_poll_ms;
 static bool s_cached_usb_power_valid;
 static bool s_cached_usb_powered;
+static uint8_t s_external_power_release_polls;
 static power_test_mode_t s_power_test_mode;
 static RTC_DATA_ATTR uint32_t s_power_test_wake_magic;
 
@@ -1230,15 +1235,14 @@ static void handle_event(const app_event_message_t *message)
             break;
         }
         {
-            bool physical_powered = false;
-            esp_err_t power_err = vibe_board_usb_powered(&physical_powered);
-            bool usb_valid = false;
-            bool usb_powered = false;
-            effective_usb_power(power_err == ESP_OK, physical_powered,
-                                &usb_valid, &usb_powered);
-            if (!usb_valid || usb_powered) {
+            bool external_valid = false;
+            bool external_powered = false;
+            effective_usb_power(s_cached_usb_power_valid, s_cached_usb_powered,
+                                &external_valid, &external_powered);
+            if (!external_valid || external_powered) {
                 ESP_LOGW(TAG,
-                         "serial deep sleep refused: USB powered or status unavailable");
+                         "serial deep sleep refused: external power=%d valid=%d",
+                         (int)external_powered, (int)external_valid);
                 break;
             }
         }
@@ -1623,6 +1627,17 @@ static bool enter_deep_sleep(void)
         ESP_LOGW(TAG, "deep sleep deferred: wake button is active");
         return false;
     }
+    /* Deep sleep is the only state that intentionally drops Bluetooth, so it
+     * is refused whenever the board runs from an external supply. */
+    bool external_valid = false;
+    bool external_powered = false;
+    effective_usb_power(s_cached_usb_power_valid, s_cached_usb_powered,
+                        &external_valid, &external_powered);
+    if (!external_valid || external_powered) {
+        ESP_LOGW(TAG, "deep sleep refused: external power=%d valid=%d",
+                 (int)external_powered, (int)external_valid);
+        return false;
+    }
     esp_err_t err = configure_deep_sleep_wake_sources();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "deep sleep wake setup failed: %s",
@@ -1687,22 +1702,68 @@ static bool enter_deep_sleep(void)
     return true;
 }
 
+/* True when the board runs from an external supply: the USB port or a plain
+ * charge-only cable.  AXP192 reports USB VBUS separately from the charge-in
+ * progress bit, and a weak charger, a long thin cable or a full battery can
+ * make either one alone read false.  A false battery view is what arms the
+ * deep sleep countdown and drops Bluetooth, so accept either signal as
+ * external power and only release it once the loss keeps repeating. */
+static void poll_external_power(int64_t current_ms)
+{
+    bool usb_powered = false;
+    esp_err_t usb_err = vibe_board_usb_powered(&usb_powered);
+    bool charging = false;
+    esp_err_t charging_err = vibe_board_battery_charging(&charging);
+    bool usb_valid = usb_err == ESP_OK;
+    bool charging_valid = charging_err == ESP_OK;
+    bool valid = usb_valid || charging_valid;
+    bool powered = (usb_valid && usb_powered) || (charging_valid && charging);
+
+    s_next_power_state_poll_ms = current_ms + POWER_STATE_POLL_MS;
+
+    if (!valid) {
+        s_cached_usb_power_valid = false;
+        s_external_power_release_polls = 0;
+        if (!s_usb_status_error_logged) {
+            ESP_LOGW(TAG,
+                     "power state forced ACTIVE: supply status unavailable: %s/%s",
+                     esp_err_to_name(usb_err), esp_err_to_name(charging_err));
+            s_usb_status_error_logged = true;
+        }
+        return;
+    }
+
+    s_cached_usb_power_valid = true;
+    s_usb_status_error_logged = false;
+    if (powered) {
+        s_external_power_release_polls = 0;
+        if (!s_cached_usb_powered) {
+            ESP_LOGI(TAG,
+                     "external power detected usb=%d charging=%d; "
+                     "standby keeps Bluetooth, deep sleep disabled",
+                     usb_powered, charging);
+        }
+        s_cached_usb_powered = true;
+        return;
+    }
+    if (!s_cached_usb_powered) {
+        return;
+    }
+    if (++s_external_power_release_polls >= EXTERNAL_POWER_RELEASE_POLLS) {
+        s_cached_usb_powered = false;
+        s_external_power_release_polls = 0;
+        ESP_LOGW(TAG,
+                 "external power lost usb=%d charging=%d; "
+                 "battery standby/deep sleep policy resumed",
+                 usb_powered, charging);
+    }
+}
+
 static void update_power_state(int64_t current_ms)
 {
     bool active_work = deep_sleep_has_active_work(current_ms);
     if (current_ms >= s_next_power_state_poll_ms) {
-        bool usb_powered = false;
-        esp_err_t power_err = vibe_board_usb_powered(&usb_powered);
-        s_cached_usb_power_valid = power_err == ESP_OK;
-        s_cached_usb_powered = s_cached_usb_power_valid && usb_powered;
-        s_next_power_state_poll_ms = current_ms + POWER_STATE_POLL_MS;
-        if (!s_cached_usb_power_valid && !s_usb_status_error_logged) {
-            ESP_LOGW(TAG, "power state forced ACTIVE: USB status unavailable: %s",
-                     esp_err_to_name(power_err));
-            s_usb_status_error_logged = true;
-        } else if (s_cached_usb_power_valid) {
-            s_usb_status_error_logged = false;
-        }
+        poll_external_power(current_ms);
     }
 
     bool usb_power_valid = false;
@@ -1750,11 +1811,9 @@ static void maybe_send_powered_bt_keepalive(int64_t current_ms)
         return;
     }
 
-    bool physical_powered = false;
-    esp_err_t power_err = vibe_board_usb_powered(&physical_powered);
     bool usb_valid = false;
     bool usb_powered = false;
-    effective_usb_power(power_err == ESP_OK, physical_powered,
+    effective_usb_power(s_cached_usb_power_valid, s_cached_usb_powered,
                         &usb_valid, &usb_powered);
     if (!usb_valid || !usb_powered) {
         return;
