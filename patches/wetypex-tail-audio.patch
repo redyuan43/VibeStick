@@ -1,0 +1,33 @@
+--- a/voice_stream.py
++++ b/voice_stream.py
+@@ -272,11 +272,16 @@
+         if self.stopped_at is None:
+             self.stopped_at = time.monotonic()
+         self.stopped.set()
+-        if self.capture and self.capture.poll() is None:
+-            try:
+-                self.capture.send_signal(signal.SIGINT)
+-            except ProcessLookupError:
+-                pass
++        if self.capture and self.capture.poll() is None and not getattr(self, '_kill_scheduled', False):
++            self._kill_scheduled = True
++            def _kill_later():
++                time.sleep(1.8)
++                try:
++                    if self.capture.poll() is None:
++                        self.capture.send_signal(signal.SIGINT)
++                except ProcessLookupError:
++                    pass
++            threading.Thread(target=_kill_later, daemon=True).start()
+ 
+     def stop(self, immediate=False):
+         self.immediate |= immediate
+@@ -307,7 +312,7 @@
+                 if current - self.since > 600:
+                     self.stop_capture()
+                 if not select.select([self.capture.stdout], [], [], .1)[0]:
+-                    if self.stopped.is_set() and current - self.stopped_at > 1:
++                    if self.stopped.is_set() and current - self.stopped_at > 2.5:
+                         break
+                     if current - last_audio > 5:
+                         raise RuntimeError('音频采集无响应，请检查所选麦克风和音频服务')
