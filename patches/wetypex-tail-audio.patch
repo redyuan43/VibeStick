@@ -27,7 +27,7 @@
                      self.stop_capture()
                  if not select.select([self.capture.stdout], [], [], .1)[0]:
 -                    if self.stopped.is_set() and current - self.stopped_at > 1:
-+                    if self.stopped.is_set() and current - self.stopped_at > 2.5:
++                    if self.stopped.is_set() and current - self.stopped_at > 3.5:
                          break
                      if current - last_audio > 5:
                          raise RuntimeError('音频采集无响应，请检查所选麦克风和音频服务')
