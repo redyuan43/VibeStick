@@ -29,7 +29,14 @@
 #include "esp_codec_dev_defaults.h"
 #endif
 
-#define AUDIO_FRAME_MS 60
+/*
+ * 120 ms frames, not 60 ms: this build uploads one HTTP request per frame, and
+ * a request costs roughly 60 ms on the 2.4 GHz link. At 60 ms per frame the
+ * upload permanently lagged the capture by a few percent, so the queue stayed
+ * full and the live stream lost ~4% of its audio. A longer frame leaves the
+ * request overhead at the same absolute cost but halves how often it is paid.
+ */
+#define AUDIO_FRAME_MS 120
 #define AUDIO_FRAME_SAMPLES ((VIBE_STICK_AUDIO_SAMPLE_RATE * AUDIO_FRAME_MS) / 1000)
 #define AUDIO_CHUNK_BYTES (AUDIO_FRAME_SAMPLES * VIBE_STICK_AUDIO_CHANNELS * \
                            (VIBE_STICK_AUDIO_BITS_PER_SAMPLE / 8))
@@ -168,6 +175,17 @@ static esp_err_t create_audio_queue(vibe_audio_transport_t transport)
         }
         if (s_audio_queue_storage) {
             depth = budget / item_size;
+#if defined(VIBE_STICKS3_MIC_MODE)
+            /*
+             * This build feeds a live system microphone: keep a few seconds of
+             * slack so a slow upload does not chop the stream, but far less
+             * than the 128 s the raw PSRAM budget would allow, which would show
+             * up as minutes of latency.
+             */
+            if (depth > 25) {
+                depth = 25;
+            }
+#endif
             queue = xQueueCreateStatic(depth, item_size, s_audio_queue_storage,
                                        &s_audio_queue_control);
             if (!queue) {
@@ -768,8 +786,9 @@ static esp_err_t read_audio_chunk(audio_chunk_t *chunk)
 static void audio_task(void *arg)
 {
     (void)arg;
-    audio_chunk_t pcm_chunk = {0};
-    audio_chunk_t wire_chunk = {0};
+    /* Kept off the 8 KB task stack: a 120 ms PCM frame is 3.8 KB. */
+    static audio_chunk_t pcm_chunk;
+    static audio_chunk_t wire_chunk;
     vibe_ima_adpcm_state_t encoder = {0};
     vibe_ima_adpcm_reset(&encoder);
 
@@ -801,7 +820,22 @@ static void audio_task(void *arg)
         }
         s_audio_stats.chunks_read++;
         s_audio_stats.bytes_read += pcm_chunk.len;
-        if (xQueueSend(s_audio_queue, &wire_chunk, 0) != pdTRUE) {
+        bool queued = xQueueSend(s_audio_queue, &wire_chunk, 0) == pdTRUE;
+#if defined(VIBE_STICKS3_MIC_MODE)
+        if (!queued) {
+            /*
+             * Live microphone: evict the oldest frame and keep the fresh one.
+             * Dropping the new frame instead (the default below) pins the queue
+             * to its oldest content, so the host keeps hearing speech from
+             * minutes ago no matter how far behind the upload is.
+             */
+            static audio_chunk_t s_evicted_chunk;
+            if (xQueueReceive(s_audio_queue, &s_evicted_chunk, 0) == pdTRUE) {
+                queued = xQueueSend(s_audio_queue, &wire_chunk, 0) == pdTRUE;
+            }
+        }
+#endif
+        if (!queued) {
             s_audio_stats.chunks_dropped++;
             s_audio_stats.bytes_dropped += pcm_chunk.len;
         } else {

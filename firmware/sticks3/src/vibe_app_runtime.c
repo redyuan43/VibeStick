@@ -3431,8 +3431,12 @@ static esp_err_t http_post_binary(const char *path, const uint8_t *body, size_t 
                                "16000");
     esp_http_client_set_header(client, "X-Vibe-Stick-Audio-Channels", "1");
     if (vibe_audio_transport() == VIBE_AUDIO_TRANSPORT_IMA_ADPCM) {
+        char block_samples[12];
+        snprintf(block_samples, sizeof(block_samples), "%d",
+                 VIBE_STICK_AUDIO_FRAME_SAMPLES);
         esp_http_client_set_header(client,
-                                   "X-Vibe-Stick-Audio-Block-Samples", "960");
+                                   "X-Vibe-Stick-Audio-Block-Samples",
+                                   block_samples);
     }
     esp_http_client_set_header(client, "X-Vibe-Stick-Sample-Rate", "16000");
     esp_http_client_set_header(client, "X-Vibe-Stick-Channels", "1");

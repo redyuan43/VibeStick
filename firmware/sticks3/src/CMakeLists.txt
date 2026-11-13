@@ -10,6 +10,9 @@ if(VIBE_STICKS3_MINIMAL_ASR)
                  driver esp_adc esp_timer esp_lcd esp_codec_dev esp_app_format)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         VIBE_BOARD_STICKS3=1 VIBE_STICKS3_MINIMAL_ASR=1)
+    if(VIBE_STICKS3_MIC_MODE)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE VIBE_STICKS3_MIC_MODE=1)
+    endif()
     return()
 endif()
 

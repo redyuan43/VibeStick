@@ -10,6 +10,11 @@ endif()
 set(VIBE_BOARD "${VIBE_BOARD}" CACHE STRING "VibeStick board target")
 option(VIBE_SERIAL_DEBUG "Enable serial commands that simulate hardware buttons" OFF)
 option(VIBE_STICKS3_MINIMAL_ASR "Build the maintained StickS3 voice-only runtime" OFF)
+option(VIBE_STICKS3_MIC_MODE
+       "Keep the StickS3 microphone streaming as a PC audio input device" OFF)
+if(VIBE_STICKS3_MIC_MODE)
+    set(VIBE_STICKS3_MINIMAL_ASR ON)
+endif()
 option(VIBE_RECORDING_DIAGNOSTICS
        "Persist the most recent recording transport summary for diagnosis" OFF)
 

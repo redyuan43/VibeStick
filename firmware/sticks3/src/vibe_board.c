@@ -351,6 +351,18 @@ esp_err_t vibe_board_init_power(void)
     }
 
     ESP_LOGI(TAG, "power hold enabled");
+    {
+        uint8_t gpio_out = 0;
+        uint8_t gpio_mode = 0;
+        uint8_t ldo = 0;
+        if (read_reg(M5PM1_REG_GPIO_OUT, &gpio_out) == ESP_OK &&
+            read_reg(M5PM1_REG_GPIO_MODE, &gpio_mode) == ESP_OK &&
+            read_reg(M5PM1_REG_PWR_CFG, &ldo) == ESP_OK) {
+            ESP_LOGI(TAG, "pm1 rail out=0x%02X mode=0x%02X pwr=0x%02X l3b=%d",
+                     gpio_out, gpio_mode, ldo,
+                     (gpio_out & M5PM1_GPIO2_L3B_POWER_EN) ? 1 : 0);
+        }
+    }
     return ESP_OK;
 }
 

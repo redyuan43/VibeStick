@@ -48,3 +48,7 @@ Recordings/
 bridge/recordings/
 .omx
 /firmware/sticks3/include/vibe_sticks3_asr_local.h
+
+# local build dirs and agent workspace
+build-sticks3-mic/
+.workbuddy/

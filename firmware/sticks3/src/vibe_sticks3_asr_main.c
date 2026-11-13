@@ -4,6 +4,7 @@
 #include "vibe_audio.h"
 #include "vibe_board.h"
 #include "vibe_board_profile.h"
+#include "vibe_stick_config.h"
 #include "vibe_sticks3_asr_transport.h"
 #include "vibe_sticks3_status.h"
 #include "vibe_wifi_runtime.h"
@@ -20,10 +21,22 @@
 #include "nvs_flash.h"
 
 static const char *TAG = "sticks3_asr";
+#ifndef VIBE_STICK_WIFI_PROFILES
+#define VIBE_STICK_WIFI_PROFILES \
+    { { VIBE_STICK_WIFI_SSID, VIBE_STICK_WIFI_PASSWORD } }
+#endif
+/* Compiled credentials seed the NVS profile store on first boot. An empty
+ * SSID is rejected by the merge step, so this stays inert when unset. */
+static const vibe_wifi_profile_t s_seed_profiles[] = VIBE_STICK_WIFI_PROFILES;
 static vibe_wifi_runtime_t s_wifi;
 static TaskHandle_t s_upload_task;
 static SemaphoreHandle_t s_upload_done;
 static atomic_bool s_recording, s_failed;
+#if defined(VIBE_STICKS3_MIC_MODE)
+/* Keeps one long lived upload session open so the PC sees a live microphone
+ * instead of a per-dictation recording. */
+static atomic_bool s_mic_wanted;
+#endif
 static char s_session[33];
 static uint8_t s_upload_buffer[VIBE_STICK_AUDIO_ADPCM_FRAME_BYTES * 4];
 static size_t s_posts, s_pcm_bytes;
@@ -115,6 +128,9 @@ static void wifi_changed(bool connected, const char *ip, void *context)
 {
     (void)context;
     ESP_LOGI(TAG, "wifi connected=%d ip=%s", connected, ip ? ip : "");
+#if defined(VIBE_STICKS3_MIC_MODE)
+    atomic_store(&s_mic_wanted, connected);
+#endif
     if (!atomic_load(&s_recording)) vibe_sticks3_status_show(connected ? VIBE_STICKS3_STATUS_READY : VIBE_STICKS3_STATUS_WIFI);
 }
 
@@ -123,6 +139,9 @@ static void control_task(void *arg)
     (void)arg;
     bool previous = false;
     int64_t battery_at = 0;
+#if defined(VIBE_STICKS3_MIC_MODE)
+    int64_t retry_at = 0;
+#endif
     while (true) {
         bool pressed = gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0;
         uint8_t command = 0;
@@ -133,12 +152,23 @@ static void control_task(void *arg)
             toggle |= gpio_get_level(VIBE_BOARD_PIN_BUTTON_FRONT) == 0;
         }
         previous = pressed;
+#if defined(VIBE_STICKS3_MIC_MODE)
+        (void)toggle;
+#else
         if (toggle) {
             if (atomic_load(&s_recording)) stop_recording();
             else start_recording();
         }
+#endif
         if (atomic_load(&s_recording) && atomic_load(&s_failed)) stop_recording();
         int64_t now = esp_timer_get_time();
+#if defined(VIBE_STICKS3_MIC_MODE)
+        if (atomic_load(&s_mic_wanted) && !atomic_load(&s_recording) &&
+            now >= retry_at) {
+            start_recording();
+            retry_at = esp_timer_get_time() + 3000000;
+        }
+#endif
         if (now >= battery_at && !atomic_load(&s_recording)) {
             int level;
             if (vibe_board_battery_level(&level) == ESP_OK) vibe_sticks3_status_set_battery_level(level);
@@ -161,6 +191,8 @@ void app_main(void)
     ESP_ERROR_CHECK(xTaskCreatePinnedToCore(upload_task, "asr_upload", 6144, NULL, 4,
                                           &s_upload_task, 0) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     const vibe_wifi_runtime_config_t wifi = {
+        .configured_profiles = s_seed_profiles,
+        .configured_profile_count = sizeof(s_seed_profiles) / sizeof(s_seed_profiles[0]),
         .idle_power_save = WIFI_PS_MIN_MODEM,
         .max_tx_power = VIBE_BOARD_WIFI_MAX_TX_POWER, .status_changed = wifi_changed,
     };

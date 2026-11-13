@@ -142,7 +142,11 @@ esp_err_t sticks3_transport_audio(const char *session, const uint8_t *audio,
     esp_http_client_set_header(s_client, "X-Vibe-Stick-Audio-Encoding", "ima-adpcm-v1");
     esp_http_client_set_header(s_client, "X-Vibe-Stick-Audio-Sample-Rate", "16000");
     esp_http_client_set_header(s_client, "X-Vibe-Stick-Audio-Channels", "1");
-    esp_http_client_set_header(s_client, "X-Vibe-Stick-Audio-Block-Samples", "960");
+    char block_samples[12];
+    snprintf(block_samples, sizeof(block_samples), "%d",
+             VIBE_STICK_AUDIO_FRAME_SAMPLES);
+    esp_http_client_set_header(s_client, "X-Vibe-Stick-Audio-Block-Samples",
+                               block_samples);
     /* Hold this exact batch until ACK; do not dequeue fresh audio on a retry.
      * Bound recovery below the ASR relay's 15s idle / 10s backlog limits.
      */

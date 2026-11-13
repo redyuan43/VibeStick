@@ -2,13 +2,26 @@
 
 #include <limits.h>
 
+/*
+ * Deviations from the shipped table, both for measured reasons:
+ *
+ * 0x01/0x02 omitted: the shipped table writes 0x01 = 0xBA, whose bit 7 makes
+ *   the codec run from its internal clock and ignore the MCLK pin. StickS3
+ *   feeds MCLK from GPIO18, so the ADC desynchronises from I2S and the capture
+ *   collapses to -66 dBFS noise. Left alone, the driver programs both
+ *   registers from the real MCLK and sample rate.
+ * 0x14 = 0x1A: the low bits select the analog input branch, not a gain step.
+ *   With the shipped 0x10 the capsule is not routed through and the raw peak
+ *   stays at ~1 LSB no matter how much gain is applied downstream.
+ *
+ * 0x17 stays at the shipped 0xFF (+32 dB ADC volume): it is the stage that
+ * actually carries the level on this board.
+ */
 static const vibe_capture_es8311_register_t s_sticks3_es8311_registers[] = {
     {0x00, 0x80},
-    {0x01, 0xBA},
-    {0x02, 0x18},
     {0x0D, 0x01},
     {0x0E, 0x02},
-    {0x14, 0x10},
+    {0x14, 0x1A},
     {0x17, 0xFF},
     {0x1C, 0x6A},
 };
@@ -34,7 +47,13 @@ static const vibe_capture_profile_t s_profiles[] = {
         .magnification = 16,
         .noise_filter_level = 0,
         .input_gain_db = 0,
-        .input_only_right = true,
+        /*
+         * ES8311 puts ADC (microphone) samples on the left slot; the right slot
+         * carries DAC output. Reading right returned a silent DAC branch, which
+         * is why the capture measured -65 dBFS. Everything else on this profile
+         * matches the shipped configuration.
+         */
+        .input_only_right = false,
         .process_samples = true,
         .mclk_pin = 18,
         .bclk_pin = 17,
